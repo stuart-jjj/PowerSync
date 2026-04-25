@@ -929,6 +929,7 @@ async def async_setup_entry(
     foxess_coordinator = domain_data.get("foxess_coordinator")
     goodwe_coordinator = domain_data.get("goodwe_coordinator")
     alphaess_coordinator = domain_data.get("alphaess_coordinator")
+    voltx_coordinator = domain_data.get("voltx_coordinator")
     esy_sunhome_coordinator = domain_data.get("esy_sunhome_coordinator")
     solax_coordinator = domain_data.get("solax_coordinator")
     demand_charge_coordinator: DemandChargeCoordinator | None = domain_data.get("demand_charge_coordinator")
@@ -938,6 +939,7 @@ async def async_setup_entry(
     is_foxess = domain_data.get("is_foxess", False)
     is_goodwe = domain_data.get("is_goodwe", False)
     is_alphaess = domain_data.get("is_alphaess", False)
+    is_voltx = domain_data.get("is_voltx", False)
     is_esy_sunhome = domain_data.get("is_esy_sunhome", False)
     is_solax = domain_data.get("is_solax", False)
 
@@ -1013,6 +1015,8 @@ async def async_setup_entry(
         energy_coordinator = sigenergy_coordinator
     elif is_alphaess:
         energy_coordinator = alphaess_coordinator
+    elif is_voltx:
+        energy_coordinator = voltx_coordinator
     elif is_esy_sunhome:
         energy_coordinator = esy_sunhome_coordinator
     elif is_solax:
@@ -1384,6 +1388,8 @@ async def async_setup_entry(
         battery_system = "sigenergy"
     elif is_alphaess:
         battery_system = "alphaess"
+    elif is_voltx:
+        battery_system = "voltx"
     entities.append(BatteryHealthSensor(
         entry=entry,
         coordinator=energy_coordinator,

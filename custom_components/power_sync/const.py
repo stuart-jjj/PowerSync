@@ -130,6 +130,9 @@ BATTERY_SYSTEM_ALPHAESS = "alphaess"
 BATTERY_SYSTEM_ESY_SUNHOME = "esy_sunhome"
 BATTERY_SYSTEM_SOLAX = "solax"
 BATTERY_SYSTEM_SAJ_H2 = "saj_h2"
+# Voltx is a native Modbus battery path, so it needs to appear in the same
+# first-class battery registry as the other built-in integrations.
+BATTERY_SYSTEM_VOLTX = "voltx"
 
 BATTERY_SYSTEMS = {
     BATTERY_SYSTEM_TESLA: "Tesla Powerwall — Fleet API or Teslemetry",
@@ -141,7 +144,17 @@ BATTERY_SYSTEMS = {
     BATTERY_SYSTEM_ESY_SUNHOME: "ESY Sunhome — via esy_sunhome companion integration",
     BATTERY_SYSTEM_SOLAX: "Solax Hybrid — via Solax Modbus integration",
     BATTERY_SYSTEM_SAJ_H2: "SAJ H2/HS2 — via SAJ H2 Modbus integration",
+    BATTERY_SYSTEM_VOLTX: "Voltx / Solplanet hybrid — Modbus TCP",
 }
+
+# Voltx / Solplanet Battery System Configuration (Modbus TCP)
+# Defaults mirror the proof-of-concept integration and the observed inverter
+# Monitor-port Modbus settings used during development.
+CONF_VOLTX_HOST = "voltx_host"
+CONF_VOLTX_PORT = "voltx_port"
+CONF_VOLTX_SLAVE_ID = "voltx_slave_id"
+DEFAULT_VOLTX_PORT = 502
+DEFAULT_VOLTX_SLAVE_ID = 3
 
 # Sungrow SH-series Battery System Configuration (Modbus TCP)
 # Hybrid inverters with integrated battery control
@@ -1454,6 +1467,7 @@ OPTIMIZATION_PROVIDER_NATIVE_NAMES = {
     BATTERY_SYSTEM_ALPHAESS: "AlphaESS",
     BATTERY_SYSTEM_ESY_SUNHOME: "ESY Sunhome",
     BATTERY_SYSTEM_SOLAX: "Solax",
+    BATTERY_SYSTEM_VOLTX: "Voltx",
 }
 
 OPTIMIZATION_PROVIDERS = {
@@ -1498,6 +1512,7 @@ BATTERY_CAPACITY_DEFAULTS = {
     BATTERY_SYSTEM_ALPHAESS: 10000,   # Varies (SMILE5 ~ 5.7 kWh, Storion ~ 30 kWh), default 10 kWh
     BATTERY_SYSTEM_ESY_SUNHOME: 10000,  # HM6 varies; default 10 kWh
     BATTERY_SYSTEM_SOLAX: 11600,      # T-BAT-SYS-HV 11.6 kWh typical
+    BATTERY_SYSTEM_VOLTX: 10000,      # Varies by inverter/battery pairing
 }
 
 # Max charge/discharge power defaults by system (W)
@@ -1510,6 +1525,7 @@ BATTERY_POWER_DEFAULTS = {
     BATTERY_SYSTEM_ALPHAESS: 5000,    # Varies by model (SMILE5 = 5 kW, Storion-T30 larger)
     BATTERY_SYSTEM_ESY_SUNHOME: 5000,  # HM6; rate is firmware-decided, using 5 kW default
     BATTERY_SYSTEM_SOLAX: 5000,        # Varies by model (X1-Hybrid G4: 3.7 kW, X3-Hybrid: 6 kW)
+    BATTERY_SYSTEM_VOLTX: 5000,        # Varies by inverter/battery pairing
 }
 
 # Optimization service
