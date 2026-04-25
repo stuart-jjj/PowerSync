@@ -3499,9 +3499,11 @@ class VoltxEnergyCoordinator(DataUpdateCoordinator):
             attrs = status.attributes or {}
             if "battery_soc" not in attrs:
                 raise UpdateFailed("Voltx Modbus returned no battery data")
-        except Exception as err:
-            if self.data:
+        except UpdateFailed as err:
+            if str(err) == "Voltx Modbus returned no battery data" and self.data:
                 return self.data
+            raise
+        except Exception as err:
             raise UpdateFailed(f"Error fetching Voltx energy data: {err}") from err
 
         solar_kw = attrs.get("pv_power_kw", 0) or 0
