@@ -75,6 +75,7 @@ from .const import (
     BATTERY_SYSTEM_ESY_SUNHOME,
     BATTERY_SYSTEM_SOLAX,
     BATTERY_SYSTEM_SAJ_H2,
+    BATTERY_SYSTEM_VOLTX,
     BATTERY_SYSTEMS,
     CONF_ESY_CONFIG_ENTRY_ID,
     # Solax battery system configuration
@@ -92,6 +93,12 @@ from .const import (
     CONF_SAJ_CONFIG_ENTRY_ID,
     CONF_SAJ_BATTERY_CAPACITY_KWH,
     DEFAULT_SAJ_BATTERY_CAPACITY_KWH,
+    # Voltx battery system configuration
+    CONF_VOLTX_HOST,
+    CONF_VOLTX_PORT,
+    CONF_VOLTX_SLAVE_ID,
+    DEFAULT_VOLTX_PORT,
+    DEFAULT_VOLTX_SLAVE_ID,
     # AlphaESS battery system configuration
     CONF_ALPHAESS_MODBUS_HOST,
     CONF_ALPHAESS_MODBUS_PORT,
@@ -763,6 +770,7 @@ class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._sungrow_data: dict[str, Any] = {}  # Sungrow Modbus configuration
         self._foxess_data: dict[str, Any] = {}  # FoxESS Modbus configuration
         self._goodwe_data: dict[str, Any] = {}  # GoodWe configuration
+        self._voltx_data: dict[str, Any] = {}  # Voltx Modbus configuration
         self._aemo_only_mode: bool = False  # True if using AEMO spike only (no Amber)
         self._aemo_data: dict[str, Any] = {}
         self._flow_power_data: dict[str, Any] = {}
@@ -1105,6 +1113,10 @@ class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return await self.async_step_solax_battery()
         elif self._selected_battery_system == BATTERY_SYSTEM_SAJ_H2:
             return await self.async_step_saj_h2_battery()
+        elif self._selected_battery_system == BATTERY_SYSTEM_VOLTX:
+            # Voltx has a native battery setup step, separate from the generic
+            # AC inverter curtailment brand selector used elsewhere in the flow.
+            return await self.async_step_voltx_connection()
         else:
             return await self.async_step_tesla_provider()
 
@@ -1132,6 +1144,9 @@ class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             **getattr(self, "_esy_sunhome_data", {}),
             **getattr(self, "_solax_data", {}),
             **getattr(self, "_saj_h2_data", {}),
+            # Keep the validated Voltx endpoint details on the config entry so
+            # runtime setup can recreate the native Modbus coordinator directly.
+            **getattr(self, "_voltx_data", {}),
             CONF_ELECTRICITY_PROVIDER: self._selected_electricity_provider,
         }
 
@@ -1172,6 +1187,7 @@ class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             BATTERY_SYSTEM_ESY_SUNHOME: "ESY Sunhome",
             BATTERY_SYSTEM_SOLAX: "Solax",
             BATTERY_SYSTEM_SAJ_H2: "SAJ H2",
+            BATTERY_SYSTEM_VOLTX: "Voltx",
         }.get(self._selected_battery_system, "")
 
         if battery_label:
@@ -1988,6 +2004,79 @@ class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     "Leave blank to skip."
                 ),
             },
+        )
+
+    async def async_step_voltx_connection(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Configure Voltx / Solplanet Modbus TCP connection."""
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            host = user_input.get(CONF_VOLTX_HOST, "").strip()
+            port = user_input.get(CONF_VOLTX_PORT, DEFAULT_VOLTX_PORT)
+            slave_id = user_input.get(CONF_VOLTX_SLAVE_ID, DEFAULT_VOLTX_SLAVE_ID)
+
+            if not host:
+                errors["base"] = "voltx_host_required"
+            else:
+                from .inverters.voltx import VoltxController
+
+                # Validate with the same controller class used at runtime so the
+                # setup flow and the live integration share one register contract.
+                controller = VoltxController(
+                    host=host,
+                    port=int(port),
+                    slave_id=int(slave_id),
+                )
+                try:
+                    connected = await controller.connect()
+                    if not connected:
+                        errors["base"] = "voltx_connection_failed"
+                    else:
+                        state = await controller.get_status()
+                        if state.attributes is None or "battery_soc" not in state.attributes:
+                            errors["base"] = "voltx_no_data"
+                finally:
+                    try:
+                        await controller.disconnect()
+                    except Exception:
+                        pass
+
+                if not errors:
+                    self._voltx_data = {
+                        CONF_VOLTX_HOST: host,
+                        CONF_VOLTX_PORT: int(port),
+                        CONF_VOLTX_SLAVE_ID: int(slave_id),
+                    }
+                    return self._create_final_entry()
+
+        return self.async_show_form(
+            step_id="voltx_connection",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_VOLTX_HOST): TextSelector(
+                        TextSelectorConfig(type=TextSelectorType.TEXT)
+                    ),
+                    vol.Optional(
+                        CONF_VOLTX_PORT,
+                        default=DEFAULT_VOLTX_PORT,
+                    ): NumberSelector(
+                        NumberSelectorConfig(
+                            min=1, max=65535, step=1, mode=NumberSelectorMode.BOX
+                        )
+                    ),
+                    vol.Optional(
+                        CONF_VOLTX_SLAVE_ID,
+                        default=DEFAULT_VOLTX_SLAVE_ID,
+                    ): NumberSelector(
+                        NumberSelectorConfig(
+                            min=1, max=247, step=1, mode=NumberSelectorMode.BOX
+                        )
+                    ),
+                }
+            ),
+            errors=errors,
         )
 
     async def async_step_esy_sunhome(
@@ -3525,6 +3614,10 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
             menu_options.append("solax_battery_options")
         elif battery_system == BATTERY_SYSTEM_SAJ_H2:
             menu_options.append("saj_h2_connection")
+        elif battery_system == BATTERY_SYSTEM_VOLTX:
+            # Offer Voltx endpoint editing in options without forcing users to
+            # remove and recreate the integration entry.
+            menu_options.append("voltx_connection_options")
 
         menu_options.extend([
             "optimization",
@@ -4142,6 +4235,65 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
             errors=errors,
         )
 
+    async def async_step_voltx_connection_options(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Menu handler: Voltx Modbus connection settings."""
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            host = user_input.get(CONF_VOLTX_HOST, "").strip()
+            if not host:
+                errors["base"] = "voltx_host_required"
+            else:
+                # Only the stored connection parameters change here; the reload
+                # path rebuilds the Voltx coordinator with the new endpoint.
+                new_data = dict(self.config_entry.data)
+                new_data[CONF_VOLTX_HOST] = host
+                new_data[CONF_VOLTX_PORT] = user_input.get(
+                    CONF_VOLTX_PORT, DEFAULT_VOLTX_PORT
+                )
+                new_data[CONF_VOLTX_SLAVE_ID] = user_input.get(
+                    CONF_VOLTX_SLAVE_ID, DEFAULT_VOLTX_SLAVE_ID
+                )
+                self.hass.config_entries.async_update_entry(
+                    self.config_entry, data=new_data
+                )
+                return self.async_create_entry(
+                    title="", data=dict(self.config_entry.options)
+                )
+
+        current_host = self._get_option(CONF_VOLTX_HOST, "")
+        current_port = self._get_option(CONF_VOLTX_PORT, DEFAULT_VOLTX_PORT)
+        current_slave_id = self._get_option(
+            CONF_VOLTX_SLAVE_ID, DEFAULT_VOLTX_SLAVE_ID
+        )
+
+        return self.async_show_form(
+            step_id="voltx_connection_options",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_VOLTX_HOST,
+                        default=current_host,
+                    ): TextSelector(TextSelectorConfig(type=TextSelectorType.TEXT)),
+                    vol.Optional(
+                        CONF_VOLTX_PORT,
+                        default=current_port,
+                    ): NumberSelector(NumberSelectorConfig(
+                        min=1, max=65535, step=1, mode=NumberSelectorMode.BOX,
+                    )),
+                    vol.Optional(
+                        CONF_VOLTX_SLAVE_ID,
+                        default=current_slave_id,
+                    ): NumberSelector(NumberSelectorConfig(
+                        min=1, max=247, step=1, mode=NumberSelectorMode.BOX,
+                    )),
+                }
+            ),
+            errors=errors,
+        )
+
     async def async_step_esy_sunhome_connection(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
@@ -4421,6 +4573,9 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
             BATTERY_SYSTEM_SUNGROW: "Sungrow built-in optimization",
             BATTERY_SYSTEM_FOXESS: "FoxESS built-in optimization",
             BATTERY_SYSTEM_GOODWE: "GoodWe built-in optimization",
+            # Voltx reuses the existing native/manual-control behavior, so it
+            # fits the same "built-in optimization" label as other batteries.
+            BATTERY_SYSTEM_VOLTX: "Voltx built-in optimization",
         }
         native_label = native_labels.get(battery_system, "Built-in optimization")
 

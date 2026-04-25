@@ -445,6 +445,21 @@
         },
         "submit": "Connect"
       },
+      "voltx_connection": {
+        "title": "Voltx Modbus connection",
+        "description": "Connect to your Voltx / Solplanet inverter over Modbus TCP for battery telemetry and control.",
+        "data": {
+          "voltx_host": "Inverter IP address",
+          "voltx_port": "Modbus port",
+          "voltx_slave_id": "Modbus slave ID"
+        },
+        "data_description": {
+          "voltx_host": "Local IP address of your Voltx / Solplanet inverter.",
+          "voltx_port": "Default Modbus TCP port is 502.",
+          "voltx_slave_id": "Default is 3 on the verified Solplanet/Voltx register map."
+        },
+        "submit": "Connect"
+      },
       "esy_sunhome": {
         "title": "ESY Sunhome connection",
         "description": "PowerSync bridges through the ESY Sunhome integration. Select the ESY Sunhome config entry to use.",
@@ -761,6 +776,9 @@
       "foxess_cloud_connection_error": "Cannot reach FoxESS Cloud. Check your internet connection and retry.",
       "goodwe_connect_failed": "Cannot connect to GoodWe inverter. Verify the IP address is correct and the inverter is powered on and reachable from Home Assistant.",
       "goodwe_no_battery": "This GoodWe model (DT/MS/XS series) does not support battery control. Only ET/EH/ES/EM series hybrid inverters are supported.",
+      "voltx_host_required": "IP address is required -- enter the local IP of your Voltx / Solplanet inverter.",
+      "voltx_connection_failed": "Cannot connect to the Voltx inverter. Check the IP address, Modbus port, slave ID, and that the inverter is reachable from Home Assistant.",
+      "voltx_no_data": "Connected to the Voltx inverter but no battery telemetry was returned. Verify the slave ID and that the battery is online.",
       "esy_sunhome_not_installed": "The ESY Sunhome integration is not installed. Install it via HACS (search 'ESY Sunhome') and add a device before continuing.",
       "esy_sunhome_no_device": "No ESY Sunhome device found in the selected integration entry. Verify the ESY Sunhome integration is set up and has a paired device.",
       "invalid_credentials": "Email or password is incorrect. Check your Flow Power portal login credentials.",
@@ -801,6 +819,7 @@
           "sungrow_connection": "Sungrow Modbus connection",
           "foxess_connection_options": "FoxESS connection",
           "goodwe_connection_options": "GoodWe connection",
+          "voltx_connection_options": "Voltx connection",
           "esy_sunhome_connection": "ESY Sunhome connection",
           "saj_h2_connection": "SAJ H2 connection",
           "optimization": "Optimization mode",
@@ -923,6 +942,21 @@
           "goodwe_host": "Local IP address of your GoodWe inverter.",
           "goodwe_protocol": "UDP for WiFi dongles (port 8899), TCP for LAN dongles (port 502).",
           "goodwe_port": "Default: 8899 for UDP, 502 for TCP."
+        },
+        "submit": "Save"
+      },
+      "voltx_connection_options": {
+        "title": "Voltx connection",
+        "description": "Update your Voltx / Solplanet inverter Modbus settings. Changes take effect immediately.",
+        "data": {
+          "voltx_host": "Inverter IP address",
+          "voltx_port": "Modbus port",
+          "voltx_slave_id": "Modbus slave ID"
+        },
+        "data_description": {
+          "voltx_host": "Local IP address of your Voltx / Solplanet inverter.",
+          "voltx_port": "Default Modbus TCP port is 502.",
+          "voltx_slave_id": "Default is 3 on the verified Solplanet/Voltx register map."
         },
         "submit": "Save"
       },
