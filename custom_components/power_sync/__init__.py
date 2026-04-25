@@ -21170,15 +21170,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             try:
                 entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
                 voltx_coord = entry_data.get("voltx_coordinator")
-                if voltx_coord and hasattr(voltx_coord, '_controller') and voltx_coord._controller:
-                    controller = voltx_coord._controller
-                    result = await controller.set_self_consumption_mode()
+                if voltx_coord:
+                    result = await voltx_coord.restore_normal()
                     if result:
-                        _LOGGER.info("Voltx self-consumption mode set")
+                        _LOGGER.info("Voltx restore_normal succeeded")
                     else:
-                        _LOGGER.warning("Voltx set_self_consumption_mode failed")
+                        _LOGGER.warning("Voltx restore_normal failed")
                 else:
-                    _LOGGER.error("Self-consumption: Voltx coordinator/controller not available")
+                    _LOGGER.error("Self-consumption: Voltx coordinator not available")
                 return
             except Exception as e:
                 _LOGGER.error(f"Error setting Voltx self-consumption: {e}", exc_info=True)
