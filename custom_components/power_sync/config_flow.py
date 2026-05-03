@@ -107,6 +107,9 @@ from .const import (
     CONF_VOLTX_SLAVE_ID,
     DEFAULT_VOLTX_PORT,
     DEFAULT_VOLTX_SLAVE_ID,
+    CONF_VOLTX_SOLAR_POWER_ENTITY,
+    CONF_VOLTX_SOLAR_ENERGY_ENTITY,
+    CONF_VOLTX_GRID_POWER_ENTITY,
     # AlphaESS battery system configuration
     CONF_ALPHAESS_MODBUS_HOST,
     CONF_ALPHAESS_MODBUS_PORT,
@@ -2212,6 +2215,9 @@ class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         CONF_VOLTX_HOST: host,
                         CONF_VOLTX_PORT: int(port),
                         CONF_VOLTX_SLAVE_ID: int(slave_id),
+                        CONF_VOLTX_SOLAR_POWER_ENTITY: user_input.get(CONF_VOLTX_SOLAR_POWER_ENTITY) or None,
+                        CONF_VOLTX_SOLAR_ENERGY_ENTITY: user_input.get(CONF_VOLTX_SOLAR_ENERGY_ENTITY) or None,
+                        CONF_VOLTX_GRID_POWER_ENTITY: user_input.get(CONF_VOLTX_GRID_POWER_ENTITY) or None,
                     }
                     return self._create_final_entry()
 
@@ -2237,6 +2243,15 @@ class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         NumberSelectorConfig(
                             min=1, max=247, step=1, mode=NumberSelectorMode.BOX
                         )
+                    ),
+                    vol.Optional(CONF_VOLTX_SOLAR_POWER_ENTITY): EntitySelector(
+                        EntitySelectorConfig(domain="sensor")
+                    ),
+                    vol.Optional(CONF_VOLTX_SOLAR_ENERGY_ENTITY): EntitySelector(
+                        EntitySelectorConfig(domain="sensor")
+                    ),
+                    vol.Optional(CONF_VOLTX_GRID_POWER_ENTITY): EntitySelector(
+                        EntitySelectorConfig(domain="sensor")
                     ),
                 }
             ),
@@ -4552,6 +4567,9 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                 new_data[CONF_VOLTX_SLAVE_ID] = user_input.get(
                     CONF_VOLTX_SLAVE_ID, DEFAULT_VOLTX_SLAVE_ID
                 )
+                new_data[CONF_VOLTX_SOLAR_POWER_ENTITY] = user_input.get(CONF_VOLTX_SOLAR_POWER_ENTITY) or None
+                new_data[CONF_VOLTX_SOLAR_ENERGY_ENTITY] = user_input.get(CONF_VOLTX_SOLAR_ENERGY_ENTITY) or None
+                new_data[CONF_VOLTX_GRID_POWER_ENTITY] = user_input.get(CONF_VOLTX_GRID_POWER_ENTITY) or None
                 self.hass.config_entries.async_update_entry(
                     self.config_entry, data=new_data
                 )
@@ -4564,29 +4582,44 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
         current_slave_id = self._get_option(
             CONF_VOLTX_SLAVE_ID, DEFAULT_VOLTX_SLAVE_ID
         )
+        current_solar_power_entity = self._get_option(CONF_VOLTX_SOLAR_POWER_ENTITY)
+        current_solar_energy_entity = self._get_option(CONF_VOLTX_SOLAR_ENERGY_ENTITY)
+        current_grid_power_entity = self._get_option(CONF_VOLTX_GRID_POWER_ENTITY)
+
+        schema: dict[vol.Marker, Any] = {
+            vol.Required(
+                CONF_VOLTX_HOST,
+                default=current_host,
+            ): TextSelector(TextSelectorConfig(type=TextSelectorType.TEXT)),
+            vol.Optional(
+                CONF_VOLTX_PORT,
+                default=current_port,
+            ): NumberSelector(NumberSelectorConfig(
+                min=1, max=65535, step=1, mode=NumberSelectorMode.BOX,
+            )),
+            vol.Optional(
+                CONF_VOLTX_SLAVE_ID,
+                default=current_slave_id,
+            ): NumberSelector(NumberSelectorConfig(
+                min=1, max=247, step=1, mode=NumberSelectorMode.BOX,
+            )),
+        }
+        if current_solar_power_entity:
+            schema[vol.Optional(CONF_VOLTX_SOLAR_POWER_ENTITY, default=current_solar_power_entity)] = EntitySelector(EntitySelectorConfig(domain="sensor"))
+        else:
+            schema[vol.Optional(CONF_VOLTX_SOLAR_POWER_ENTITY)] = EntitySelector(EntitySelectorConfig(domain="sensor"))
+        if current_solar_energy_entity:
+            schema[vol.Optional(CONF_VOLTX_SOLAR_ENERGY_ENTITY, default=current_solar_energy_entity)] = EntitySelector(EntitySelectorConfig(domain="sensor"))
+        else:
+            schema[vol.Optional(CONF_VOLTX_SOLAR_ENERGY_ENTITY)] = EntitySelector(EntitySelectorConfig(domain="sensor"))
+        if current_grid_power_entity:
+            schema[vol.Optional(CONF_VOLTX_GRID_POWER_ENTITY, default=current_grid_power_entity)] = EntitySelector(EntitySelectorConfig(domain="sensor"))
+        else:
+            schema[vol.Optional(CONF_VOLTX_GRID_POWER_ENTITY)] = EntitySelector(EntitySelectorConfig(domain="sensor"))
 
         return self.async_show_form(
             step_id="voltx_connection_options",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(
-                        CONF_VOLTX_HOST,
-                        default=current_host,
-                    ): TextSelector(TextSelectorConfig(type=TextSelectorType.TEXT)),
-                    vol.Optional(
-                        CONF_VOLTX_PORT,
-                        default=current_port,
-                    ): NumberSelector(NumberSelectorConfig(
-                        min=1, max=65535, step=1, mode=NumberSelectorMode.BOX,
-                    )),
-                    vol.Optional(
-                        CONF_VOLTX_SLAVE_ID,
-                        default=current_slave_id,
-                    ): NumberSelector(NumberSelectorConfig(
-                        min=1, max=247, step=1, mode=NumberSelectorMode.BOX,
-                    )),
-                }
-            ),
+            data_schema=vol.Schema(schema),
             errors=errors,
         )
 

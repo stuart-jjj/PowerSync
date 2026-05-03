@@ -158,6 +158,11 @@ CONF_VOLTX_PORT = "voltx_port"
 CONF_VOLTX_SLAVE_ID = "voltx_slave_id"
 DEFAULT_VOLTX_PORT = 502
 DEFAULT_VOLTX_SLAVE_ID = 3
+# Optional HA sensor overrides for AC-coupled Voltx systems where the inverter
+# Modbus registers cannot see third-party solar (e.g. Enphase) or site grid metering.
+CONF_VOLTX_SOLAR_POWER_ENTITY = "voltx_solar_power_entity"    # live solar power, W
+CONF_VOLTX_SOLAR_ENERGY_ENTITY = "voltx_solar_energy_entity"  # daily solar kWh total
+CONF_VOLTX_GRID_POWER_ENTITY = "voltx_grid_power_entity"      # signed grid power W (+ve=import)
 
 # Sungrow SH-series Battery System Configuration (Modbus TCP)
 # Hybrid inverters with integrated battery control

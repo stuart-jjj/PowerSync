@@ -3830,6 +3830,9 @@ class VoltxEnergyCoordinator(DataUpdateCoordinator):
         port: int = 502,
         slave_id: int = 3,
         entry_id: str = "",
+        solar_power_entity: str | None = None,
+        solar_energy_entity: str | None = None,
+        grid_power_entity: str | None = None,
     ) -> None:
         from .inverters.voltx import VoltxController
 
@@ -3837,6 +3840,9 @@ class VoltxEnergyCoordinator(DataUpdateCoordinator):
         self.port = port
         self.slave_id = slave_id
         self._entry_id = entry_id
+        self._solar_power_entity = solar_power_entity
+        self._solar_energy_entity = solar_energy_entity
+        self._grid_power_entity = grid_power_entity
         # Reuse the native controller so polling and service handlers share the
         # same Voltx register knowledge and connection behavior.
         self._controller = VoltxController(host, port, slave_id)
@@ -3886,6 +3892,29 @@ class VoltxEnergyCoordinator(DataUpdateCoordinator):
         solar_kw = attrs.get("pv_power_kw", 0) or 0
         grid_kw = attrs.get("grid_power_kw", 0) or 0
         battery_kw = attrs.get("battery_power_kw", 0) or 0
+
+        # For AC-coupled systems the Voltx Modbus registers cannot see third-party
+        # solar (e.g. Enphase) or site grid CT data. Override from HA sensor entities
+        # when configured.
+        def _read_w_entity(entity_id: str) -> float | None:
+            state = self.hass.states.get(entity_id)
+            if state is None or state.state in ("unavailable", "unknown", "none"):
+                return None
+            try:
+                return float(state.state)
+            except (ValueError, TypeError):
+                return None
+
+        if self._solar_power_entity:
+            w = _read_w_entity(self._solar_power_entity)
+            if w is not None:
+                solar_kw = max(0.0, w / 1000.0)
+
+        if self._grid_power_entity:
+            w = _read_w_entity(self._grid_power_entity)
+            if w is not None:
+                grid_kw = w / 1000.0
+
         load_kw = attrs.get("load_power_kw")
         if load_kw is None:
             # Voltx Modbus TCP does not expose the full CT/meter view, so use a
@@ -3895,6 +3924,16 @@ class VoltxEnergyCoordinator(DataUpdateCoordinator):
 
         buy, sell = _get_current_prices(self.hass, self._entry_id)
         self._energy_acc.update(max(0, solar_kw), grid_kw, battery_kw, load_kw, buy, sell)
+
+        energy_summary = self._energy_acc.as_dict()
+
+        # If a daily solar energy entity is configured, use its authoritative kWh
+        # total directly (e.g. Enphase already integrates precisely) rather than
+        # relying on our power accumulator which can drift.
+        if self._solar_energy_entity:
+            kwh = _read_w_entity(self._solar_energy_entity)  # units are kWh, reusing helper
+            if kwh is not None:
+                energy_summary["pv_today_kwh"] = round(kwh, 3)
 
         max_charge_w = attrs.get("battery_max_charge_power_w")
         max_discharge_w = attrs.get("battery_max_discharge_power_w")
@@ -3914,7 +3953,7 @@ class VoltxEnergyCoordinator(DataUpdateCoordinator):
             "work_mode_raw": attrs.get("work_mode_raw"),
             "charge_power_command_w": attrs.get("charge_power_command_w"),
             "last_update": dt_util.utcnow(),
-            "energy_summary": self._energy_acc.as_dict(),
+            "energy_summary": energy_summary,
         }
 
     async def force_charge(self, duration_minutes: int = 30, power_w: float = 0) -> bool:

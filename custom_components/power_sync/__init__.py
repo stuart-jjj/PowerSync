@@ -295,6 +295,9 @@ from .const import (
     CONF_VOLTX_HOST,
     CONF_VOLTX_PORT,
     CONF_VOLTX_SLAVE_ID,
+    CONF_VOLTX_SOLAR_POWER_ENTITY,
+    CONF_VOLTX_SOLAR_ENERGY_ENTITY,
+    CONF_VOLTX_GRID_POWER_ENTITY,
     CONF_SOLAX_ENTITY_PREFIX,
     CONF_SOLAX_BATTERY_NOMINAL_V,
     CONF_SOLAX_MAX_CHARGE_CURRENT_A,
@@ -13883,6 +13886,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             CONF_VOLTX_SLAVE_ID,
             entry.data.get(CONF_VOLTX_SLAVE_ID, DEFAULT_VOLTX_SLAVE_ID),
         )
+        voltx_solar_power_entity = entry.options.get(
+            CONF_VOLTX_SOLAR_POWER_ENTITY,
+            entry.data.get(CONF_VOLTX_SOLAR_POWER_ENTITY),
+        ) or None
+        voltx_solar_energy_entity = entry.options.get(
+            CONF_VOLTX_SOLAR_ENERGY_ENTITY,
+            entry.data.get(CONF_VOLTX_SOLAR_ENERGY_ENTITY),
+        ) or None
+        voltx_grid_power_entity = entry.options.get(
+            CONF_VOLTX_GRID_POWER_ENTITY,
+            entry.data.get(CONF_VOLTX_GRID_POWER_ENTITY),
+        ) or None
 
         _LOGGER.info(
             "Initializing Voltx Modbus coordinator: %s:%s (slave %s)",
@@ -13894,6 +13909,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             port=int(voltx_port),
             slave_id=int(voltx_slave_id),
             entry_id=entry.entry_id,
+            solar_power_entity=voltx_solar_power_entity,
+            solar_energy_entity=voltx_solar_energy_entity,
+            grid_power_entity=voltx_grid_power_entity,
         )
     elif is_esy_sunhome:
         _LOGGER.info("Running in ESY Sunhome mode — bridging via esy_sunhome companion integration")
