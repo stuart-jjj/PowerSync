@@ -25,6 +25,7 @@ from .const import (
     family_device_info,
     SENSOR_FAMILY_BATTERY,
     SENSOR_FAMILY_EV_CHARGING,
+    TESLA_SITE_INFO_CONTROL_MAX_AGE_SECONDS,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -77,6 +78,7 @@ async def async_setup_entry(
 
 class _TeslaSiteNumberBase(NumberEntity):
     _attr_has_entity_name = True
+    _attr_should_poll = True
     _attr_mode = NumberMode.SLIDER
     _attr_native_min_value = 0
     _attr_native_max_value = 100
@@ -97,7 +99,8 @@ class _TeslaSiteNumberBase(NumberEntity):
         self._attr_suggested_object_id = f"power_sync_{key}"
         self._attr_name = name
         self._attr_icon = icon
-        self._attr_entity_category = EntityCategory.CONFIG
+        # No EntityCategory — these are user-facing controls (Backup Reserve etc),
+        # belong in the device card's main Controls section, not Configuration.
 
     @property
     def device_info(self):
@@ -109,6 +112,21 @@ class _TeslaSiteNumberBase(NumberEntity):
             .get(self._entry.entry_id, {})
             .get("tesla_coordinator")
         )
+
+    async def async_update(self) -> None:
+        """Refresh Tesla site_info often enough for controls changed elsewhere."""
+        coord = self._tesla_coord()
+        if coord is None:
+            return
+        try:
+            await coord.async_get_site_info(
+                max_age=TESLA_SITE_INFO_CONTROL_MAX_AGE_SECONDS,
+            )
+        except Exception:
+            _LOGGER.debug(
+                "Could not refresh Tesla site_info for number entity",
+                exc_info=True,
+            )
 
 
 class BackupReserveNumber(_TeslaSiteNumberBase):
@@ -180,7 +198,7 @@ class ForcePowerNumber(NumberEntity):
     _attr_native_step = 0.5
     _attr_native_unit_of_measurement = UnitOfPower.KILO_WATT
     _attr_icon = "mdi:lightning-bolt"
-    _attr_entity_category = EntityCategory.CONFIG
+    # User-facing power input for force charge/discharge — Controls, not Configuration.
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         self.hass = hass

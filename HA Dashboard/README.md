@@ -13,7 +13,7 @@ The strategy dynamically includes sections based on your configuration:
 - **LP Forecast Charts** - 48-hour solar, load, and price forecasts from the built-in optimizer
 - **Solar Curtailment Status** - DC curtailment (Tesla) and AC inverter status cards
 - **AC Inverter Controls** - Load following, shutdown, and restore buttons
-- **FoxESS Sensors** - PV1/PV2, CT2 power, work mode, min SOC, daily energy
+- **PV String Details** - PV1/PV2 power, voltage, and current, plus supported inverter extras
 - **Battery Health** - Overall and individual battery health gauges (up to 4 batteries)
 - **Energy Charts** - Solar, Battery, Grid, and Home load graphs
 - **Demand Charge** - Period status, peak demand, and cost tracking

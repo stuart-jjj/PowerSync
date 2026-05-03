@@ -17,7 +17,7 @@ Supported actions:
 - set_discharge_rate: Set discharge rate limit (Sigenergy only)
 - set_export_limit: Set export power limit (Sigenergy only)
 
-EV Actions (Tesla Fleet/Teslemetry or Tesla BLE):
+EV Actions (Tesla Fleet/Teslemetry, Tesla BLE, OCPP, generic HA, Zaptec, or HA-native chargers):
 - start_ev_charging: Start charging an EV
 - stop_ev_charging: Stop charging an EV
 - set_ev_charge_limit: Set EV charge limit percentage
@@ -35,6 +35,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers import entity_registry as er, device_registry as dr
 from homeassistant.helpers.event import async_track_time_interval, async_track_point_in_time
 from datetime import timedelta, datetime, time as dt_time
+from homeassistant.util import dt as dt_util
 
 from ..const import (
     DOMAIN,
@@ -53,6 +54,10 @@ from ..const import (
     TESLA_BLE_BINARY_STATUS,
     TESLEMETRY_BT_SWITCH_CHARGE,
     TESLEMETRY_BT_NUMBER_CHARGE_AMPS,
+)
+from ..solar_surplus_config import (
+    DEFAULT_SOLAR_SURPLUS_MIN_BATTERY_SOC,
+    get_solar_surplus_min_battery_soc,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -113,6 +118,15 @@ def _is_api_credit_available(api_name: str = "teslemetry") -> bool:
         f"🚫 {api_name.title()} API credits exhausted, {remaining:.1f} minutes remaining in cooldown"
     )
     return False
+
+
+def _coerce_positive_int(value: Any, default: Optional[int] = None) -> Optional[int]:
+    """Return a positive integer from user/config input, or default when invalid."""
+    try:
+        result = int(float(value))
+    except (TypeError, ValueError):
+        return default
+    return result if result > 0 else default
 
 
 def _is_sigenergy(config_entry: ConfigEntry) -> bool:
@@ -632,7 +646,12 @@ async def _set_ev_charge_limit_ble(
 
 
 async def _set_ev_charging_amps_ble(
-    hass: HomeAssistant, ble_prefix: str, amps: int
+    hass: HomeAssistant,
+    ble_prefix: str,
+    amps: int,
+    *,
+    allow_stale_entity_max_override: bool = False,
+    configured_max_amps: Optional[int] = None,
 ) -> bool:
     """Set EV charging amps via Tesla BLE."""
     amps_entity = TESLA_BLE_NUMBER_CHARGING_AMPS.format(prefix=ble_prefix)
@@ -642,10 +661,24 @@ async def _set_ev_charging_amps_ble(
         _LOGGER.error(f"Tesla BLE charging amps entity not found: {amps_entity}")
         return False
 
-    # Cap amps to entity's min/max range
-    entity_min = state.attributes.get("min", 0)
-    entity_max = state.attributes.get("max", amps)
-    capped_amps = max(int(entity_min), min(int(entity_max), int(amps)))
+    # Cap amps to entity's min/max range. Tesla integrations can report a stale
+    # 16A max while idle, so solar-surplus callers may opt into the configured
+    # app/home-power max instead.
+    entity_min = _coerce_positive_int(state.attributes.get("min"), 0) or 0
+    entity_max = _coerce_positive_int(state.attributes.get("max"), int(amps)) or int(amps)
+    effective_max = entity_max
+    if (
+        allow_stale_entity_max_override
+        and configured_max_amps is not None
+        and configured_max_amps > entity_max
+    ):
+        effective_max = configured_max_amps
+        _LOGGER.debug(
+            "BLE amps using configured max %dA over entity max %dA",
+            configured_max_amps,
+            entity_max,
+        )
+    capped_amps = max(entity_min, min(effective_max, int(amps)))
     if capped_amps != amps:
         _LOGGER.debug(f"BLE amps capped from {amps}A to {capped_amps}A (entity range: {entity_min}-{entity_max})")
 
@@ -739,7 +772,12 @@ async def _stop_ev_charging_teslemetry_bt(hass: HomeAssistant, tbt_prefix: str) 
 
 
 async def _set_ev_charging_amps_teslemetry_bt(
-    hass: HomeAssistant, tbt_prefix: str, amps: int
+    hass: HomeAssistant,
+    tbt_prefix: str,
+    amps: int,
+    *,
+    allow_stale_entity_max_override: bool = False,
+    configured_max_amps: Optional[int] = None,
 ) -> bool:
     """Set EV charging amps via Teslemetry Bluetooth."""
     entity_id = TESLEMETRY_BT_NUMBER_CHARGE_AMPS.format(prefix=tbt_prefix)
@@ -747,9 +785,21 @@ async def _set_ev_charging_amps_teslemetry_bt(
     if state is None:
         _LOGGER.error(f"Teslemetry BT charge amps entity not found: {entity_id}")
         return False
-    min_val = float(state.attributes.get("min", 0))
-    max_val = float(state.attributes.get("max", 32))
-    capped = max(int(min_val), min(int(max_val), int(amps)))
+    min_val = _coerce_positive_int(state.attributes.get("min"), 0) or 0
+    max_val = _coerce_positive_int(state.attributes.get("max"), 32) or 32
+    effective_max = max_val
+    if (
+        allow_stale_entity_max_override
+        and configured_max_amps is not None
+        and configured_max_amps > max_val
+    ):
+        effective_max = configured_max_amps
+        _LOGGER.debug(
+            "Teslemetry BT amps using configured max %dA over entity max %dA",
+            configured_max_amps,
+            max_val,
+        )
+    capped = max(min_val, min(effective_max, int(amps)))
     if capped != amps:
         _LOGGER.debug(f"Teslemetry BT amps capped from {amps}A to {capped}A (range: {min_val}-{max_val})")
     try:
@@ -856,26 +906,24 @@ async def execute_actions(
     return success_count > 0
 
 
-_BATTERY_CONTROL_ACTIONS = frozenset({
-    "set_backup_reserve",
-    "preserve_charge",
-    "set_operation_mode",
-    "force_discharge",
-    "force_charge",
-    "curtail_inverter",
-    "restore_inverter",
-    "set_grid_export",
-    "set_grid_charging",
-    "set_storm_watch",
-    "set_off_grid_ev_reserve",
-    "set_vpp_enrollment",
-    "restore_normal",
-    "set_charge_rate",
-    "set_discharge_rate",
-    "set_export_limit",
-    "powerwall_go_off_grid",
-    "powerwall_reconnect_grid",
-})
+def _ev_action_loadpoint_id(params: Dict[str, Any]) -> str:
+    """Return the loadpoint id for direct EV start/stop automation actions."""
+    vehicle_id = params.get("vehicle_id") or params.get("vehicle_vin")
+    if vehicle_id:
+        return str(vehicle_id)
+
+    charger_type = params.get("charger_type")
+    if charger_type == "generic":
+        return "generic_ev"
+    if charger_type == "ocpp":
+        charger_id = str(params.get("ocpp_charger_id") or "ocpp_charger")
+        return charger_id if charger_id.startswith("ocpp_") else f"ocpp_{charger_id}"
+    if charger_type == "zaptec":
+        return "zaptec_standalone"
+
+    return DEFAULT_VEHICLE_ID
+
+
 
 
 async def _execute_single_action(
@@ -898,19 +946,6 @@ async def _execute_single_action(
     Returns:
         True if action executed successfully
     """
-    # Monitoring mode: block battery/grid control actions so automations
-    # don't override the user's manual settings while the optimizer observes only.
-    if action_type in _BATTERY_CONTROL_ACTIONS:
-        from ..const import CONF_MONITORING_MODE
-        if config_entry.options.get(
-            CONF_MONITORING_MODE, config_entry.data.get(CONF_MONITORING_MODE, False)
-        ):
-            _LOGGER.info(
-                "[MONITORING] Automation action '%s' blocked by monitoring mode",
-                action_type,
-            )
-            return None  # Treat as skipped (not applicable), not a failure
-
     if action_type == "set_backup_reserve":
         return await _action_set_backup_reserve(hass, config_entry, params)
     elif action_type == "preserve_charge":
@@ -949,9 +984,26 @@ async def _execute_single_action(
         return await _action_set_export_limit(hass, config_entry, params)
     # EV Charging Actions (pass context for time window support)
     elif action_type == "start_ev_charging":
-        return await _action_start_ev_charging(hass, config_entry, params, context)
+        success = await _action_start_ev_charging(hass, config_entry, params, context)
+        if success and not params.get("skip_ownership"):
+            await record_manual_ev_charging_session(
+                hass,
+                config_entry,
+                _ev_action_loadpoint_id(params),
+                params,
+                reason=params.get("reason", "Manual automation start"),
+            )
+        return success
     elif action_type == "stop_ev_charging":
-        return await _action_stop_ev_charging(hass, config_entry, params)
+        success = await _action_stop_ev_charging(hass, config_entry, params)
+        if success and not params.get("skip_ownership"):
+            await clear_tracked_ev_charging_session(
+                hass,
+                config_entry,
+                _ev_action_loadpoint_id(params),
+                reason=params.get("reason", "Manual automation stop"),
+            )
+        return success
     elif action_type == "set_ev_charge_limit":
         return await _action_set_ev_charge_limit(hass, config_entry, params)
     elif action_type == "set_ev_charging_amps":
@@ -1780,15 +1832,43 @@ async def _action_restore_inverter(
 
 
 async def _start_ocpp_charging(hass: HomeAssistant, charger_id: str) -> bool:
-    """Start charging on an OCPP charger via its HA switch entity."""
+    """Start charging on an OCPP charger via its HA switch entity.
+
+    When the connector is in "Finishing" (the post-stop state some chargers
+    sit in until the cable is unplugged), a plain turn_on can be a no-op:
+    HACS lbbrhzn/ocpp's charge_control switch caches its is_on state and the
+    underlying RemoteStartTransaction never gets sent. Toggle off→on first
+    in that case to force a fresh RemoteStartTransaction.
+    """
     entity_id = f"switch.{charger_id}_charge_control"
     state = hass.states.get(entity_id)
     if not state:
         _LOGGER.error("OCPP start: entity %s not found", entity_id)
         return False
+
+    connector_state = hass.states.get(f"sensor.{charger_id}_status_connector")
+    needs_reset = (
+        connector_state is not None
+        and connector_state.state.lower() == "finishing"
+    )
+
     try:
+        if needs_reset:
+            try:
+                await hass.services.async_call(
+                    "switch", "turn_off", {"entity_id": entity_id}, blocking=True
+                )
+                await asyncio.sleep(1)
+            except Exception as off_err:
+                _LOGGER.debug("OCPP pre-start reset turn_off failed for %s: %s", charger_id, off_err)
         await hass.services.async_call("switch", "turn_on", {"entity_id": entity_id}, blocking=True)
-        _LOGGER.info("OCPP charger %s: start charging via %s", charger_id, entity_id)
+        if needs_reset:
+            _LOGGER.info(
+                "OCPP charger %s: start charging via %s (reset from Finishing)",
+                charger_id, entity_id,
+            )
+        else:
+            _LOGGER.info("OCPP charger %s: start charging via %s", charger_id, entity_id)
         return True
     except Exception as e:
         _LOGGER.error("OCPP start charging failed for %s: %s", charger_id, e)
@@ -1811,6 +1891,263 @@ async def _stop_ocpp_charging(hass: HomeAssistant, charger_id: str) -> bool:
         return False
 
 
+def _find_ocpp_current_limit_entity(hass: HomeAssistant, charger_id: str) -> Optional[str]:
+    """Find a HACS OCPP number entity that can set a charger's current limit."""
+    charger_key = str(charger_id).lower()
+    current_keys = (
+        "maximum_current",
+        "max_current",
+        "current_limit",
+        "charging_current",
+        "charge_current",
+        "current",
+        "amps",
+    )
+
+    def _matches(entity_id: str) -> bool:
+        entity_lower = entity_id.lower()
+        if not entity_lower.startswith("number."):
+            return False
+        object_id = entity_lower.split(".", 1)[1]
+        if not object_id.startswith(f"{charger_key}_"):
+            return False
+        return any(key in object_id for key in current_keys)
+
+    candidates: List[str] = []
+
+    try:
+        entity_reg = er.async_get(hass)
+        for entity in entity_reg.entities.values():
+            if getattr(entity, "platform", None) != "ocpp":
+                continue
+            if _matches(entity.entity_id):
+                candidates.append(entity.entity_id)
+    except Exception:
+        pass
+
+    if not candidates:
+        try:
+            for entity_id in hass.states.async_entity_ids("number"):
+                if _matches(entity_id):
+                    candidates.append(entity_id)
+        except Exception:
+            pass
+
+    if not candidates:
+        return None
+
+    def _priority(entity_id: str) -> int:
+        object_id = entity_id.lower().split(".", 1)[1]
+        for idx, key in enumerate(current_keys):
+            if object_id.endswith(key) or f"_{key}_" in object_id:
+                return idx
+        return len(current_keys)
+
+    return sorted(set(candidates), key=_priority)[0]
+
+
+def _generic_charger_ready_for_start(
+    hass: HomeAssistant,
+    params: Dict[str, Any],
+) -> tuple[bool, str | None]:
+    """Return whether a generic charger appears to have a vehicle connected."""
+    status_entity = params.get("charger_status_entity")
+    if not status_entity:
+        return True, None
+
+    state = hass.states.get(status_entity)
+    if not state or state.state in ("unavailable", "unknown"):
+        return True, None
+
+    status_lower = state.state.lower()
+    if status_lower not in ("available", "disconnected"):
+        return True, None
+
+    car_present_states = {
+        "preparing",
+        "charging",
+        "suspendedev",
+        "suspendedevse",
+        "suspended_ev",
+        "suspended_evse",
+        "finishing",
+    }
+    car_on_connector = any(
+        s.state.lower() in car_present_states
+        for s in hass.states.async_all()
+        if s.entity_id.startswith("sensor.")
+        and s.entity_id.endswith("_status_connector")
+        and s.state not in ("unavailable", "unknown")
+    )
+    if car_on_connector:
+        _LOGGER.debug(
+            "Generic charger: %s=%s but connector shows car present",
+            status_entity,
+            state.state,
+        )
+        return True, None
+
+    return False, "Vehicle is not plugged in"
+
+
+def _get_zaptec_standalone(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry | None,
+) -> Optional[Dict[str, Any]]:
+    """Return the configured Zaptec standalone client and cached charger state."""
+    from ..const import (
+        CONF_ZAPTEC_CHARGER_ID,
+        CONF_ZAPTEC_INSTALLATION_ID_CLOUD,
+        CONF_ZAPTEC_STANDALONE_ENABLED,
+        CONF_ZAPTEC_USERNAME,
+    )
+
+    candidates = [config_entry] if config_entry is not None else []
+    try:
+        for entry in hass.config_entries.async_entries(DOMAIN):
+            if entry is not config_entry:
+                candidates.append(entry)
+    except Exception:
+        pass
+
+    for entry in candidates:
+        opts = {**getattr(entry, "data", {}), **getattr(entry, "options", {})}
+        if not (
+            opts.get(CONF_ZAPTEC_STANDALONE_ENABLED)
+            and opts.get(CONF_ZAPTEC_USERNAME)
+        ):
+            continue
+
+        entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+        client = entry_data.get("zaptec_client")
+        charger_id = opts.get(CONF_ZAPTEC_CHARGER_ID, "")
+        if not client or not charger_id:
+            continue
+
+        return {
+            "client": client,
+            "charger_id": charger_id,
+            "installation_id": opts.get(CONF_ZAPTEC_INSTALLATION_ID_CLOUD, ""),
+            "cached_state": entry_data.get("zaptec_cached_state", {}),
+        }
+
+    return None
+
+
+def _zaptec_state_value(cached_state: Dict[str, Any], key: str, default: Any = None) -> Any:
+    """Read Zaptec cached state defensively; tests use simple dict stubs."""
+    value = cached_state.get(key, default)
+    return default if value is None else value
+
+
+async def _set_zaptec_charging_amps(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry | None,
+    amps: int,
+) -> bool:
+    """Set Zaptec standalone installation current."""
+    zaptec = _get_zaptec_standalone(hass, config_entry)
+    if not zaptec:
+        _LOGGER.error("Zaptec set amps: standalone charger is not configured")
+        return False
+
+    installation_id = zaptec.get("installation_id")
+    if not installation_id:
+        _LOGGER.error("Zaptec set amps: no installation ID configured")
+        return False
+
+    target_amps = max(0, min(80, int(amps)))
+    try:
+        await zaptec["client"].set_installation_current(installation_id, target_amps)
+        _LOGGER.info("Zaptec charger set to %dA", target_amps)
+        return True
+    except Exception as e:
+        _LOGGER.error("Zaptec set amps failed: %s", e)
+        return False
+
+
+async def _start_zaptec_charging(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry | None,
+    amps: Optional[int] = None,
+) -> bool:
+    """Start Zaptec standalone charging with state-aware command selection."""
+    zaptec = _get_zaptec_standalone(hass, config_entry)
+    if not zaptec:
+        _LOGGER.error("Zaptec start: standalone charger is not configured")
+        return False
+
+    cached_state = zaptec.get("cached_state") or {}
+    charger_mode = str(_zaptec_state_value(cached_state, "charger_operation_mode", "")).lower()
+    try:
+        power_w = float(_zaptec_state_value(cached_state, "total_charge_power_w", 0) or 0)
+    except (TypeError, ValueError):
+        power_w = 0
+    cable_locked = bool(_zaptec_state_value(cached_state, "cable_locked", False))
+
+    if charger_mode not in ("connected_waiting", "charging") and power_w <= 50 and not cable_locked:
+        _LOGGER.warning("Zaptec start: vehicle is not plugged in")
+        return False
+
+    target_amps = int(amps) if amps is not None else None
+
+    if charger_mode == "charging":
+        if target_amps is not None:
+            await _set_zaptec_charging_amps(hass, config_entry, target_amps)
+        _LOGGER.info("Zaptec charger is already charging")
+        return True
+
+    if charger_mode == "connected_waiting":
+        if not await _set_zaptec_charging_amps(hass, config_entry, target_amps or 16):
+            _LOGGER.warning("Zaptec start: waiting charger could not be assigned current")
+            return False
+        _LOGGER.info("Zaptec charger waiting: set installation current instead of resume")
+        return True
+
+    try:
+        if target_amps is not None and zaptec.get("installation_id"):
+            await _set_zaptec_charging_amps(hass, config_entry, target_amps)
+        await zaptec["client"].resume_charging(zaptec["charger_id"])
+        _LOGGER.info("Zaptec charger resumed via Cloud API")
+        return True
+    except Exception as e:
+        _LOGGER.error("Zaptec start charging failed: %s", e)
+        return False
+
+
+async def _stop_zaptec_charging(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry | None,
+) -> bool:
+    """Stop Zaptec standalone charging, treating already-idle states as success."""
+    zaptec = _get_zaptec_standalone(hass, config_entry)
+    if not zaptec:
+        _LOGGER.error("Zaptec stop: standalone charger is not configured")
+        return False
+
+    cached_state = zaptec.get("cached_state") or {}
+    charger_mode = str(_zaptec_state_value(cached_state, "charger_operation_mode", "")).lower()
+    try:
+        power_w = float(_zaptec_state_value(cached_state, "total_charge_power_w", 0) or 0)
+    except (TypeError, ValueError):
+        power_w = 0
+
+    if charger_mode in ("connected_waiting", "disconnected", "") and power_w <= 50:
+        _LOGGER.info(
+            "Zaptec charger already in %s mode, skipping stop command",
+            charger_mode or "unknown",
+        )
+        return True
+
+    try:
+        await zaptec["client"].stop_charging(zaptec["charger_id"])
+        _LOGGER.info("Zaptec charger stopped via Cloud API")
+        return True
+    except Exception as e:
+        _LOGGER.error("Zaptec stop charging failed: %s", e)
+        return False
+
+
 async def _action_start_ev_charging(
     hass: HomeAssistant,
     config_entry: ConfigEntry,
@@ -1818,10 +2155,11 @@ async def _action_start_ev_charging(
     context: Optional[Dict[str, Any]] = None
 ) -> bool:
     """
-    Start EV charging via Tesla, OCPP, or generic charger.
+    Start EV charging via Tesla, OCPP, generic, or Zaptec charger.
 
     Dispatches based on charger_type parameter. Tesla uses BLE/Fleet API,
-    OCPP uses HA switch entities, generic uses configured switch entity.
+    OCPP uses HA switch entities, generic uses configured switch entity,
+    Zaptec uses the standalone Cloud client.
 
     Parameters:
         stop_outside_window: If True, schedule charging to stop at end of time window
@@ -1836,11 +2174,30 @@ async def _action_start_ev_charging(
             return False
         return await _start_ocpp_charging(hass, ocpp_charger_id)
 
+    # Zaptec standalone charger: use configured Cloud API client
+    if charger_type == "zaptec":
+        amps = params.get("amps")
+        if amps is None:
+            amps = params.get("charging_amps")
+        return await _start_zaptec_charging(
+            hass,
+            config_entry,
+            int(amps) if amps is not None else None,
+        )
+
     # Generic charger: use configured switch entity
     if charger_type == "generic":
-        switch_entity = params.get("charger_switch_entity")
+        ready, block_reason = _generic_charger_ready_for_start(hass, params)
+        if not ready:
+            _LOGGER.warning("Generic charger start blocked: %s", block_reason)
+            return False
+
+        switch_entity = (params.get("charger_switch_entity") or "").strip()
         if not switch_entity:
             _LOGGER.error("Generic charger start: no switch entity configured")
+            return False
+        if "." not in switch_entity:
+            _LOGGER.error("Generic charger start: invalid switch entity %s", switch_entity)
             return False
         try:
             await hass.services.async_call("switch", "turn_on", {"entity_id": switch_entity}, blocking=True)
@@ -1849,6 +2206,20 @@ async def _action_start_ev_charging(
         except Exception as e:
             _LOGGER.error("Generic charger start failed: %s", e)
             return False
+
+    # HA-native charger integrations: Wallbox, Easee, native Zaptec, ev_charger,
+    # and similar entities that expose service-domain start/stop methods.
+    if _is_ha_native_charger_type(charger_type):
+        amps = params.get("amps")
+        if amps is None:
+            amps = params.get("charging_amps")
+        if amps is not None:
+            amps_ok = await _set_ha_native_charging_amps(hass, params, int(amps))
+            if not amps_ok:
+                _LOGGER.debug(
+                    "HA-native charger start will continue although current limit update failed"
+                )
+        return await _start_ha_native_charger(hass, params)
 
     # Tesla charger: existing logic below
     ev_config = _get_ev_config(config_entry)
@@ -1957,7 +2328,14 @@ async def _action_start_ev_charging(
             async def stop_charging_at_window_end(now) -> None:
                 """Stop charging when time window ends."""
                 _LOGGER.info(f"⏰ Time window ended, stopping EV charging")
-                await _action_stop_ev_charging(hass, config_entry, params)
+                stop_success = await _action_stop_ev_charging(hass, config_entry, params)
+                if stop_success and not params.get("skip_ownership"):
+                    await clear_tracked_ev_charging_session(
+                        hass,
+                        config_entry,
+                        _ev_action_loadpoint_id(params),
+                        reason="time window ended",
+                    )
                 # Send notification that charging stopped
                 await _send_expo_push(hass, "EV Charging", "Stopped - time window ended")
                 # Clean up the scheduled stop entry
@@ -1987,7 +2365,7 @@ async def _action_stop_ev_charging(
     params: Dict[str, Any]
 ) -> bool:
     """
-    Stop EV charging via Tesla, OCPP, or generic charger.
+    Stop EV charging via Tesla, OCPP, generic, or Zaptec charger.
 
     Dispatches based on charger_type parameter.
     Also cancels any scheduled stop from stop_outside_window.
@@ -2012,11 +2390,18 @@ async def _action_stop_ev_charging(
             return False
         return await _stop_ocpp_charging(hass, ocpp_charger_id)
 
+    # Zaptec standalone charger
+    if charger_type == "zaptec":
+        return await _stop_zaptec_charging(hass, config_entry)
+
     # Generic charger
     if charger_type == "generic":
-        switch_entity = params.get("charger_switch_entity")
+        switch_entity = (params.get("charger_switch_entity") or "").strip()
         if not switch_entity:
             _LOGGER.error("Generic charger stop: no switch entity configured")
+            return False
+        if "." not in switch_entity:
+            _LOGGER.error("Generic charger stop: invalid switch entity %s", switch_entity)
             return False
         try:
             await hass.services.async_call("switch", "turn_off", {"entity_id": switch_entity}, blocking=True)
@@ -2026,11 +2411,24 @@ async def _action_stop_ev_charging(
             _LOGGER.error("Generic charger stop failed: %s", e)
             return False
 
+    # HA-native charger integrations
+    if _is_ha_native_charger_type(charger_type):
+        return await _stop_ha_native_charger(hass, params)
+
     # Tesla charger: existing logic below
     ev_config = _get_ev_config(config_entry)
     ev_provider = ev_config["ev_provider"]
     vehicle_vin = params.get("vehicle_vin")
     ble_prefix = _resolve_ble_prefix_for_vehicle(hass, config_entry, vehicle_vin)
+
+    charging_entity = await _get_tesla_ev_entity(hass, r"sensor\..*_charging$", vehicle_vin)
+    if charging_entity:
+        charging_state = hass.states.get(charging_entity)
+        if charging_state and charging_state.state not in ("unavailable", "unknown"):
+            state_lower = charging_state.state.lower()
+            if state_lower and state_lower != "charging":
+                _LOGGER.info("EV is not charging (state: %s) - treating stop as complete", state_lower)
+                return True
 
     # Try Teslemetry Bluetooth first if configured
     if ev_provider in (EV_PROVIDER_TESLEMETRY_BT, EV_PROVIDER_BOTH):
@@ -2098,10 +2496,10 @@ async def _action_set_ev_charge_limit(
 ) -> bool:
     """
     Set EV charge limit percentage via Tesla Fleet/Teslemetry or Tesla BLE.
-    OCPP and generic chargers don't support charge limits — returns True (no-op).
+    OCPP, generic, and Zaptec chargers don't support vehicle charge limits — returns True (no-op).
     """
     charger_type = params.get("charger_type", "tesla")
-    if charger_type in ("ocpp", "generic"):
+    if charger_type in ("ocpp", "generic", "zaptec"):
         _LOGGER.info("set_ev_charge_limit: not supported for %s chargers (no-op)", charger_type)
         return True
 
@@ -2177,10 +2575,13 @@ async def _action_set_ev_charging_amps(
     params: Dict[str, Any]
 ) -> bool:
     """
-    Set EV charging amperage via Tesla, OCPP, or generic charger.
+    Set EV charging amperage via Tesla, OCPP, generic, or Zaptec charger.
     """
-    # Accept both "amps" and "charging_amps" for flexibility
-    amps = params.get("amps") or params.get("charging_amps")
+    # Accept both "amps" and "charging_amps" for flexibility. Preserve 0A
+    # values for charger APIs that use amps=0 as a pause/stop command.
+    amps = params.get("amps")
+    if amps is None:
+        amps = params.get("charging_amps")
     if amps is None:
         _LOGGER.error("set_ev_charging_amps: missing amps parameter")
         return False
@@ -2194,6 +2595,14 @@ async def _action_set_ev_charging_amps(
             _LOGGER.error("OCPP set amps: no charger ID configured")
             return False
         return await _set_ocpp_charging_amps(hass, ocpp_charger_id, int(amps))
+
+    # Zaptec standalone charger
+    if charger_type == "zaptec":
+        return await _set_zaptec_charging_amps(hass, config_entry, int(amps))
+
+    # HA-native charger integrations
+    if _is_ha_native_charger_type(charger_type):
+        return await _set_ha_native_charging_amps(hass, params, int(amps))
 
     # Generic charger
     if charger_type == "generic":
@@ -2214,17 +2623,29 @@ async def _action_set_ev_charging_amps(
     ev_provider = ev_config["ev_provider"]
     vehicle_vin = params.get("vehicle_vin")
     ble_prefix = _resolve_ble_prefix_for_vehicle(hass, config_entry, vehicle_vin)
+    configured_max_amps = _coerce_positive_int(params.get("max_charge_amps"))
+    allow_stale_entity_max_override = bool(
+        params.get("allow_stale_entity_max_override")
+    )
 
     # Clamp to valid range (5-48A typical, but allow up to 80A for some chargers)
     # Note: Tesla vehicles refuse charging below 5A, so we enforce 5A minimum
     # Tesla BLE supports same 5-32A range as cloud API
     amps = max(5, min(80, int(amps)))
+    if configured_max_amps is not None:
+        amps = min(configured_max_amps, amps)
 
     # Try Teslemetry Bluetooth first if configured
     if ev_provider in (EV_PROVIDER_TESLEMETRY_BT, EV_PROVIDER_BOTH):
         tbt_prefix = _resolve_teslemetry_bt_prefix(hass)
         if _is_teslemetry_bt_available(hass, tbt_prefix):
-            result = await _set_ev_charging_amps_teslemetry_bt(hass, tbt_prefix, amps)
+            result = await _set_ev_charging_amps_teslemetry_bt(
+                hass,
+                tbt_prefix,
+                amps,
+                allow_stale_entity_max_override=allow_stale_entity_max_override,
+                configured_max_amps=configured_max_amps,
+            )
             if result or ev_provider == EV_PROVIDER_TESLEMETRY_BT:
                 return result
 
@@ -2232,7 +2653,13 @@ async def _action_set_ev_charging_amps(
     ble_amps = amps
     if ev_provider in (EV_PROVIDER_TESLA_BLE, EV_PROVIDER_BOTH):
         if _is_ble_available(hass, ble_prefix):
-            result = await _set_ev_charging_amps_ble(hass, ble_prefix, ble_amps)
+            result = await _set_ev_charging_amps_ble(
+                hass,
+                ble_prefix,
+                ble_amps,
+                allow_stale_entity_max_override=allow_stale_entity_max_override,
+                configured_max_amps=configured_max_amps,
+            )
             if result or ev_provider == EV_PROVIDER_TESLA_BLE:
                 return result
 
@@ -2258,10 +2685,22 @@ async def _action_set_ev_charging_amps(
             # Check entity's actual min/max limits and clamp accordingly
             entity_state = hass.states.get(charging_amps_entity)
             if entity_state:
-                entity_min = entity_state.attributes.get("min", 5)
-                entity_max = entity_state.attributes.get("max", 32)
+                entity_min = _coerce_positive_int(entity_state.attributes.get("min"), 5) or 5
+                entity_max = _coerce_positive_int(entity_state.attributes.get("max"), 32) or 32
+                effective_max = entity_max
+                if (
+                    allow_stale_entity_max_override
+                    and configured_max_amps is not None
+                    and configured_max_amps > entity_max
+                ):
+                    effective_max = configured_max_amps
+                    _LOGGER.debug(
+                        "Tesla charging amps using configured max %dA over entity max %dA",
+                        configured_max_amps,
+                        entity_max,
+                    )
                 original_amps = amps
-                amps = max(entity_min, min(entity_max, amps))
+                amps = max(entity_min, min(effective_max, amps))
                 if amps != original_amps:
                     _LOGGER.info(
                         f"Clamped charging amps from {original_amps}A to {amps}A "
@@ -2309,6 +2748,318 @@ _ev_scheduled_stop: Dict[str, Any] = {}
 
 # Default vehicle ID for single-vehicle setups
 DEFAULT_VEHICLE_ID = "_default"
+
+# Internal charger type for HA-native charger integrations that expose their
+# own service domains rather than the generic switch/number model.
+HA_NATIVE_CHARGER_TYPES = {
+    "ha_native",
+    "native",
+    "ev_charger",
+    "wallbox",
+    "easee",
+    "zaptec_native",
+}
+
+
+def _is_ha_native_charger_type(charger_type: Any) -> bool:
+    """Return whether params refer to a HA-native charger integration."""
+    return str(charger_type or "").lower() in HA_NATIVE_CHARGER_TYPES
+
+
+def _ha_native_charger_entity(params: Dict[str, Any]) -> str:
+    """Return the HA entity id used by a HA-native charger adapter."""
+    return str(
+        params.get("charger_entity_id")
+        or params.get("entity_id")
+        or params.get("charger_switch_entity")
+        or ""
+    ).strip()
+
+
+def _ha_native_charger_domain(params: Dict[str, Any], entity_id: str) -> str:
+    """Return the HA service domain for a native charger entity."""
+    configured_domain = str(params.get("charger_domain") or "").strip()
+    if configured_domain:
+        return configured_domain
+    if "." in entity_id:
+        return entity_id.split(".", 1)[0]
+    charger_type = str(params.get("charger_type") or "").strip()
+    if charger_type in HA_NATIVE_CHARGER_TYPES and charger_type not in ("ha_native", "native", "zaptec_native"):
+        return charger_type
+    if charger_type == "zaptec_native":
+        return "zaptec"
+    return "homeassistant"
+
+
+def _ha_native_charger_amps_entity(hass: HomeAssistant, params: Dict[str, Any], entity_id: str) -> str:
+    """Find a number entity that controls HA-native charger amps."""
+    explicit_entity = str(params.get("charger_amps_entity") or "").strip()
+    if explicit_entity:
+        return explicit_entity
+
+    candidates: list[str] = []
+    if entity_id:
+        candidates.append(
+            entity_id.replace("switch.", "number.").replace("_charger", "_charging_amps")
+        )
+        candidates.extend(
+            entity_id.replace("switch.", "number.") + suffix
+            for suffix in ("_amps", "_charging_amps", "_current", "_charging_current")
+        )
+
+    for number_entity in candidates:
+        if hass.states.get(number_entity):
+            return number_entity
+    return ""
+
+
+async def _set_ha_native_charging_amps(
+    hass: HomeAssistant,
+    params: Dict[str, Any],
+    amps: int,
+) -> bool:
+    """Set charging current for HA-native charger integrations."""
+    entity_id = _ha_native_charger_entity(params)
+    domain = _ha_native_charger_domain(params, entity_id)
+
+    if not entity_id and domain != "zaptec":
+        _LOGGER.error("HA-native charger set amps: no charger entity configured")
+        return False
+
+    try:
+        if domain == "wallbox":
+            await hass.services.async_call(
+                "wallbox",
+                "set_charging_current",
+                {"entity_id": entity_id, "charging_current": amps},
+                blocking=True,
+            )
+            _LOGGER.debug("Set Wallbox charging amps to %dA", amps)
+            return True
+
+        if domain == "easee":
+            await hass.services.async_call(
+                "easee",
+                "set_charger_dynamic_limit",
+                {"entity_id": entity_id, "current": amps},
+                blocking=True,
+            )
+            _LOGGER.debug("Set Easee charging amps to %dA", amps)
+            return True
+
+        if domain == "zaptec":
+            installation_id = str(
+                params.get("zaptec_installation_id")
+                or params.get("zaptec_installation_id_cloud")
+                or ""
+            ).strip()
+            if installation_id:
+                await hass.services.async_call(
+                    "zaptec",
+                    "limit_current",
+                    {"device_id": installation_id, "available_current": amps},
+                    blocking=True,
+                )
+                _LOGGER.debug("Set HA Zaptec charging amps to %dA", amps)
+                return True
+
+        if domain == "ocpp":
+            await hass.services.async_call(
+                "ocpp",
+                "set_charge_rate",
+                {"entity_id": entity_id, "limit_amps": amps},
+                blocking=True,
+            )
+            _LOGGER.debug("Set native OCPP charging amps to %dA", amps)
+            return True
+
+        amps_entity = _ha_native_charger_amps_entity(hass, params, entity_id)
+        if amps_entity:
+            await hass.services.async_call(
+                "number",
+                "set_value",
+                {"entity_id": amps_entity, "value": amps},
+                blocking=True,
+            )
+            _LOGGER.debug("Set HA-native charger amps via %s to %dA", amps_entity, amps)
+            return True
+    except Exception as err:
+        _LOGGER.error("Failed to set HA-native charger amps: %s", err)
+        return False
+
+    _LOGGER.debug("No HA-native charger amp control found for %s", entity_id or domain)
+    return False
+
+
+async def _start_ha_native_charger(
+    hass: HomeAssistant,
+    params: Dict[str, Any],
+) -> bool:
+    """Start charging through a HA-native charger integration."""
+    entity_id = _ha_native_charger_entity(params)
+    domain = _ha_native_charger_domain(params, entity_id)
+
+    if not entity_id:
+        _LOGGER.error("HA-native charger start: no charger entity configured")
+        return False
+
+    try:
+        if domain == "switch":
+            service_domain = "switch"
+            service = "turn_on"
+        elif domain in ("ev_charger", "ocpp", "wallbox", "easee", "zaptec"):
+            service_domain = domain
+            service = "resume_charging" if domain == "zaptec" else "start_charging"
+        else:
+            service_domain = "homeassistant"
+            service = "turn_on"
+
+        await hass.services.async_call(
+            service_domain,
+            service,
+            {"entity_id": entity_id},
+            blocking=True,
+        )
+        _LOGGER.info("Started HA-native charger via %s.%s for %s", service_domain, service, entity_id)
+        return True
+    except Exception as err:
+        _LOGGER.error("HA-native charger start failed: %s", err)
+        return False
+
+
+async def _stop_ha_native_charger(
+    hass: HomeAssistant,
+    params: Dict[str, Any],
+) -> bool:
+    """Stop charging through a HA-native charger integration."""
+    entity_id = _ha_native_charger_entity(params)
+    domain = _ha_native_charger_domain(params, entity_id)
+
+    if not entity_id:
+        _LOGGER.error("HA-native charger stop: no charger entity configured")
+        return False
+
+    try:
+        if domain == "switch":
+            service_domain = "switch"
+            service = "turn_off"
+        elif domain in ("ev_charger", "ocpp", "wallbox", "easee", "zaptec"):
+            service_domain = domain
+            service = "stop_charging"
+        else:
+            service_domain = "homeassistant"
+            service = "turn_off"
+
+        await hass.services.async_call(
+            service_domain,
+            service,
+            {"entity_id": entity_id},
+            blocking=True,
+        )
+        _LOGGER.info("Stopped HA-native charger via %s.%s for %s", service_domain, service, entity_id)
+        return True
+    except Exception as err:
+        _LOGGER.error("HA-native charger stop failed: %s", err)
+        return False
+
+
+async def record_manual_ev_charging_session(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    vehicle_id: Optional[str] = None,
+    params: Optional[Dict[str, Any]] = None,
+    reason: str = "Manual charging",
+) -> None:
+    """Record a user-started EV session so automation modes do not fight it."""
+    from ..const import DOMAIN
+
+    entry_id = config_entry.entry_id
+    resolved_vehicle_id = vehicle_id or DEFAULT_VEHICLE_ID
+
+    # If another PowerSync mode owned this loadpoint, release its timers and
+    # session bookkeeping without sending another physical stop command.
+    await clear_tracked_ev_charging_session(
+        hass,
+        config_entry,
+        resolved_vehicle_id,
+        reason="manual override",
+    )
+
+    full_params = {
+        "dynamic_mode": "manual",
+        "owner_mode": "manual",
+        "vehicle_id": resolved_vehicle_id,
+        "vehicle_vin": None if resolved_vehicle_id == DEFAULT_VEHICLE_ID else resolved_vehicle_id,
+        **(params or {}),
+    }
+
+    if entry_id not in _dynamic_ev_state:
+        _dynamic_ev_state[entry_id] = {}
+
+    session_id = None
+    try:
+        from .ev_charging_session import get_session_manager
+        session_manager = get_session_manager()
+        if session_manager:
+            session = await session_manager.start_session(
+                vehicle_id=resolved_vehicle_id,
+                mode="manual",
+            )
+            session_id = session.id
+    except Exception as e:
+        _LOGGER.debug("Manual EV: could not start session tracking: %s", e)
+
+    _dynamic_ev_state[entry_id][resolved_vehicle_id] = {
+        "active": True,
+        "params": full_params,
+        "current_amps": 0,
+        "target_amps": 0,
+        "cancel_timer": None,
+        "priority": 0,
+        "paused": False,
+        "paused_reason": None,
+        "charging_started": True,
+        "entity_max_rechecked": True,
+        "allocated_surplus_kw": 0,
+        "reason": reason,
+        "vehicle_name": full_params.get("vehicle_name"),
+        "session_id": session_id,
+    }
+    from .ev_ownership import claim_ev_ownership
+    _dynamic_ev_state[entry_id][resolved_vehicle_id]["ownership"] = claim_ev_ownership(
+        hass,
+        config_entry,
+        resolved_vehicle_id,
+        owner_mode="manual",
+        session_id=session_id,
+        reason=reason,
+        command="start",
+        extra={"charger_type": full_params.get("charger_type", "tesla")},
+    )
+
+    if DOMAIN in hass.data and entry_id in hass.data[DOMAIN]:
+        hass.data[DOMAIN][entry_id]["dynamic_ev_state"] = _dynamic_ev_state[entry_id]
+
+    _LOGGER.info("Manual EV charging session recorded for %s", resolved_vehicle_id)
+
+
+async def clear_tracked_ev_charging_session(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    vehicle_id: Optional[str] = None,
+    reason: str = "manual stop",
+) -> None:
+    """Clear PowerSync EV ownership without sending a physical stop command."""
+    await _action_stop_ev_charging_dynamic(
+        hass,
+        config_entry,
+        {
+            "vehicle_id": vehicle_id or DEFAULT_VEHICLE_ID,
+            "stop_charging": False,
+            "manual_stop": True,
+            "stop_reason": reason,
+        },
+    )
 
 
 def _calculate_solar_surplus(live_status: dict, current_ev_power_kw: float, config: dict) -> float:
@@ -2411,14 +3162,14 @@ def _get_current_ev_prices(hass, entry_id: str) -> tuple:
         buy_prices = sigenergy_tariff.get("buy_prices", [])
         sell_prices = sigenergy_tariff.get("sell_prices", [])
         if buy_prices:
-            now = datetime.now()
+            now = dt_util.now()  # HA tz; container UTC would pick wrong slot
             current_time = f"{now.hour:02d}:{30 if now.minute >= 30 else 0:02d}"
             for slot in buy_prices:
                 if slot.get("timeRange", "").startswith(current_time):
                     import_price = slot.get("price", 30.0)
                     break
         if sell_prices:
-            now = datetime.now()
+            now = dt_util.now()  # HA tz; container UTC would pick wrong slot
             current_time = f"{now.hour:02d}:{30 if now.minute >= 30 else 0:02d}"
             for slot in sell_prices:
                 if slot.get("timeRange", "").startswith(current_time):
@@ -2440,7 +3191,7 @@ def get_price_recommendation(
     export_price_cents: float,
     surplus_kw: float,
     battery_soc: float,
-    min_battery_soc: float = 80,
+    min_battery_soc: float = DEFAULT_SOLAR_SURPLUS_MIN_BATTERY_SOC,
     prefer_export_threshold_cents: float = 15.0,
 ) -> dict:
     """
@@ -2663,13 +3414,13 @@ async def _solar_surplus_switch_to_next_vehicle(
 
 async def _set_vehicle_amps(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
+    config_entry: ConfigEntry | None,
     vehicle_id: str,
     amps: int,
     params: dict
 ) -> bool:
     """
-    Set charging amps for any charger type (Tesla, OCPP, generic HA entities).
+    Set charging amps for any charger type (Tesla, OCPP, generic HA entities, Zaptec).
 
     Args:
         hass: Home Assistant instance
@@ -2688,7 +3439,12 @@ async def _set_vehicle_amps(
             return await _action_stop_ev_charging(hass, config_entry, {"vehicle_vin": vehicle_id})
         return await _action_set_ev_charging_amps(hass, config_entry, {
             "amps": amps,
-            "vehicle_vin": vehicle_id if vehicle_id != DEFAULT_VEHICLE_ID else None
+            "vehicle_vin": vehicle_id if vehicle_id != DEFAULT_VEHICLE_ID else None,
+            "max_charge_amps": params.get("max_charge_amps"),
+            "allow_stale_entity_max_override": params.get(
+                "allow_stale_entity_max_override",
+                False,
+            ),
         })
 
     elif charger_type == "ocpp":
@@ -2700,8 +3456,31 @@ async def _set_vehicle_amps(
             return await _stop_ocpp_charging(hass, ocpp_charger_id)
         # Set amps then ensure charger is on (idempotent)
         amps_ok = await _set_ocpp_charging_amps(hass, ocpp_charger_id, amps)
-        await _start_ocpp_charging(hass, ocpp_charger_id)
-        return amps_ok
+        start_ok = await _start_ocpp_charging(hass, ocpp_charger_id)
+        if not amps_ok:
+            _LOGGER.debug(
+                "OCPP charger %s start command %s even though current limit update failed",
+                ocpp_charger_id, "succeeded" if start_ok else "failed",
+            )
+        return start_ok
+
+    elif charger_type == "zaptec":
+        if amps == 0:
+            return await _stop_zaptec_charging(hass, config_entry)
+        return await _start_zaptec_charging(hass, config_entry, amps)
+
+    elif _is_ha_native_charger_type(charger_type):
+        if amps == 0:
+            return await _stop_ha_native_charger(hass, params)
+
+        amps_ok = await _set_ha_native_charging_amps(hass, params, amps)
+        start_ok = await _start_ha_native_charger(hass, params)
+        if not amps_ok:
+            _LOGGER.debug(
+                "HA-native charger start command %s even though current limit update failed",
+                "succeeded" if start_ok else "failed",
+            )
+        return start_ok
 
     elif charger_type == "generic":
         # Use HA service calls to switch and number entities
@@ -2729,6 +3508,10 @@ async def _set_vehicle_amps(
                     )
             else:
                 # Set amps and ensure charger is on
+                ready, block_reason = _generic_charger_ready_for_start(hass, params)
+                if not ready:
+                    _LOGGER.warning("Generic charger set amps blocked: %s", block_reason)
+                    return False
                 if amps_entity:
                     await hass.services.async_call(
                         "number", "set_value",
@@ -2751,9 +3534,23 @@ async def _set_vehicle_amps(
     return False
 
 
+def _effective_min_charge_amps(params: dict) -> int:
+    """Return the minimum current the selected charger can actually accept."""
+    configured_min = _coerce_positive_int(params.get("min_charge_amps"), 5) or 5
+    charger_type = params.get("charger_type", "tesla")
+    if charger_type == "tesla":
+        # Tesla charge-current entities clamp to at least 5A. Solar surplus may
+        # be configured lower, but hysteresis must use the hardware floor.
+        return max(configured_min, 5)
+    return configured_min
+
+
 async def _set_ocpp_charging_amps(hass: HomeAssistant, charger_id: int, amps: int) -> bool:
     """Set charging amps for an OCPP charger."""
     from ..const import DOMAIN
+
+    charger_id = str(charger_id)
+    server_found = False
 
     try:
         # Find the OCPP charger controller in hass.data
@@ -2761,16 +3558,53 @@ async def _set_ocpp_charging_amps(hass: HomeAssistant, charger_id: int, amps: in
             if isinstance(entry_data, dict) and "ocpp_server" in entry_data:
                 ocpp_server = entry_data["ocpp_server"]
                 if hasattr(ocpp_server, "set_charging_profile"):
+                    server_found = True
                     success = await ocpp_server.set_charging_profile(charger_id, amps)
                     if success:
                         _LOGGER.info(f"Set OCPP charger {charger_id} to {amps}A")
                         return True
 
-        _LOGGER.warning(f"OCPP server not found or charger {charger_id} not available")
-        return False
     except Exception as e:
-        _LOGGER.error(f"Failed to set OCPP charging amps: {e}")
-        return False
+        _LOGGER.error(f"Failed to set OCPP charging amps through server: {e}")
+
+    current_entity = _find_ocpp_current_limit_entity(hass, charger_id)
+    if current_entity:
+        try:
+            target_amps = int(amps)
+            entity_state = hass.states.get(current_entity)
+            if entity_state:
+                entity_min = entity_state.attributes.get("min")
+                entity_max = entity_state.attributes.get("max")
+                if entity_min is not None:
+                    target_amps = max(int(entity_min), target_amps)
+                if entity_max is not None:
+                    target_amps = min(int(entity_max), target_amps)
+
+            await hass.services.async_call(
+                "number",
+                "set_value",
+                {"entity_id": current_entity, "value": target_amps},
+                blocking=True,
+            )
+            _LOGGER.info(
+                "Set OCPP charger %s to %dA via %s",
+                charger_id, target_amps, current_entity,
+            )
+            return True
+        except Exception as e:
+            _LOGGER.error("Failed to set OCPP amps via %s: %s", current_entity, e)
+
+    if server_found:
+        _LOGGER.warning(
+            "OCPP charger %s current limit not updated: server command failed and no current-limit number entity was found",
+            charger_id,
+        )
+    else:
+        _LOGGER.warning(
+            "OCPP charger %s current limit not updated: no OCPP server or current-limit number entity found",
+            charger_id,
+        )
+    return False
 
 
 def _parse_time_window(time_str: str) -> Optional[dt_time]:
@@ -2871,6 +3705,7 @@ async def _get_tesla_live_status(hass: HomeAssistant, config_entry: ConfigEntry)
         - grid_power: Positive = importing, Negative = exporting
     """
     from ..const import DOMAIN
+    from .live_status import coordinator_data_to_ev_live_status
 
     entry_data = hass.data.get(DOMAIN, {}).get(config_entry.entry_id, {})
 
@@ -2878,14 +3713,7 @@ async def _get_tesla_live_status(hass: HomeAssistant, config_entry: ConfigEntry)
     for coord_key in ("tesla_coordinator", "sigenergy_coordinator", "sungrow_coordinator"):
         coordinator = entry_data.get(coord_key)
         if coordinator and coordinator.data:
-            data = coordinator.data
-            return {
-                "battery_soc": data.get("battery_level"),
-                "grid_power": (data.get("grid_power", 0) or 0) * 1000,
-                "solar_power": (data.get("solar_power", 0) or 0) * 1000,
-                "battery_power": (data.get("battery_power", 0) or 0) * 1000,
-                "load_power": (data.get("load_power", 0) or 0) * 1000,
-            }
+            return coordinator_data_to_ev_live_status(coordinator.data)
 
     # Fall back to direct API call
     token_getter = entry_data.get("token_getter")
@@ -2948,6 +3776,31 @@ async def _dynamic_ev_update_surplus(
 
     params = state.get("params", {})
 
+    # Don't charge when vehicle is away from home
+    try:
+        from .ev_charging_planner import get_ev_location
+        _vin = vehicle_id if vehicle_id != DEFAULT_VEHICLE_ID else None
+        _location = await get_ev_location(hass, config_entry, _vin)
+        if _location not in ("home", "unknown"):
+            _current_amps = state.get("current_amps", 0)
+            if _current_amps > 0:
+                _LOGGER.info(f"⚡ Solar surplus EV: Stopping - vehicle not at home ({_location})")
+                await _set_vehicle_amps(hass, config_entry, vehicle_id, 0, params)
+                state["current_amps"] = 0
+                state["target_amps"] = 0
+                try:
+                    from .ev_charging_session import get_session_manager
+                    _sm = get_session_manager()
+                    if _sm:
+                        await _sm.end_session(vehicle_id=vehicle_id, reason="vehicle_away")
+                except Exception:
+                    pass
+            state["high_surplus_start"] = None
+            state["low_surplus_start"] = None
+            return
+    except Exception as e:
+        _LOGGER.debug(f"Solar surplus EV: Could not check vehicle location: {e}")
+
     # Re-check Tesla entity max after charging starts (Tesla reports real max only when active)
     # The entity needs a few seconds to update after the car starts drawing power,
     # so we do this on the first update cycle after charging_started=True (10-30s later).
@@ -2963,7 +3816,21 @@ async def _dynamic_ev_update_surplus(
                 if entity_state:
                     new_max = int(entity_state.attributes.get("max", 0))
                     old_max = params.get("max_charge_amps", 32)
-                    if new_max > 0 and new_max != old_max:
+                    if (
+                        new_max > 0
+                        and new_max < old_max
+                        and params.get("allow_stale_entity_max_override")
+                    ):
+                        _LOGGER.debug(
+                            "Solar surplus EV: ignoring Tesla entity max %dA below configured %dA",
+                            new_max,
+                            old_max,
+                        )
+                    elif (
+                        new_max > 0
+                        and new_max != old_max
+                        and not params.get("allow_stale_entity_max_override")
+                    ):
                         _LOGGER.info(
                             f"⚡ Solar surplus EV: Updated max_charge_amps {old_max}A -> {new_max}A "
                             f"(entity limit after charging started)"
@@ -2982,8 +3849,8 @@ async def _dynamic_ev_update_surplus(
     battery_soc = live_status.get("battery_soc") or 0
 
     # Battery priority check
-    min_soc = params.get("min_battery_soc", 80)
-    pause_soc = params.get("pause_below_soc", 70)
+    min_soc = get_solar_surplus_min_battery_soc(params)
+    pause_soc = params.get("pause_below_soc", max(0, min_soc - 10))
 
     # Parallel charging parameters
     allow_parallel = params.get("allow_parallel_charging", False)
@@ -3155,7 +4022,7 @@ async def _dynamic_ev_update_surplus(
     available_amps = (my_surplus_kw * 1000) / (voltage * phases)
 
     # Apply constraints
-    min_amps = params.get("min_charge_amps", 5)
+    min_amps = _effective_min_charge_amps(params)
     max_amps = params.get("max_charge_amps", 32)
     new_amps = int(round(max(0, min(max_amps, available_amps))))
 
@@ -3170,6 +4037,7 @@ async def _dynamic_ev_update_surplus(
             low_surplus_start = state.get("low_surplus_start")
             if low_surplus_start is None:
                 state["low_surplus_start"] = datetime.now()
+                new_amps = current_amps
             elif (datetime.now() - low_surplus_start).total_seconds() >= stop_delay_minutes * 60:
                 # Stop charging after delay
                 _LOGGER.info(f"⚡ Solar surplus EV: Stopping - insufficient surplus for {stop_delay_minutes} min")
@@ -3305,20 +4173,58 @@ async def _dynamic_ev_update_surplus(
                     _LOGGER.debug(f"Could not end session: {e}")
 
 
-def _get_phases_from_config(hass, config_entry, params):
-    """Get charging phases: from params, or fall back to home_power_settings."""
-    if "phases" in params and params["phases"] in (1, 3):
-        return params["phases"]
+def _get_home_power_settings(hass, config_entry) -> dict:
+    """Return app-managed home power settings from automation storage."""
     try:
         from ..const import DOMAIN
         entry_data = hass.data.get(DOMAIN, {}).get(config_entry.entry_id, {})
         store = entry_data.get("automation_store")
         if store:
             stored = getattr(store, '_data', {}) or {}
-            phase_type = stored.get("home_power_settings", {}).get("phase_type", "single")
-            return 3 if phase_type == "three" else 1
+            settings = stored.get("home_power_settings", {})
+            if isinstance(settings, dict):
+                return settings
     except Exception:
         pass
+    return {}
+
+
+def _get_home_power_max_charge_amps(hass, config_entry) -> Optional[int]:
+    """Return configured per-phase max charger speed from Home Power settings."""
+    settings = _get_home_power_settings(hass, config_entry)
+    if not settings.get("max_charge_speed_enabled"):
+        return None
+    return _coerce_positive_int(settings.get("max_amps_per_phase"))
+
+
+def _resolve_dynamic_max_charge_amps(
+    hass,
+    config_entry,
+    params: dict,
+    default: int = 32,
+) -> tuple[int, str]:
+    """Resolve dynamic EV max amps, giving Home Power max-speed priority."""
+    home_max = _get_home_power_max_charge_amps(hass, config_entry)
+    if home_max is not None:
+        return home_max, "home_power"
+
+    source = params.get("max_charge_amps_source")
+    configured = _coerce_positive_int(params.get("max_charge_amps"), default)
+    if source:
+        return configured or default, str(source)
+    if "max_charge_amps" in params:
+        return configured or default, "params"
+    return default, "default"
+
+
+def _get_phases_from_config(hass, config_entry, params):
+    """Get charging phases: from params, or fall back to home_power_settings."""
+    if "phases" in params and params["phases"] in (1, 3):
+        return params["phases"]
+    settings = _get_home_power_settings(hass, config_entry)
+    if settings:
+        phase_type = settings.get("phase_type", "single")
+        return 3 if phase_type == "three" else 1
     return 1
 
 
@@ -3520,7 +4426,7 @@ async def _dynamic_ev_update(
                 f"ev_relevant={ev_grid_check:.2f}kW, inverter_max={max_inverter_kw}kW), "
                 f"reducing to {new_amps}A"
             )
-            success = await _action_set_ev_charging_amps(hass, config_entry, {"amps": new_amps})
+            success = await _set_vehicle_amps(hass, config_entry, vehicle_id, new_amps, params)
             if success:
                 state["current_amps"] = new_amps
             return
@@ -3541,9 +4447,7 @@ async def _dynamic_ev_update(
             f"(battery={battery_power_kw:.1f}kW, grid={grid_power_kw:.1f}kW, "
             f"available={available_power_kw:.1f}kW)"
         )
-        success = await _action_set_ev_charging_amps(
-            hass, config_entry, {"amps": new_amps}
-        )
+        success = await _set_vehicle_amps(hass, config_entry, vehicle_id, new_amps, params)
         if success:
             state["current_amps"] = new_amps
         else:
@@ -3621,12 +4525,14 @@ async def _action_start_ev_charging_dynamic(
 
     Common parameters:
         dynamic_mode: "battery_target" or "solar_surplus" (default battery_target)
+        owner_mode: Business mode that owns the session, e.g. smart_schedule,
+            price_level_recovery, scheduled, solar_surplus. Defaults to dynamic_mode.
         min_charge_amps: Minimum EV charge amps (default 5)
         max_charge_amps: Maximum EV charge amps (default 32)
         voltage: Assumed charging voltage (default 240)
         stop_outside_window: Stop when outside time window (default False)
         vehicle_vin: Optional VIN to filter by specific vehicle
-        charger_type: "tesla", "ocpp", or "generic" (default tesla)
+        charger_type: "tesla", "ocpp", "generic", or "zaptec" (default tesla)
         priority: Vehicle priority for dual-vehicle setups (default 1)
     """
     from ..const import DOMAIN
@@ -3651,19 +4557,143 @@ async def _action_start_ev_charging_dynamic_locked(
 
     # Determine mode
     dynamic_mode = params.get("dynamic_mode", "battery_target")
+    owner_mode = params.get("owner_mode", dynamic_mode)
+    allow_takeover = bool(params.get("allow_ownership_takeover", False))
+
+    from .ev_ownership import (
+        can_claim_ev_ownership,
+        can_take_over_ev_ownership,
+        claim_ev_ownership,
+        record_ev_command,
+    )
+
+    entry_vehicles = _dynamic_ev_state.get(entry_id, {})
+
+    def _same_loadpoint(candidate_id: str) -> bool:
+        return (
+            candidate_id == vehicle_id
+            or candidate_id == DEFAULT_VEHICLE_ID
+            or vehicle_id == DEFAULT_VEHICLE_ID
+        )
+
+    allowed, _lease_id, _lease, block_reason = can_claim_ev_ownership(
+        hass,
+        config_entry,
+        vehicle_id,
+        owner_mode=owner_mode,
+        allow_takeover=allow_takeover,
+    )
+    if not allowed:
+        reason = block_reason or "another EV mode owns this loadpoint"
+        _LOGGER.info(
+            "Dynamic EV: %s start blocked for %s because %s",
+            owner_mode,
+            vehicle_id,
+            reason,
+        )
+        record_ev_command(
+            hass,
+            config_entry,
+            vehicle_id,
+            command=f"start_{owner_mode}",
+            success=False,
+            reason=reason,
+        )
+        return False
+
+    # Legacy fallback for runtime state created before explicit ownership was
+    # claimed. This keeps old dynamic sessions from being hijacked by another
+    # automated mode during an in-place upgrade.
+    for vid, v_state in entry_vehicles.items():
+        if not v_state.get("active") or not _same_loadpoint(vid):
+            continue
+        existing_params = v_state.get("params") or {}
+        existing_owner_mode = (
+            existing_params.get("owner_mode")
+            or existing_params.get("dynamic_mode")
+            or "dynamic"
+        )
+        if not can_take_over_ev_ownership(
+            existing_owner_mode,
+            owner_mode,
+            allow_takeover=allow_takeover,
+        ):
+            reason = f"{existing_owner_mode} already owns this loadpoint"
+            _LOGGER.info(
+                "Dynamic EV: %s start blocked for %s because legacy state says %s",
+                owner_mode,
+                vehicle_id,
+                reason,
+            )
+            record_ev_command(
+                hass,
+                config_entry,
+                vehicle_id,
+                command=f"start_{owner_mode}",
+                success=False,
+                reason=reason,
+            )
+            return False
 
     # Prevent duplicate sessions for the same vehicle/mode
     # _default and a resolved VIN (e.g. LRWYHCEK3PC907290) refer to the same physical
     # vehicle in single-vehicle setups. Treat them as duplicates to prevent two update
     # loops fighting over the same car's charge current.
-    entry_vehicles = _dynamic_ev_state.get(entry_id, {})
     for vid, v_state in entry_vehicles.items():
-        if v_state.get("active") and v_state.get("params", {}).get("dynamic_mode") == dynamic_mode:
+        if (
+            v_state.get("active")
+            and _same_loadpoint(vid)
+            and v_state.get("params", {}).get("dynamic_mode") == dynamic_mode
+        ):
             if vid == vehicle_id:
+                existing_params = v_state.setdefault("params", {})
+                existing_owner_mode = (
+                    existing_params.get("owner_mode")
+                    or existing_params.get("dynamic_mode")
+                    or dynamic_mode
+                )
+                if can_take_over_ev_ownership(
+                    existing_owner_mode,
+                    owner_mode,
+                    allow_takeover=allow_takeover,
+                ):
+                    existing_params["owner_mode"] = owner_mode
+                    v_state["ownership"] = claim_ev_ownership(
+                        hass,
+                        config_entry,
+                        vehicle_id,
+                        owner_mode=owner_mode,
+                        session_id=v_state.get("session_id"),
+                        reason=v_state.get("reason") or None,
+                        command=f"update_{owner_mode}",
+                        extra={"charger_type": existing_params.get("charger_type", "tesla")},
+                    )
                 _LOGGER.debug(f"Dynamic session ({dynamic_mode}) already active for vehicle {vid}, skipping duplicate")
                 return True
             # _default overlaps with any VIN (single-vehicle setup)
             if vid == DEFAULT_VEHICLE_ID or vehicle_id == DEFAULT_VEHICLE_ID:
+                existing_params = v_state.setdefault("params", {})
+                existing_owner_mode = (
+                    existing_params.get("owner_mode")
+                    or existing_params.get("dynamic_mode")
+                    or dynamic_mode
+                )
+                if can_take_over_ev_ownership(
+                    existing_owner_mode,
+                    owner_mode,
+                    allow_takeover=allow_takeover,
+                ):
+                    existing_params["owner_mode"] = owner_mode
+                    v_state["ownership"] = claim_ev_ownership(
+                        hass,
+                        config_entry,
+                        vid,
+                        owner_mode=owner_mode,
+                        session_id=v_state.get("session_id"),
+                        reason=v_state.get("reason") or None,
+                        command=f"update_{owner_mode}",
+                        extra={"charger_type": existing_params.get("charger_type", "tesla")},
+                    )
                 _LOGGER.info(
                     f"Dynamic session ({dynamic_mode}) already active for {vid}, "
                     f"skipping duplicate start for {vehicle_id}"
@@ -3671,23 +4701,33 @@ async def _action_start_ev_charging_dynamic_locked(
                 return True
 
     # Get common parameters with defaults
-    min_charge_amps = params.get("min_charge_amps", 5)
-    max_charge_amps = params.get("max_charge_amps", 32)
+    min_charge_amps = _effective_min_charge_amps(params)
+    max_charge_amps, max_charge_amps_source = _resolve_dynamic_max_charge_amps(
+        hass,
+        config_entry,
+        params,
+    )
     voltage = params.get("voltage", 240)
     stop_outside_window = params.get("stop_outside_window", False)
     charger_type = params.get("charger_type", "tesla")
     priority = params.get("priority", 1)
+    allow_stale_entity_max_override = bool(
+        params.get("allow_stale_entity_max_override")
+    )
+    if dynamic_mode == "solar_surplus" and max_charge_amps_source != "default":
+        allow_stale_entity_max_override = True
 
     # Resolve phases early for logging and start_amps capping
     resolved_phases = _get_phases_from_config(hass, config_entry, params)
 
     # Mode-specific parameters
     if dynamic_mode == "solar_surplus":
+        min_battery_soc = get_solar_surplus_min_battery_soc(params)
         mode_params = {
             "household_buffer_kw": params.get("household_buffer_kw", 0.5),
             "surplus_calculation": params.get("surplus_calculation", "grid_based"),
-            "min_battery_soc": params.get("min_battery_soc", 80),
-            "pause_below_soc": params.get("pause_below_soc", 70),
+            "min_battery_soc": min_battery_soc,
+            "pause_below_soc": params.get("pause_below_soc", max(0, min_battery_soc - 10)),
             "sustained_surplus_minutes": params.get("sustained_surplus_minutes", 2),
             "stop_delay_minutes": params.get("stop_delay_minutes", 5),
             "dual_vehicle_strategy": params.get("dual_vehicle_strategy", "priority_first"),
@@ -3742,11 +4782,20 @@ async def _action_start_ev_charging_dynamic_locked(
         start_success = await _action_start_ev_charging(hass, config_entry, params, context)
         if not start_success:
             _LOGGER.info("Dynamic EV: Could not start EV charging (vehicle may be disconnected)")
+            record_ev_command(
+                hass,
+                config_entry,
+                vehicle_id,
+                command=f"start_{owner_mode}",
+                success=False,
+                reason="physical start failed",
+            )
             return False
 
-        # Set initial amps
-        amps_success = await _action_set_ev_charging_amps(
-            hass, config_entry, {"amps": start_amps}
+        # Set initial amps through the charger abstraction so OCPP and generic
+        # chargers do not fall back to the Tesla-only amperage path.
+        amps_success = await _set_vehicle_amps(
+            hass, config_entry, vehicle_id, start_amps, params
         )
         if not amps_success:
             # This is expected - Tesla reports lower max amps until charging actually starts
@@ -3775,10 +4824,13 @@ async def _action_start_ev_charging_dynamic_locked(
     # Build full params dict
     full_params = {
         "dynamic_mode": dynamic_mode,
+        "owner_mode": owner_mode,
         "vehicle_vin": params.get("vehicle_vin"),
         "vehicle_name": params.get("vehicle_name"),
         "min_charge_amps": min_charge_amps,
         "max_charge_amps": max_charge_amps,
+        "max_charge_amps_source": max_charge_amps_source,
+        "allow_stale_entity_max_override": allow_stale_entity_max_override,
         "voltage": voltage,
         "phases": _get_phases_from_config(hass, config_entry, params),
         "stop_outside_window": stop_outside_window,
@@ -3790,6 +4842,7 @@ async def _action_start_ev_charging_dynamic_locked(
         # Pass through generic charger entities if present
         "charger_switch_entity": params.get("charger_switch_entity"),
         "charger_amps_entity": params.get("charger_amps_entity"),
+        "charger_status_entity": params.get("charger_status_entity"),
         "ocpp_charger_id": params.get("ocpp_charger_id"),
     }
 
@@ -3810,7 +4863,18 @@ async def _action_start_ev_charging_dynamic_locked(
                 entity_state = hass.states.get(entity)
                 if entity_state:
                     entity_max = int(entity_state.attributes.get("max", max_charge_amps))
-                    if entity_max < full_params.get("max_charge_amps", 32):
+                    if (
+                        entity_max < full_params.get("max_charge_amps", 32)
+                        and full_params.get("allow_stale_entity_max_override")
+                    ):
+                        _LOGGER.debug(
+                            "Skipping Tesla idle entity max cap %dA for solar surplus; "
+                            "using configured max %dA from %s",
+                            entity_max,
+                            full_params.get("max_charge_amps", 32),
+                            full_params.get("max_charge_amps_source", "params"),
+                        )
+                    elif entity_max < full_params.get("max_charge_amps", 32):
                         _LOGGER.info(
                             f"Preliminary cap: max_charge_amps to {entity_max}A "
                             f"(will re-check after charging starts)"
@@ -3849,13 +4913,25 @@ async def _action_start_ev_charging_dynamic_locked(
 
             session = await session_manager.start_session(
                 vehicle_id=vehicle_id,
-                mode=dynamic_mode,
+                mode=owner_mode,
                 start_soc=int(initial_soc) if initial_soc else None,
             )
             _dynamic_ev_state[entry_id][vehicle_id]["session_id"] = session.id
             _LOGGER.info(f"📊 Started charging session {session.id}")
     except Exception as e:
         _LOGGER.debug(f"Could not start session tracking: {e}")
+
+    session_id = _dynamic_ev_state[entry_id][vehicle_id].get("session_id")
+    _dynamic_ev_state[entry_id][vehicle_id]["ownership"] = claim_ev_ownership(
+        hass,
+        config_entry,
+        vehicle_id,
+        owner_mode=owner_mode,
+        session_id=session_id,
+        reason=_dynamic_ev_state[entry_id][vehicle_id].get("reason") or None,
+        command=f"start_{owner_mode}",
+        extra={"charger_type": charger_type},
+    )
 
     # Also store in hass.data for access from other places (for API endpoints)
     if DOMAIN in hass.data and entry_id in hass.data[DOMAIN]:
@@ -3916,18 +4992,33 @@ async def _action_stop_ev_charging_dynamic(
         elif vehicle_id == DEFAULT_VEHICLE_ID:
             vehicle_ids_to_stop = list(vehicles.keys())  # Stop all (single vehicle)
         else:
-            vehicle_ids_to_stop = []
+            # Caller asked to stop a specific vehicle that isn't tracked in
+            # dynamic state. Treat that as a cleanup no-op unless the caller
+            # explicitly owns the session and asks to stop an untracked vehicle.
+            if params.get("stop_untracked"):
+                vehicle_ids_to_stop = [vehicle_id]
+            else:
+                _LOGGER.debug(
+                    "Dynamic EV: no tracked session for %s; skipping downstream stop",
+                    vehicle_id,
+                )
+                vehicle_ids_to_stop = []
     else:
         # Stop all vehicles for this entry
         vehicle_ids_to_stop = list(vehicles.keys())
 
     # Collect per-vehicle params before deleting state (needed for stop)
     vehicle_params: Dict[str, dict] = {}
+    released_vehicle_ids: set[str] = set()
 
     for vid in vehicle_ids_to_stop:
         state = vehicles.get(vid)
         if state:
             vehicle_params[vid] = state.get("params", {})
+        elif params.get("stop_untracked") and vid == vehicle_id:
+            vehicle_params[vid] = params
+
+        if state:
 
             # Cancel the timer
             cancel_timer = state.get("cancel_timer")
@@ -3978,6 +5069,15 @@ async def _action_stop_ev_charging_dynamic(
                     _LOGGER.debug(f"Could not send stop notification: {e}")
 
             state["active"] = False
+            from .ev_ownership import release_ev_ownership
+            release_ev_ownership(
+                hass,
+                config_entry,
+                vid,
+                reason=params.get("stop_reason", "manual" if params.get("manual_stop") else "stopped"),
+                command="stop" if stop_charging else "release",
+            )
+            released_vehicle_ids.add(vid)
             del vehicles[vid]
             _LOGGER.info(f"⚡ Dynamic EV charging stopped for {vid}")
 
@@ -3994,16 +5094,29 @@ async def _action_stop_ev_charging_dynamic(
 
     # Stop EV charging if requested
     if stop_charging and vehicle_ids_to_stop:
+        physical_stop_failed = False
         for vid_to_stop in vehicle_ids_to_stop:
             v_params = vehicle_params.get(vid_to_stop, {})
             charger_type = v_params.get("charger_type", "tesla")
-            if charger_type in ("generic", "ocpp"):
+            if charger_type in ("generic", "ocpp", "zaptec"):
                 # Use _set_vehicle_amps which handles all charger types
-                await _set_vehicle_amps(hass, config_entry, vid_to_stop, 0, v_params)
+                stop_success = await _set_vehicle_amps(hass, config_entry, vid_to_stop, 0, v_params)
             else:
                 stop_params = dict(params)
                 stop_params["vehicle_vin"] = vid_to_stop
-                await _action_stop_ev_charging(hass, config_entry, stop_params)
-        return True
+                stop_success = await _action_stop_ev_charging(hass, config_entry, stop_params)
+            if not stop_success:
+                physical_stop_failed = True
+            if params.get("stop_untracked") and vid_to_stop not in released_vehicle_ids:
+                from .ev_ownership import release_ev_ownership
+                release_ev_ownership(
+                    hass,
+                    config_entry,
+                    vid_to_stop,
+                    reason=params.get("stop_reason", "stopped"),
+                    command="stop",
+                    success=stop_success,
+                )
+        return not physical_stop_failed
 
     return True

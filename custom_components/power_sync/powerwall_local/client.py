@@ -1,32 +1,27 @@
-"""Unified local Powerwall client covering both PW2 and PW3.
+"""Unified local Powerwall client for PW2 and PW3 over RSA-signed v1r.
 
-PW2 exposes a plain HTTPS REST API with Bearer auth from ``/api/login/Basic``.
-No RSA signing is required — just the customer password (last 5 digits of
-the gateway serial) and the gateway IP.
+Both generations now route all reads and writes through the signed protobuf
+transport at ``/tedapi/v1r``. Live snapshots come from a single
+``DeviceControllerQuery`` envelope plus a ``config.json`` read for the
+operation mode and backup reserve — no Bearer login or customer password
+required. Islanding commands use the same signed transport.
 
-PW3 removed most REST surface and routes config + commands through a signed
-protobuf transport at ``/tedapi/v1r``. REST endpoints like
-``/api/meters/aggregates`` still work with Bearer auth after the initial
-customer login. The islanding command is unknown on PW3 and we try a
-fallback chain: REST ``/api/v2/islanding/mode`` -> config.json rewrite ->
-Storm Watch Manual Backup.
-
-This module presents one interface to the rest of the integration so that
-coordinator + service layers do not need to care which generation they're
-talking to.
+The RSA private key + DIN are established during cloud pairing (Fleet API);
+without both, this client refuses to construct.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-from .exceptions import (
-    PowerwallAuthError,
-    PowerwallLocalError,
-    PowerwallUnreachableError,
+from .exceptions import PowerwallLocalError, PowerwallUnreachableError
+from .fleet_api_bms import (
+    build_device_controller_query_envelope,
+    parse_device_controller_response,
 )
 from .signaling import TeslaSignalingClient
 from .transport import TEDAPIv1rTransport
@@ -60,26 +55,41 @@ class PowerwallSnapshot:
     operation_mode: str | None
     backup_reserve_percent: int | None
     raw: dict[str, Any]
+    # Best-effort fields from /api/system_status (PW2; may be None on PW3).
+    # Keep None when the endpoint is unsupported so consumers know to skip.
+    system_island_state: str | None = None
+    pw_count: int | None = None
+    total_pack_full_wh: float | None = None
+    total_pack_remaining_wh: float | None = None
+    battery_blocks: list[dict[str, Any]] | None = None
+    alerts: list[dict[str, Any]] | None = None
 
 
 class PowerwallLocalClient:
-    """Dispatches local calls between PW2 REST and PW3 TEDAPI v1r."""
+    """RSA-signed local Powerwall client (both PW2 and PW3)."""
 
     def __init__(
         self,
         host: str,
-        customer_password: str,
         *,
         version: PowerwallVersion,
-        private_key_pem: bytes | None = None,
-        din: str | None = None,
+        private_key_pem: bytes,
+        din: str,
         fleet_api_base: str | None = None,
         fleet_api_token: str | None = None,
         energy_site_id: int | str | None = None,
         signaling: TeslaSignalingClient | None = None,
     ) -> None:
+        if not private_key_pem:
+            raise PowerwallLocalError(
+                "PowerwallLocalClient requires the RSA private key from cloud pairing"
+            )
+        if not din:
+            raise PowerwallLocalError(
+                "PowerwallLocalClient requires the gateway DIN from cloud pairing"
+            )
+
         self._host = host
-        self._customer_password = customer_password
         self._version = version
         self._din = din
         self._fleet_api_base = fleet_api_base
@@ -93,19 +103,9 @@ class PowerwallLocalClient:
         self._saved_reserve_percent: int | None = None
         self._curtailment_active = False
 
-
-        # Both generations use the same signed transport for symmetry — on
-        # PW2 the RSA signing path is unused but the REST helpers live in
-        # the same class so we avoid duplicating the session/SSL setup.
-        if private_key_pem is None:
-            # Unsigned client (PW2-only, or pre-pairing monitoring).
-            self._transport: TEDAPIv1rTransport | None = None
-            self._unsigned = _UnsignedRESTClient(host, customer_password)
-        else:
-            self._transport = TEDAPIv1rTransport(
-                host, private_key_pem, customer_password
-            )
-            self._unsigned = None
+        self._transport: TEDAPIv1rTransport = TEDAPIv1rTransport(
+            host, private_key_pem, din=din,
+        )
 
     @property
     def version(self) -> PowerwallVersion:
@@ -125,74 +125,62 @@ class PowerwallLocalClient:
 
     @property
     def din(self) -> str | None:
-        if self._din:
-            return self._din
-        if self._transport and self._transport.din:
-            return self._transport.din
-        return None
+        return self._din or self._transport.din
 
-    async def _get(self, path: str) -> Any | None:
-        if self._transport is not None:
-            return await self._transport.api_get(path)
-        assert self._unsigned is not None
-        return await self._unsigned.api_get(path)
+    async def _fetch_dcq_local(self) -> dict[str, Any] | None:
+        """Send a DeviceControllerQuery directly to the gateway over LAN.
 
-    async def _post(self, path: str, body: dict[str, Any]) -> Any | None:
-        if self._transport is not None:
-            return await self._transport.api_post(path, body)
-        assert self._unsigned is not None
-        return await self._unsigned.api_post(path, body)
+        Builds the same protobuf envelope used by the Fleet-API cloud relay
+        path but POSTs it through the signed v1r transport for sub-100ms
+        latency. Returns the decoded JSON payload or None on any failure.
+        """
+        try:
+            envelope = build_device_controller_query_envelope(self._din)
+        except Exception as err:
+            _LOGGER.error("DeviceControllerQuery encode failed: %s", err)
+            return None
 
-    async def login(self) -> bool:
-        if self._transport is not None:
-            ok = await self._transport.login()
-            if ok:
-                # Always refresh the DIN from the gateway — the stored
-                # value might be a partial serial instead of the full
-                # {part_number}--{serial_number} the TEDAPI v1r transport
-                # needs for TLV signature personalization.
-                fetched = await self._transport.fetch_din()
-                if fetched:
-                    self._din = fetched
-            return ok
-        assert self._unsigned is not None
-        return await self._unsigned.login()
+        try:
+            resp = await self._transport.post_v1r(envelope, self._din)
+        except PowerwallUnreachableError:
+            raise
+        except PowerwallLocalError as err:
+            _LOGGER.warning("DeviceControllerQuery v1r POST failed: %s", err)
+            return None
+        if not resp.ok or not resp.inner_bytes:
+            _LOGGER.debug(
+                "DeviceControllerQuery returned no inner bytes (fault=%s, http=%s)",
+                resp.fault_name, resp.http_status,
+            )
+            return None
+
+        try:
+            return parse_device_controller_response(resp.inner_bytes)
+        except Exception as err:
+            _LOGGER.warning("DeviceControllerQuery decode error: %s", err)
+            return None
 
     async def get_snapshot(self) -> PowerwallSnapshot:
-        """Fetch the standard monitoring set in parallel-friendly order."""
-        meters = await self._get("/api/meters/aggregates") or {}
-        soe = await self._get("/api/system_status/soe") or {}
-        grid = await self._get("/api/system_status/grid_status") or {}
-        operation = await self._get("/api/operation") or {}
+        """Fetch live status via RSA-signed DCQ + config.json read in parallel."""
+        dcq_task = self._fetch_dcq_local()
+        cfg_task = self._transport.read_config(self._din)
+        dcq, cfg = await asyncio.gather(dcq_task, cfg_task, return_exceptions=True)
 
-        def _watts(section: dict[str, Any] | None) -> float | None:
-            if not isinstance(section, dict):
-                return None
-            v = section.get("instant_power")
-            return float(v) if v is not None else None
+        if isinstance(dcq, BaseException):
+            if isinstance(dcq, PowerwallUnreachableError):
+                raise dcq
+            _LOGGER.warning("DeviceControllerQuery raised: %s", dcq)
+            dcq = None
+        if isinstance(cfg, BaseException):
+            _LOGGER.debug("config.json read raised: %s", cfg)
+            cfg = None
 
-        return PowerwallSnapshot(
-            soc=_float_or_none(soe.get("percentage")),
-            solar_w=_watts(meters.get("solar")),
-            battery_w=_watts(meters.get("battery")),
-            grid_w=_watts(meters.get("site")),
-            load_w=_watts(meters.get("load")),
-            grid_status=grid.get("grid_status") if isinstance(grid, dict) else None,
-            operation_mode=(
-                operation.get("real_mode") if isinstance(operation, dict) else None
-            ),
-            backup_reserve_percent=_int_or_none(
-                operation.get("backup_reserve_percent")
-                if isinstance(operation, dict)
-                else None
-            ),
-            raw={
-                "meters": meters,
-                "soe": soe,
-                "grid": grid,
-                "operation": operation,
-            },
-        )
+        if not dcq:
+            raise PowerwallUnreachableError(
+                "Gateway returned no DeviceControllerQuery data"
+            )
+
+        return _snapshot_from_dcq(dcq, cfg if isinstance(cfg, dict) else None)
 
     async def verify_pairing(self) -> int | None:
         """Check our key's state on the gateway via list_authorized_clients.
@@ -283,14 +271,19 @@ class PowerwallLocalClient:
     async def go_off_grid(self, *, mode_override: int | None = None) -> bool:
         """Physically disconnect from the grid (contactor open).
 
-        Primary path (both PW2 and PW3): local TEDAPI v1r with signed
-        setIslandModeRequest sent directly to the gateway over LAN.
-        No cloud relay needed — the RSA-signed protobuf goes straight
-        to the gateway which verifies the signature locally.
+        Cloud-only via Fleet API ``device_command`` with a signed
+        ``routable_message``. The gateway verifies our RSA signature
+        from the paired key. Local TEDAPI v1r returns success for the
+        same setIslandModeRequest but does not actually operate the
+        contactor — discovered empirically on both PW2 and PW3.
 
-        Cloud fallback: signed routable_message via device_command.
-        PW3 default mode=6, PW2 default mode=2. Use mode_override to
-        test alternative mode values.
+        Because the path is cloud-only, a local LAN IP is NOT required;
+        the client just needs the paired private key + gateway DIN +
+        Fleet API token + energy site ID. ``_send_signed_device_command``
+        handles the signing-and-send.
+
+        Default mode=6 works for both PW2 and PW3. Use ``mode_override``
+        to test alternative values.
         """
         # Verify our key is state=3 (verified) before attempting off-grid
         key_state = await self.verify_pairing()
@@ -574,12 +567,6 @@ class PowerwallLocalClient:
         MESSAGEFAULT_ERROR_UNKNOWN_KEY_ID the transport raises
         ``PowerwallSignatureError`` which we surface as "not paired".
         """
-        if self._transport is None:
-            return await self.login()
-        if not self._din:
-            self._din = await self._transport.fetch_din()
-        if not self._din:
-            return False
         try:
             config = await self._transport.read_config(self._din)
         except PowerwallLocalError:
@@ -601,104 +588,132 @@ def _int_or_none(value: Any) -> int | None:
         return None
 
 
-class _UnsignedRESTClient:
-    """Minimal REST client for PW2 without an RSA transport.
+# DCQ "islanding.customerIslandMode" → grid_status string. Tesla's REST returned
+# "SystemGridConnected" / "SystemIslandedActive" / etc.; the DCQ uses simpler
+# enum names that we map back so downstream consumers (sensors that branch on
+# the historical strings) keep working.
+_DCQ_ISLAND_MODE_TO_GRID_STATUS = {
+    "ISLAND_MODE_UNKNOWN": None,
+    "OnGrid": "SystemGridConnected",
+    "Backup": "SystemIslandedActive",
+    "OffGrid": "SystemIslandedActive",
+    "Normal": "SystemGridConnected",
+}
 
-    Shares the self-signed SSL context with the v1r transport but skips all
-    protobuf machinery. Used before pairing completes so the app can still
-    display live data, and on pure PW2 installs where pairing is optional.
+# Powerwall reserves the bottom 5% of nominal capacity for cell health and
+# won't discharge past it. Tesla's user-facing apps rescale operational SOC
+# across the usable 5–100% range, so 24% raw shows as 20% in the Tesla app.
+_LOW_SOE_RESERVE_PCT = 5.0
+
+
+def _snapshot_from_dcq(
+    dcq: dict[str, Any], cfg: dict[str, Any] | None
+) -> PowerwallSnapshot:
+    """Map a DeviceControllerQuery JSON + config.json into a PowerwallSnapshot.
+
+    DCQ shape (see ``fleet_api_bms.DEVICE_CONTROLLER_QUERY``):
+      control.meterAggregates: [{location: "site"|"battery"|"solar"|"load",
+                                 realPowerW: float}, ...]
+      control.systemStatus.{nominalFullPackEnergyWh, nominalEnergyRemainingWh}
+      control.islanding.{customerIslandMode, contactorClosed, microGridOK,
+                         gridOK, disableReasons}
+      control.alerts.active: [str, ...]
+      control.batteryBlocks: [{din, disableReasons}, ...]
+      control.siteShutdown.{isShutDown, reasons}
     """
+    control = dcq.get("control") or {}
 
-    def __init__(self, host: str, customer_password: str) -> None:
-        import aiohttp
+    # Per-location power readings (watts).
+    meters = {
+        m.get("location"): m
+        for m in control.get("meterAggregates") or []
+        if isinstance(m, dict) and m.get("location")
+    }
 
-        from .transport import _insecure_ssl_context
-
-        self._host = host
-        self._customer_password = customer_password
-        self._ssl = _insecure_ssl_context()
-        self._timeout = aiohttp.ClientTimeout(total=8.0)
-        self._token: str | None = None
-        self._aiohttp = aiohttp
-
-    async def _session(self):
-        connector = self._aiohttp.TCPConnector(ssl=self._ssl, limit=4)
-        return self._aiohttp.ClientSession(
-            connector=connector, timeout=self._timeout
-        )
-
-    async def login(self) -> bool:
-        url = f"https://{self._host}/api/login/Basic"
-        payload = {
-            "username": "customer",
-            "password": self._customer_password,
-            "email": "customer@customer.domain",
-            "clientInfo": {"timezone": "UTC"},
-        }
-        try:
-            async with await self._session() as sess:
-                async with sess.post(url, json=payload) as resp:
-                    if resp.status in (401, 403):
-                        raise PowerwallAuthError(
-                            f"Gateway rejected customer password ({resp.status})"
-                        )
-                    if resp.status != 200:
-                        return False
-                    data = await resp.json()
-                    self._token = data.get("token")
-                    return self._token is not None
-        except self._aiohttp.ClientError as err:
-            raise PowerwallUnreachableError(str(err)) from err
-
-    async def api_get(self, path: str) -> Any | None:
-        if not self._token and not await self.login():
+    def _watts(location: str) -> float | None:
+        m = meters.get(location)
+        if not isinstance(m, dict):
             return None
-        url = f"https://{self._host}{path}"
-        headers = {"Authorization": f"Bearer {self._token}"}
-        try:
-            async with await self._session() as sess:
-                async with sess.get(url, headers=headers) as resp:
-                    if resp.status in (401, 403) and await self.login():
-                        headers["Authorization"] = f"Bearer {self._token}"
-                        async with sess.get(url, headers=headers) as r2:
-                            if r2.status != 200:
-                                return None
-                            return await r2.json()
-                    if resp.status != 200:
-                        return None
-                    return await resp.json()
-        except self._aiohttp.ClientError as err:
-            raise PowerwallUnreachableError(str(err)) from err
+        return _float_or_none(m.get("realPowerW"))
 
-    async def api_post(self, path: str, body: dict[str, Any]) -> Any | None:
-        if not self._token and not await self.login():
-            return None
-        url = f"https://{self._host}{path}"
-        headers = {
-            "Authorization": f"Bearer {self._token}",
-            "Content-Type": "application/json",
-        }
-        try:
-            async with await self._session() as sess:
-                async with sess.post(url, json=body, headers=headers) as resp:
-                    if resp.status in (401, 403) and await self.login():
-                        headers["Authorization"] = f"Bearer {self._token}"
-                        async with sess.post(url, json=body, headers=headers) as r2:
-                            if r2.status not in (200, 201, 204):
-                                text = await r2.text()
-                                _LOGGER.warning(
-                                    "POST %s retry returned %s: %s",
-                                    path, r2.status, text[:300],
-                                )
-                                return None
-                            return {} if r2.status == 204 else await r2.json()
-                    if resp.status not in (200, 201, 204):
-                        text = await resp.text()
-                        _LOGGER.warning(
-                            "POST %s returned %s: %s",
-                            path, resp.status, text[:300],
-                        )
-                        return None
-                    return {} if resp.status == 204 else await resp.json()
-        except self._aiohttp.ClientError as err:
-            raise PowerwallUnreachableError(str(err)) from err
+    # SOC % from energy ratios. Either field missing → leave SOC None.
+    # The Powerwall protects a 5% low-SOE reserve for cell health and won't
+    # discharge past it. The Tesla app and Tesla cloud apps both report
+    # operational SOC scaled across the usable 5–100% range; report the
+    # same so PowerSync's reading matches the Tesla app exactly.
+    sys_status = control.get("systemStatus") or {}
+    full_wh = _float_or_none(sys_status.get("nominalFullPackEnergyWh"))
+    rem_wh = _float_or_none(sys_status.get("nominalEnergyRemainingWh"))
+    if full_wh and full_wh > 0 and rem_wh is not None:
+        raw_soc = max(0.0, min(100.0, (rem_wh / full_wh) * 100.0))
+        soc_pct: float | None = max(0.0, (raw_soc - _LOW_SOE_RESERVE_PCT) / (100.0 - _LOW_SOE_RESERVE_PCT) * 100.0)
+    else:
+        soc_pct = None
+
+    # Grid status: prefer customerIslandMode mapping, fall back to gridOK bool.
+    islanding = control.get("islanding") or {}
+    island_mode = islanding.get("customerIslandMode")
+    grid_status = _DCQ_ISLAND_MODE_TO_GRID_STATUS.get(island_mode) if island_mode else None
+    if grid_status is None:
+        grid_ok = islanding.get("gridOK")
+        if isinstance(grid_ok, bool):
+            grid_status = "SystemGridConnected" if grid_ok else "SystemIslandedActive"
+
+    # Operation mode + backup reserve from config.json (RSA-read, same
+    # transport, fired in parallel).
+    site_info = (cfg or {}).get("site_info") or {}
+    operation_mode = site_info.get("default_real_mode") if isinstance(site_info, dict) else None
+    backup_reserve_percent = _int_or_none(
+        site_info.get("backup_reserve_percent") if isinstance(site_info, dict) else None
+    )
+
+    # Alerts: DCQ flat list of names; coerce to dict shape consumers expect.
+    alerts_active = control.get("alerts", {}).get("active") if isinstance(control.get("alerts"), dict) else None
+    alerts: list[dict[str, Any]] | None = None
+    if isinstance(alerts_active, list):
+        alerts = [
+            {"name": a} if isinstance(a, str) else a
+            for a in alerts_active
+            if isinstance(a, (str, dict))
+        ]
+
+    # Battery blocks — DCQ exposes per-pack DINs and disable reasons; SOC
+    # data is via dedicated BMS path (`fetch_device_controller_json`) which
+    # returns the richer cloud-relay payload. The local snapshot keeps the
+    # raw block list for downstream consumers that just need a count.
+    blocks_raw = control.get("batteryBlocks")
+    battery_blocks = (
+        [b for b in blocks_raw if isinstance(b, dict)]
+        if isinstance(blocks_raw, list)
+        else None
+    )
+    pw_count = len(battery_blocks) if battery_blocks else None
+
+    # site_shutdown + system_island_state best-effort.
+    site_shutdown = control.get("siteShutdown") or {}
+    if site_shutdown.get("isShutDown"):
+        system_island_state = "SystemIslandedActive"
+    elif grid_status:
+        system_island_state = grid_status
+    else:
+        system_island_state = None
+
+    return PowerwallSnapshot(
+        soc=soc_pct,
+        solar_w=_watts("solar"),
+        battery_w=_watts("battery"),
+        grid_w=_watts("site"),
+        load_w=_watts("load"),
+        grid_status=grid_status,
+        operation_mode=operation_mode,
+        backup_reserve_percent=backup_reserve_percent,
+        raw={"dcq": dcq, "config": cfg},
+        system_island_state=system_island_state,
+        pw_count=pw_count,
+        total_pack_full_wh=full_wh,
+        total_pack_remaining_wh=rem_wh,
+        battery_blocks=battery_blocks,
+        alerts=alerts,
+    )
+
+

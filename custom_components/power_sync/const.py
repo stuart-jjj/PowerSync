@@ -16,7 +16,7 @@ except (FileNotFoundError, json.JSONDecodeError):
     POWER_SYNC_VERSION = "0.0.0"
 
 # Dashboard JS version — bump this to cache-bust the strategy JS independently of the app version
-DASHBOARD_JS_VERSION = "11"
+DASHBOARD_JS_VERSION = "12"
 
 # User-Agent for API identification
 POWER_SYNC_USER_AGENT = f"PowerSync/{POWER_SYNC_VERSION} HomeAssistant"
@@ -27,6 +27,9 @@ CONF_AMBER_SITE_ID = "amber_site_id"
 CONF_TESLEMETRY_API_TOKEN = "teslemetry_api_token"
 CONF_TESLA_ENERGY_SITE_ID = "tesla_energy_site_id"
 CONF_AUTO_SYNC_ENABLED = "auto_sync_enabled"
+CONF_AUTO_UPDATE_ENABLED = "auto_update_enabled"
+CONF_AUTO_UPDATE_TIME = "auto_update_time"
+DEFAULT_AUTO_UPDATE_TIME = "03:00"
 CONF_TIMEZONE = "timezone"
 CONF_AMBER_FORECAST_TYPE = "amber_forecast_type"
 CONF_BATTERY_CURTAILMENT_ENABLED = "battery_curtailment_enabled"
@@ -301,6 +304,7 @@ BYD_INTEGRATION = "byd_vehicle"
 CONF_FLEET_API_ACCESS_TOKEN = "fleet_api_access_token"
 CONF_FLEET_API_REFRESH_TOKEN = "fleet_api_refresh_token"
 CONF_FLEET_API_TOKEN_EXPIRES_AT = "fleet_api_token_expires_at"
+CONF_FLEET_API_BASE_URL = "fleet_api_base_url"
 CONF_FLEET_API_CLIENT_ID = "fleet_api_client_id"
 CONF_FLEET_API_CLIENT_SECRET = "fleet_api_client_secret"
 
@@ -314,6 +318,9 @@ CONF_POWERWALL_LOCAL_PUBLIC_KEY = "powerwall_local_public_key_der"
 CONF_POWERWALL_LOCAL_DIN = "powerwall_local_din"
 CONF_POWERWALL_LOCAL_IP = "powerwall_local_ip"
 CONF_POWERWALL_LOCAL_VERSION = "powerwall_local_version"  # "pw2" | "pw3"
+# DEPRECATED — kept only so HA doesn't choke on legacy entry.data values
+# carried forward from versions <= 2.12.247. The integration uses RSA-signed
+# /tedapi/v1r exclusively now; never written, never read at runtime.
 CONF_POWERWALL_LOCAL_CUSTOMER_PASSWORD = "powerwall_local_customer_password"
 CONF_POWERWALL_LOCAL_WIFI_SSID = "powerwall_local_wifi_ssid"
 CONF_POWERWALL_LOCAL_WIFI_PASSWORD = "powerwall_local_wifi_password"
@@ -322,8 +329,9 @@ CONF_POWERWALL_LOCAL_PAIRED_AT = "powerwall_local_paired_at"
 # Minimum battery SOC (%) below which off-grid commands are refused.
 CONF_POWERWALL_OFF_GRID_MIN_SOC = "powerwall_off_grid_min_soc"
 DEFAULT_POWERWALL_OFF_GRID_MIN_SOC = 20
-# Local poll interval for meters/SOC/grid_status when paired.
-POWERWALL_LOCAL_POLL_INTERVAL = 10  # seconds
+# Local poll interval for meters/SOC/grid_status when paired. Gateway samples
+# at ~1 Hz natively; 2s gives near-real-time updates with a small margin.
+POWERWALL_LOCAL_POLL_INTERVAL = 2  # seconds
 # Pairing window the user has to toggle the Powerwall switch.
 POWERWALL_PAIRING_WINDOW_SECONDS = 120
 
@@ -417,6 +425,12 @@ DEFAULT_SOLAX_MAX_DISCHARGE_CURRENT_A = 25
 CONF_SAJ_CONFIG_ENTRY_ID = "saj_config_entry_id"
 CONF_SAJ_BATTERY_CAPACITY_KWH = "saj_battery_capacity_kwh"
 DEFAULT_SAJ_BATTERY_CAPACITY_KWH = 10.0
+# Inverter AC rated power in kW (e.g. HS2-10K-T2-5 → 10.0). Required for
+# converting LP-requested watts to the SAJ passive_battery_*_power_input
+# percent×10 encoding, and for the TOU force_discharge path which writes
+# discharge slot 7 at 100 % of this rated power.
+CONF_SAJ_INVERTER_RATED_KW = "saj_inverter_rated_kw"
+DEFAULT_SAJ_INVERTER_RATED_KW = 10.0
 
 # Demand charge configuration
 CONF_DEMAND_CHARGE_ENABLED = "demand_charge_enabled"
@@ -930,6 +944,8 @@ MIN_TWAP_SAMPLES = 12            # Minimum samples (~1 hour) before using dynami
 # Data coordinator update intervals
 UPDATE_INTERVAL_PRICES = timedelta(minutes=5)  # Amber updates every 5 minutes
 UPDATE_INTERVAL_ENERGY = timedelta(seconds=15)  # Tesla energy data every 15 seconds
+TESLA_SITE_INFO_CACHE_TTL_SECONDS = 6 * 60 * 60
+TESLA_SITE_INFO_CONTROL_MAX_AGE_SECONDS = 60
 
 # Amber API
 AMBER_API_BASE_URL = "https://api.amber.com.au/v1"
@@ -950,17 +966,22 @@ POWERSYNC_AUTH_START_URL = "https://api.powersync.cc/auth/start"
 POWERSYNC_AUTH_ME_URL = "https://api.powersync.cc/auth/me"
 
 
-def get_tesla_api_base_url(provider: str | None) -> str:
+def get_tesla_api_base_url(
+    provider: str | None, fleet_base_url: str | None = None
+) -> str:
     """Return the Tesla API base URL for a given provider.
 
     Used by all Tesla service handlers to construct API request URLs.
     All three providers expose the same /api/1/... path structure, only
     the base differs.
+
+    fleet_base_url overrides FLEET_API_BASE_URL for Fleet API provider — pass
+    entry.data.get(CONF_FLEET_API_BASE_URL) to support EU/AP regional endpoints.
     """
     if provider == TESLA_PROVIDER_POWERSYNC:
         return POWERSYNC_API_BASE_URL
     if provider == TESLA_PROVIDER_FLEET_API:
-        return FLEET_API_BASE_URL
+        return fleet_base_url or FLEET_API_BASE_URL
     return TESLEMETRY_API_BASE_URL
 
 # Services
@@ -1025,6 +1046,7 @@ SWITCH_TYPE_FORCE_CHARGE = "force_charge"
 SWITCH_TYPE_MONITORING_MODE = "monitoring_mode"
 SWITCH_TYPE_AWAY_MODE = "away_mode"
 SWITCH_TYPE_PROFIT_MAX_MODE = "profit_max_mode"
+SWITCH_TYPE_AUTO_UPDATE = "auto_update"
 
 # Monitoring mode — blocks all battery/inverter control commands
 CONF_MONITORING_MODE = "monitoring_mode"
@@ -1092,6 +1114,28 @@ SENSOR_TYPE_AMBER_COMPARISON = "flow_power_amber_comparison"
 SENSOR_TYPE_BATTERY_HEALTH = "battery_health"
 SENSOR_TYPE_FIRMWARE = "firmware"
 
+# Tesla Powerwall extended sensors (cloud)
+SENSOR_TYPE_LIFETIME_SOLAR = "lifetime_solar_energy"
+SENSOR_TYPE_LIFETIME_GRID_IMPORT = "lifetime_grid_import"
+SENSOR_TYPE_LIFETIME_GRID_EXPORT = "lifetime_grid_export"
+SENSOR_TYPE_LIFETIME_BATTERY_CHARGED = "lifetime_battery_charged"
+SENSOR_TYPE_LIFETIME_BATTERY_DISCHARGED = "lifetime_battery_discharged"
+SENSOR_TYPE_LIFETIME_HOME_CONSUMPTION = "lifetime_home_consumption"
+SENSOR_TYPE_BACKUP_TIME_REMAINING = "backup_time_remaining"
+SENSOR_TYPE_TOTAL_PACK_ENERGY = "total_pack_energy"
+SENSOR_TYPE_ENERGY_LEFT = "energy_left"
+SENSOR_TYPE_GRID_SERVICES_POWER = "grid_services_power"
+
+# Tesla Powerwall local TEDAPI sensors (gated on CONF_POWERWALL_LOCAL_PAIRED)
+SENSOR_TYPE_PW_SYSTEM_ISLAND_STATE = "pw_system_island_state"
+SENSOR_TYPE_PW_COUNT = "pw_count"
+SENSOR_TYPE_PW_ACTIVE_ALERTS = "pw_active_alerts"
+SENSOR_TYPE_PW_BLOCK_SOC = "pw_block_soc"  # per-block (key gets index suffix)
+SENSOR_TYPE_PW_BLOCK_CAPACITY = "pw_block_capacity"
+SENSOR_TYPE_PW_BLOCK_VOLTAGE = "pw_block_voltage"
+SENSOR_TYPE_PW_BLOCK_TEMPERATURE = "pw_block_temperature"
+SENSOR_TYPE_PW_BLOCK_SOH = "pw_block_soh"
+
 # Amber Export Price Boost configuration
 # Artificially increase export prices to trigger Powerwall exports
 CONF_EXPORT_PRICE_OFFSET = "export_price_offset"
@@ -1126,11 +1170,6 @@ DEFAULT_CHIP_MODE_THRESHOLD = 30.0  # c/kWh (allow export only above this)
 # When Amber reports spikeStatus='potential' or 'spike', override buy prices
 # to max(sell_prices) + $1.00 to eliminate arbitrage opportunities
 CONF_SPIKE_PROTECTION_ENABLED = "spike_protection_enabled"
-
-# Settled Prices Only mode
-# Skips the initial forecast sync at :00 and only syncs when actual/settled prices
-# arrive via the Amber API at :35/:60 seconds into each 5-minute period
-CONF_SETTLED_PRICES_ONLY = "settled_prices_only"
 
 # Forecast Discrepancy Alert configuration
 # Compares predicted forecast against conservative/low forecast and alerts if
@@ -1735,6 +1774,21 @@ SENSOR_KEY_TO_FAMILY: dict[str, str] = {
     "saving_session_active": SENSOR_FAMILY_OCTOPUS,
     "next_saving_session": SENSOR_FAMILY_OCTOPUS,
     "saving_session_rate": SENSOR_FAMILY_OCTOPUS,
+    # Tesla Powerwall extended (cloud)
+    "lifetime_solar_energy": SENSOR_FAMILY_SOLAR_INVERTER,
+    "lifetime_grid_import": SENSOR_FAMILY_GRID_HOME,
+    "lifetime_grid_export": SENSOR_FAMILY_GRID_HOME,
+    "lifetime_battery_charged": SENSOR_FAMILY_BATTERY,
+    "lifetime_battery_discharged": SENSOR_FAMILY_BATTERY,
+    "lifetime_home_consumption": SENSOR_FAMILY_GRID_HOME,
+    "backup_time_remaining": SENSOR_FAMILY_BATTERY,
+    "total_pack_energy": SENSOR_FAMILY_BATTERY,
+    "energy_left": SENSOR_FAMILY_BATTERY,
+    "grid_services_power": SENSOR_FAMILY_GRID_HOME,
+    # Powerwall local
+    "pw_system_island_state": SENSOR_FAMILY_GRID_HOME,
+    "pw_count": SENSOR_FAMILY_BATTERY,
+    "pw_active_alerts": SENSOR_FAMILY_BATTERY,
 }
 
 
@@ -1742,4 +1796,36 @@ def family_device_info(entry_id: str, family: str) -> dict:
     """Return device_info dict pointing all entities at the single parent device."""
     return {
         "identifiers": {(DOMAIN, entry_id)},
+    }
+
+
+def powerwall_device_info(entry_id: str) -> dict:
+    """Tesla Powerwall device — sub-device of the main PowerSync entry.
+
+    Holds Powerwall-specific telemetry (lifetime totals, backup time remaining,
+    grid services state, alerts) so the HA device tree separates raw Powerwall
+    diagnostics from the optimiser's user-facing controls.
+    """
+    return {
+        "identifiers": {(DOMAIN, f"{entry_id}_powerwall")},
+        "name": "Tesla Powerwall",
+        "manufacturer": "Tesla",
+        "model": "Powerwall",
+        "via_device": (DOMAIN, entry_id),
+    }
+
+
+def powerwall_block_device_info(entry_id: str, index: int) -> dict:
+    """Per-Powerwall sub-device, used for individual battery-block sensors.
+
+    Each in-service Powerwall gets its own device (Powerwall 1, Powerwall 2, …)
+    via the Tesla Powerwall parent so SOC / voltage / temperature / SoH for
+    each pack live on a distinct device card in HA.
+    """
+    return {
+        "identifiers": {(DOMAIN, f"{entry_id}_pw_{index + 1}")},
+        "name": f"Powerwall {index + 1}",
+        "manufacturer": "Tesla",
+        "model": "Powerwall Battery",
+        "via_device": (DOMAIN, f"{entry_id}_powerwall"),
     }

@@ -15,10 +15,10 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
-    CURRENCY_DOLLAR,
     UnitOfEnergy,
     UnitOfPower,
     UnitOfTemperature,
+    UnitOfTime,
     PERCENTAGE,
 )
 from homeassistant.core import HomeAssistant, callback
@@ -30,6 +30,7 @@ from homeassistant.util import dt as dt_util
 from datetime import timedelta
 
 from .const import (
+    CONF_POWERWALL_LOCAL_PAIRED,
     DOMAIN,
     SENSOR_TYPE_CURRENT_PRICE,
     SENSOR_TYPE_CURRENT_IMPORT_PRICE,
@@ -86,6 +87,16 @@ from .const import (
     DEFAULT_FP_AMBER_MARKUP,
     SENSOR_TYPE_BATTERY_HEALTH,
     SENSOR_TYPE_FIRMWARE,
+    SENSOR_TYPE_LIFETIME_SOLAR,
+    SENSOR_TYPE_LIFETIME_GRID_IMPORT,
+    SENSOR_TYPE_LIFETIME_GRID_EXPORT,
+    SENSOR_TYPE_LIFETIME_BATTERY_CHARGED,
+    SENSOR_TYPE_LIFETIME_BATTERY_DISCHARGED,
+    SENSOR_TYPE_LIFETIME_HOME_CONSUMPTION,
+    SENSOR_TYPE_BACKUP_TIME_REMAINING,
+    SENSOR_TYPE_TOTAL_PACK_ENERGY,
+    SENSOR_TYPE_ENERGY_LEFT,
+    SENSOR_TYPE_GRID_SERVICES_POWER,
     SENSOR_TYPE_INVERTER_STATUS,
     SENSOR_TYPE_BATTERY_MODE,
     SENSOR_TYPE_PV1_POWER,
@@ -160,6 +171,8 @@ from .const import (
     ATTR_AEMO_THRESHOLD,
     ATTR_SPIKE_START_TIME,
     family_device_info,
+    powerwall_device_info,
+    powerwall_block_device_info,
     SENSOR_KEY_TO_FAMILY,
     SENSOR_FAMILY_LP_OPTIMIZER,
     SENSOR_FAMILY_BATTERY,
@@ -170,7 +183,23 @@ from .const import (
     SENSOR_FAMILY_EV_CHARGING,
     SENSOR_FAMILY_OCTOPUS,
 )
-from .coordinator import AmberPriceCoordinator, LocalvoltsPriceCoordinator, TeslaEnergyCoordinator, DemandChargeCoordinator, SolcastForecastCoordinator
+from .coordinator import (
+    AmberPriceCoordinator,
+    LocalvoltsPriceCoordinator,
+    OctopusPriceCoordinator,
+    TeslaEnergyCoordinator,
+    DemandChargeCoordinator,
+    SolcastForecastCoordinator,
+)
+from .currency import (
+    currency_for_entry,
+    currency_metadata,
+    major_price_unit,
+    minor_price_unit,
+    money_unit,
+    normalize_currency,
+)
+from . import get_current_price_from_tariff_schedule
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -181,6 +210,96 @@ class PowerSyncSensorEntityDescription(SensorEntityDescription):
 
     value_fn: Callable[[Any], Any] | None = None
     attr_fn: Callable[[Any], dict[str, Any]] | None = None
+    # Optional override that pulls the sensor onto a separate HA device.
+    # Currently only "powerwall" is recognised — anything else falls back to
+    # the default family_device_info routing so existing sensors are unaffected.
+    device_section: str | None = None
+    # Currency unit kind. "money" is a pure monetary total, "major_rate" is
+    # ISO/kWh, "market_rate" is ISO/MWh, and "minor_rate" is p/ct/c per kWh.
+    currency_unit: str | None = None
+    currency_attrs: bool = False
+
+
+RATE_CURRENCY_UNITS = {"major_rate", "market_rate", "minor_rate"}
+
+
+def _currency_unit_for_kind(kind: str | None, currency: str) -> str | None:
+    """Return a unit string for a PowerSync currency unit kind."""
+    if kind == "money":
+        return money_unit(currency)
+    if kind == "major_rate":
+        return major_price_unit(currency)
+    if kind == "market_rate":
+        return major_price_unit(currency, "MWh")
+    if kind == "minor_rate":
+        return minor_price_unit(currency)
+    return None
+
+
+def _entity_currency(entity: Any, tariff_data: dict[str, Any] | None = None) -> str:
+    """Return the currency for an entity, optionally preferring tariff metadata."""
+    if tariff_data:
+        tariff_currency = normalize_currency(tariff_data.get("currency"), "")
+        if tariff_currency:
+            return tariff_currency
+    return currency_for_entry(getattr(entity, "_entry", None), getattr(entity, "hass", None))
+
+
+def _entity_currency_attrs(
+    entity: Any,
+    attrs: dict[str, Any] | None,
+    tariff_data: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Merge currency metadata into attributes for currency-aware sensors."""
+    base = dict(attrs or {})
+    description = getattr(entity, "entity_description", None)
+    kind = getattr(description, "currency_unit", None) or getattr(entity, "_attr_currency_unit", None)
+    include = (
+        getattr(description, "currency_attrs", False)
+        or getattr(entity, "_attr_currency_attrs", False)
+    )
+    if kind and include:
+        base.update(currency_metadata(_entity_currency(entity, tariff_data)))
+    return base
+
+
+class PowerSyncCurrencyMixin:
+    """Mixin for dynamic currency units on PowerSync sensors."""
+
+    def _currency_source_data(self) -> dict[str, Any] | None:
+        """Return optional tariff data that should override entry currency."""
+        return None
+
+    @property
+    def _currency_unit_kind(self) -> str | None:
+        description = getattr(self, "entity_description", None)
+        return getattr(description, "currency_unit", None) or getattr(self, "_attr_currency_unit", None)
+
+    @property
+    def native_unit_of_measurement(self) -> str | None:
+        """Return a provider/HA currency-aware unit when requested."""
+        unit = _currency_unit_for_kind(
+            self._currency_unit_kind,
+            _entity_currency(self, self._currency_source_data()),
+        )
+        if unit:
+            return unit
+        description = getattr(self, "entity_description", None)
+        return (
+            getattr(self, "_attr_native_unit_of_measurement", None)
+            or getattr(description, "native_unit_of_measurement", None)
+        )
+
+    @property
+    def device_class(self) -> SensorDeviceClass | None:
+        """Avoid monetary device class for price-rate sensors."""
+        if self._currency_unit_kind in RATE_CURRENCY_UNITS:
+            return None
+        description = getattr(self, "entity_description", None)
+        return (
+            getattr(self, "_attr_device_class", None)
+            or getattr(description, "device_class", None)
+        )
 
 
 def _get_import_price(data):
@@ -239,8 +358,8 @@ PRICE_SENSORS: tuple[PowerSyncSensorEntityDescription, ...] = (
     PowerSyncSensorEntityDescription(
         key=SENSOR_TYPE_CURRENT_IMPORT_PRICE,
         name="Current Import Price",
-        native_unit_of_measurement=f"{CURRENCY_DOLLAR}/{UnitOfEnergy.KILO_WATT_HOUR}",
-        device_class=SensorDeviceClass.MONETARY,
+        currency_unit="major_rate",
+        currency_attrs=True,
         suggested_display_precision=4,
         value_fn=_get_import_price,
         attr_fn=lambda data: {
@@ -258,8 +377,8 @@ PRICE_SENSORS: tuple[PowerSyncSensorEntityDescription, ...] = (
     PowerSyncSensorEntityDescription(
         key=SENSOR_TYPE_CURRENT_EXPORT_PRICE,
         name="Current Export Price",
-        native_unit_of_measurement=f"{CURRENCY_DOLLAR}/{UnitOfEnergy.KILO_WATT_HOUR}",
-        device_class=SensorDeviceClass.MONETARY,
+        currency_unit="major_rate",
+        currency_attrs=True,
         suggested_display_precision=4,
         icon="mdi:transmission-tower-export",
         value_fn=_get_export_price,
@@ -384,7 +503,8 @@ ENERGY_SENSORS: tuple[PowerSyncSensorEntityDescription, ...] = (
     PowerSyncSensorEntityDescription(
         key=SENSOR_TYPE_DAILY_IMPORT_COST,
         name="Daily Import Cost",
-        native_unit_of_measurement=CURRENCY_DOLLAR,
+        currency_unit="money",
+        currency_attrs=True,
         device_class=SensorDeviceClass.MONETARY,
         state_class=SensorStateClass.TOTAL,
         suggested_display_precision=2,
@@ -394,7 +514,8 @@ ENERGY_SENSORS: tuple[PowerSyncSensorEntityDescription, ...] = (
     PowerSyncSensorEntityDescription(
         key=SENSOR_TYPE_DAILY_EXPORT_EARNINGS,
         name="Daily Export Earnings",
-        native_unit_of_measurement=CURRENCY_DOLLAR,
+        currency_unit="money",
+        currency_attrs=True,
         device_class=SensorDeviceClass.MONETARY,
         state_class=SensorStateClass.TOTAL,
         suggested_display_precision=2,
@@ -404,7 +525,8 @@ ENERGY_SENSORS: tuple[PowerSyncSensorEntityDescription, ...] = (
     PowerSyncSensorEntityDescription(
         key=SENSOR_TYPE_DAILY_AVG_COST_PER_KWH,
         name="Average Cost per kWh Today",
-        native_unit_of_measurement=f"{CURRENCY_DOLLAR}/kWh",
+        currency_unit="major_rate",
+        currency_attrs=True,
         state_class=SensorStateClass.MEASUREMENT,
         suggested_display_precision=3,
         icon="mdi:cash-clock",
@@ -413,7 +535,8 @@ ENERGY_SENSORS: tuple[PowerSyncSensorEntityDescription, ...] = (
     PowerSyncSensorEntityDescription(
         key=SENSOR_TYPE_MTD_AVG_COST_PER_KWH,
         name="Average Cost per kWh Month to Date",
-        native_unit_of_measurement=f"{CURRENCY_DOLLAR}/kWh",
+        currency_unit="major_rate",
+        currency_attrs=True,
         state_class=SensorStateClass.MEASUREMENT,
         suggested_display_precision=3,
         icon="mdi:calendar-month",
@@ -494,6 +617,116 @@ TESLA_SENSORS: tuple[PowerSyncSensorEntityDescription, ...] = (
         name="Firmware",
         icon="mdi:chip",
         value_fn=lambda data: data.get("firmware") if data else None,
+    ),
+    PowerSyncSensorEntityDescription(
+        key=SENSOR_TYPE_TOTAL_PACK_ENERGY,
+        name="Battery Pack Capacity",
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY_STORAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=2,
+        icon="mdi:battery-high",
+        value_fn=lambda data: data.get("total_pack_energy_kwh") if data else None,
+        device_section="powerwall",
+    ),
+    PowerSyncSensorEntityDescription(
+        key=SENSOR_TYPE_ENERGY_LEFT,
+        name="Battery Energy Left",
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY_STORAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=2,
+        icon="mdi:battery-50",
+        value_fn=lambda data: data.get("energy_left_kwh") if data else None,
+        device_section="powerwall",
+    ),
+    PowerSyncSensorEntityDescription(
+        key=SENSOR_TYPE_BACKUP_TIME_REMAINING,
+        name="Backup Time Remaining",
+        native_unit_of_measurement=UnitOfTime.HOURS,
+        device_class=SensorDeviceClass.DURATION,
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=1,
+        icon="mdi:timer-sand",
+        value_fn=lambda data: data.get("backup_time_remaining_hours") if data else None,
+        device_section="powerwall",
+    ),
+    PowerSyncSensorEntityDescription(
+        key=SENSOR_TYPE_GRID_SERVICES_POWER,
+        name="Grid Services Power",
+        native_unit_of_measurement=UnitOfPower.KILO_WATT,
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=3,
+        icon="mdi:transmission-tower",
+        value_fn=lambda data: data.get("grid_services_power_kw") if data else None,
+        device_section="powerwall",
+    ),
+    PowerSyncSensorEntityDescription(
+        key=SENSOR_TYPE_LIFETIME_SOLAR,
+        name="Lifetime Solar Energy",
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        suggested_display_precision=1,
+        icon="mdi:solar-power-variant",
+        value_fn=lambda data: (data.get("lifetime_totals") or {}).get("lifetime_solar_kwh") if data else None,
+        device_section="powerwall",
+    ),
+    PowerSyncSensorEntityDescription(
+        key=SENSOR_TYPE_LIFETIME_GRID_IMPORT,
+        name="Lifetime Grid Import",
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        suggested_display_precision=1,
+        icon="mdi:transmission-tower-import",
+        value_fn=lambda data: (data.get("lifetime_totals") or {}).get("lifetime_grid_import_kwh") if data else None,
+        device_section="powerwall",
+    ),
+    PowerSyncSensorEntityDescription(
+        key=SENSOR_TYPE_LIFETIME_GRID_EXPORT,
+        name="Lifetime Grid Export",
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        suggested_display_precision=1,
+        icon="mdi:transmission-tower-export",
+        value_fn=lambda data: (data.get("lifetime_totals") or {}).get("lifetime_grid_export_kwh") if data else None,
+        device_section="powerwall",
+    ),
+    PowerSyncSensorEntityDescription(
+        key=SENSOR_TYPE_LIFETIME_BATTERY_CHARGED,
+        name="Lifetime Battery Charged",
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        suggested_display_precision=1,
+        icon="mdi:battery-charging-100",
+        value_fn=lambda data: (data.get("lifetime_totals") or {}).get("lifetime_battery_charged_kwh") if data else None,
+        device_section="powerwall",
+    ),
+    PowerSyncSensorEntityDescription(
+        key=SENSOR_TYPE_LIFETIME_BATTERY_DISCHARGED,
+        name="Lifetime Battery Discharged",
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        suggested_display_precision=1,
+        icon="mdi:battery-arrow-down",
+        value_fn=lambda data: (data.get("lifetime_totals") or {}).get("lifetime_battery_discharged_kwh") if data else None,
+        device_section="powerwall",
+    ),
+    PowerSyncSensorEntityDescription(
+        key=SENSOR_TYPE_LIFETIME_HOME_CONSUMPTION,
+        name="Lifetime Home Consumption",
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        suggested_display_precision=1,
+        icon="mdi:home-lightning-bolt",
+        value_fn=lambda data: (data.get("lifetime_totals") or {}).get("lifetime_home_kwh") if data else None,
+        device_section="powerwall",
     ),
 )
 
@@ -705,22 +938,25 @@ def _optimizer_window_attributes(data: dict[str, Any] | None, action: str) -> di
 OPTIMIZER_ACTION_SENSORS: tuple[PowerSyncSensorEntityDescription, ...] = (
     PowerSyncSensorEntityDescription(
         key=SENSOR_TYPE_OPTIMIZATION_STATUS,
-        name="Optimizer Current Action",
+        name="Current Action",
         icon="mdi:battery-sync",
         value_fn=lambda data: data.get("current_action") if data else None,
         attr_fn=lambda data: {
             "power_w": data.get("current_power_w"),
             "status": data.get("status"),
+            "until": data.get("current_action_end_time"),
         } if data else {},
     ),
     PowerSyncSensorEntityDescription(
         key=SENSOR_TYPE_OPTIMIZATION_NEXT_ACTION,
-        name="Optimizer Next Action",
+        name="Next Scheduled Change",
         icon="mdi:clock-fast",
         value_fn=lambda data: data.get("next_action") if data else None,
         attr_fn=lambda data: {
             "time": data.get("next_action_time"),
             "power_w": data.get("next_action_power_w"),
+            "current_action": data.get("current_action"),
+            "current_until": data.get("current_action_end_time"),
             "next_actions": data.get("next_actions", []),
             "force_charge_windows": _future_optimizer_action_windows(data, "charge"),
         } if data else {},
@@ -752,7 +988,8 @@ DEMAND_CHARGE_SENSORS: tuple[PowerSyncSensorEntityDescription, ...] = (
     PowerSyncSensorEntityDescription(
         key=SENSOR_TYPE_DEMAND_CHARGE_COST,
         name="Estimated Demand Charge Cost",
-        native_unit_of_measurement=CURRENCY_DOLLAR,
+        currency_unit="money",
+        currency_attrs=True,
         device_class=SensorDeviceClass.MONETARY,
         suggested_display_precision=2,
         value_fn=lambda data: data.get("estimated_cost", 0.0) if data else 0.0,
@@ -760,7 +997,8 @@ DEMAND_CHARGE_SENSORS: tuple[PowerSyncSensorEntityDescription, ...] = (
     PowerSyncSensorEntityDescription(
         key=SENSOR_TYPE_DAILY_SUPPLY_CHARGE_COST,
         name="Daily Supply Charge Cost This Month",
-        native_unit_of_measurement=CURRENCY_DOLLAR,
+        currency_unit="money",
+        currency_attrs=True,
         device_class=SensorDeviceClass.MONETARY,
         state_class=SensorStateClass.TOTAL,  # MONETARY only supports 'total', not 'total_increasing'
         suggested_display_precision=2,
@@ -769,7 +1007,8 @@ DEMAND_CHARGE_SENSORS: tuple[PowerSyncSensorEntityDescription, ...] = (
     PowerSyncSensorEntityDescription(
         key=SENSOR_TYPE_MONTHLY_SUPPLY_CHARGE,
         name="Monthly Supply Charge",
-        native_unit_of_measurement=CURRENCY_DOLLAR,
+        currency_unit="money",
+        currency_attrs=True,
         device_class=SensorDeviceClass.MONETARY,
         suggested_display_precision=2,
         value_fn=lambda data: data.get("monthly_supply_charge", 0.0) if data else 0.0,
@@ -777,7 +1016,8 @@ DEMAND_CHARGE_SENSORS: tuple[PowerSyncSensorEntityDescription, ...] = (
     PowerSyncSensorEntityDescription(
         key=SENSOR_TYPE_TOTAL_MONTHLY_COST,
         name="Total Estimated Monthly Cost",
-        native_unit_of_measurement=CURRENCY_DOLLAR,
+        currency_unit="money",
+        currency_attrs=True,
         device_class=SensorDeviceClass.MONETARY,
         state_class=SensorStateClass.TOTAL,
         suggested_display_precision=2,
@@ -791,8 +1031,8 @@ AEMO_SENSORS: tuple[PowerSyncSensorEntityDescription, ...] = (
     PowerSyncSensorEntityDescription(
         key=SENSOR_TYPE_AEMO_PRICE,
         name="AEMO Wholesale Price",
-        native_unit_of_measurement="$/MWh",
-        device_class=SensorDeviceClass.MONETARY,
+        currency_unit="market_rate",
+        currency_attrs=True,
         suggested_display_precision=2,
         value_fn=lambda data: data.get("last_price") if data else None,
         attr_fn=lambda data: {
@@ -923,6 +1163,7 @@ async def async_setup_entry(
     domain_data = hass.data[DOMAIN][entry.entry_id]
     amber_coordinator: AmberPriceCoordinator | None = domain_data.get("amber_coordinator")
     localvolts_coordinator: LocalvoltsPriceCoordinator | None = domain_data.get("localvolts_coordinator")
+    octopus_coordinator: OctopusPriceCoordinator | None = domain_data.get("octopus_coordinator")
     tesla_coordinator: TeslaEnergyCoordinator | None = domain_data.get("tesla_coordinator")
     sigenergy_coordinator = domain_data.get("sigenergy_coordinator")
     sungrow_coordinator = domain_data.get("sungrow_coordinator")
@@ -932,6 +1173,7 @@ async def async_setup_entry(
     voltx_coordinator = domain_data.get("voltx_coordinator")
     esy_sunhome_coordinator = domain_data.get("esy_sunhome_coordinator")
     solax_coordinator = domain_data.get("solax_coordinator")
+    saj_h2_coordinator = domain_data.get("saj_h2_coordinator")
     demand_charge_coordinator: DemandChargeCoordinator | None = domain_data.get("demand_charge_coordinator")
     aemo_spike_manager = domain_data.get("aemo_spike_manager")
     is_sigenergy = domain_data.get("is_sigenergy", False)
@@ -942,6 +1184,7 @@ async def async_setup_entry(
     is_voltx = domain_data.get("is_voltx", False)
     is_esy_sunhome = domain_data.get("is_esy_sunhome", False)
     is_solax = domain_data.get("is_solax", False)
+    is_saj_h2 = domain_data.get("is_saj_h2", False)
 
     entities: list[SensorEntity] = []
 
@@ -964,6 +1207,16 @@ async def async_setup_entry(
             entities.append(
                 AmberPriceSensor(
                     coordinator=localvolts_coordinator,
+                    description=description,
+                    entry=entry,
+                )
+            )
+    elif octopus_coordinator:
+        _LOGGER.info("Adding Octopus price sensors (import and export)")
+        for description in PRICE_SENSORS:
+            entities.append(
+                AmberPriceSensor(
+                    coordinator=octopus_coordinator,
                     description=description,
                     entry=entry,
                 )
@@ -1021,6 +1274,8 @@ async def async_setup_entry(
         energy_coordinator = esy_sunhome_coordinator
     elif is_solax:
         energy_coordinator = solax_coordinator
+    elif is_saj_h2:
+        energy_coordinator = saj_h2_coordinator
     else:
         energy_coordinator = tesla_coordinator
     if energy_coordinator:
@@ -1390,6 +1645,8 @@ async def async_setup_entry(
         battery_system = "alphaess"
     elif is_voltx:
         battery_system = "voltx"
+    elif is_saj_h2:
+        battery_system = "saj_h2"
     entities.append(BatteryHealthSensor(
         entry=entry,
         coordinator=energy_coordinator,
@@ -1401,10 +1658,76 @@ async def async_setup_entry(
     entities.append(BatteryModeSensor(hass=hass, entry=entry))
     _LOGGER.info("Battery mode sensor added")
 
+    # Powerwall local TEDAPI sensors — gated on completed pairing.
+    # System-level sensors are added immediately; per-block entities are
+    # deferred until the first snapshot reveals how many Powerwalls exist.
+    if entry.data.get(CONF_POWERWALL_LOCAL_PAIRED):
+        local_coord = (
+            domain_data.get("powerwall_local", {}).get("coordinator")
+        )
+        if local_coord is not None:
+            entities.extend([
+                PowerwallSystemIslandStateSensor(local_coord, entry),
+                PowerwallCountSensor(local_coord, entry),
+                PowerwallActiveAlertsSensor(local_coord, entry),
+            ])
+            hass.async_create_task(
+                _async_add_powerwall_block_sensors(
+                    hass, entry, local_coord, async_add_entities,
+                ),
+                name=f"{DOMAIN}_powerwall_block_sensors",
+            )
+
     async_add_entities(entities)
 
 
-class AmberPriceSensor(CoordinatorEntity, SensorEntity):
+async def _async_add_powerwall_block_sensors(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    coordinator,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """Create per-Powerwall sensors after the first snapshot lands.
+
+    Waits up to 60s for ``coordinator.data.battery_blocks`` to be populated,
+    then registers one set of sensors per discovered block. PW3 sites typically
+    return None for ``battery_blocks`` (the legacy REST endpoint is gone), so
+    this task simply exits without creating per-block entities — the cloud
+    capacity / energy-left sensors from PR1 still cover the basics.
+    """
+    import asyncio as _asyncio
+    waited = 0.0
+    while waited < 60.0:
+        snap = coordinator.data
+        if snap is not None and snap.battery_blocks:
+            break
+        await _asyncio.sleep(2.0)
+        waited += 2.0
+    snap = coordinator.data
+    if snap is None or not snap.battery_blocks:
+        _LOGGER.info(
+            "Powerwall local snapshot has no battery_blocks (likely PW3 / unsupported endpoint) — skipping per-block sensors",
+        )
+        return
+
+    block_entities: list[SensorEntity] = []
+    for index, _block in enumerate(snap.battery_blocks):
+        block_entities.extend([
+            PowerwallBlockSocSensor(coordinator, entry, index),
+            PowerwallBlockCapacitySensor(coordinator, entry, index),
+            PowerwallBlockVoltageSensor(coordinator, entry, index),
+            PowerwallBlockTemperatureSensor(coordinator, entry, index),
+            PowerwallBlockSohSensor(coordinator, entry, index),
+        ])
+    if block_entities:
+        async_add_entities(block_entities)
+        _LOGGER.info(
+            "Added %d per-Powerwall sensors across %d battery blocks",
+            len(block_entities), len(snap.battery_blocks),
+        )
+
+
+class AmberPriceSensor(PowerSyncCurrencyMixin, CoordinatorEntity, SensorEntity):
     """Sensor for Amber electricity prices."""
 
     entity_description: PowerSyncSensorEntityDescription
@@ -1445,12 +1768,84 @@ class AmberPriceSensor(CoordinatorEntity, SensorEntity):
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return additional attributes."""
         if self.entity_description.attr_fn:
-            return self.entity_description.attr_fn(self.coordinator.data)
-        return {}
+            attrs = self.entity_description.attr_fn(self.coordinator.data)
+        else:
+            attrs = {}
+        return _entity_currency_attrs(self, attrs)
 
 
-class TeslaEnergySensor(CoordinatorEntity, SensorEntity):
-    """Sensor for Tesla energy data."""
+_LOCAL_GRID_STATUS_TO_CLOUD = {
+    "SystemGridConnected": "Active",
+    "SystemIslandedReady": "Active",
+    "SystemTransitionToGrid": "Active",
+    "SystemTransitionToIsland": "Off-Grid",
+    "SystemIslandedActive": "Off-Grid",
+    "SystemMicroGridFaulted": "Off-Grid",
+    "SystemWaitForUser": "Off-Grid",
+}
+
+
+def _local_value_for(sensor_key: str, snap: Any) -> Any:
+    """Map a sensor key to its equivalent on the local PowerwallSnapshot.
+
+    Returns the locally-derived value (in the same units the cloud value_fn
+    produces) or ``None`` to indicate "no local equivalent — fall through to cloud".
+    """
+    if snap is None:
+        return None
+    if sensor_key == SENSOR_TYPE_BATTERY_POWER:
+        return None if snap.battery_w is None else snap.battery_w / 1000.0
+    if sensor_key == SENSOR_TYPE_GRID_POWER:
+        return None if snap.grid_w is None else snap.grid_w / 1000.0
+    if sensor_key == SENSOR_TYPE_SOLAR_POWER:
+        return None if snap.solar_w is None else snap.solar_w / 1000.0
+    if sensor_key == SENSOR_TYPE_HOME_LOAD:
+        return None if snap.load_w is None else snap.load_w / 1000.0
+    if sensor_key == SENSOR_TYPE_BATTERY_LEVEL:
+        return snap.soc
+    if sensor_key == SENSOR_TYPE_GRID_STATUS:
+        if snap.grid_status is None:
+            return None
+        return _LOCAL_GRID_STATUS_TO_CLOUD.get(snap.grid_status, "Active")
+    return None
+
+
+_LOCAL_OVERRIDABLE = {
+    SENSOR_TYPE_BATTERY_POWER,
+    SENSOR_TYPE_GRID_POWER,
+    SENSOR_TYPE_SOLAR_POWER,
+    SENSOR_TYPE_HOME_LOAD,
+    SENSOR_TYPE_BATTERY_LEVEL,
+    SENSOR_TYPE_GRID_STATUS,
+}
+
+# How recently the local coordinator must have ticked for its data to be
+# trusted by the local-prefer override. The local coord polls every 2s, so
+# 30s is ~15 missed ticks — comfortably past transient blips, well before
+# the data turns into a "stuck at 41%" disaster.
+_LOCAL_STALE_SECONDS = 30
+
+
+def _local_data_is_fresh(local_coord: Any) -> bool:
+    """True iff the local coordinator's last successful update is recent."""
+    if local_coord is None or local_coord.data is None:
+        return False
+    last_ts = getattr(local_coord, "last_success_ts", None)
+    if last_ts is None:
+        return False
+    import time as _time
+    return (_time.time() - last_ts) <= _LOCAL_STALE_SECONDS
+
+
+class TeslaEnergySensor(PowerSyncCurrencyMixin, CoordinatorEntity, SensorEntity):
+    """Sensor for Tesla energy data.
+
+    Reads cloud-coordinator data via the entity description's ``value_fn`` by
+    default. When the entry is paired and the local coordinator has a fresh
+    snapshot, the locally-derived value wins for keys in ``_LOCAL_OVERRIDABLE``
+    — and the entity also subscribes to local coordinator updates so it
+    refreshes at the local 2s cadence instead of the cloud 30-60s cadence.
+    """
 
     entity_description: PowerSyncSensorEntityDescription
 
@@ -1468,20 +1863,299 @@ class TeslaEnergySensor(CoordinatorEntity, SensorEntity):
         # HA 2026.2.0+ requires lowercase suggested_object_id
         self._attr_suggested_object_id = f"power_sync_{description.key}"
         self._entry = entry
+        self._local_unsub = None
 
     @property
     def device_info(self):
+        if self.entity_description.device_section == "powerwall":
+            return powerwall_device_info(self._entry.entry_id)
         return family_device_info(
             self._entry.entry_id,
             SENSOR_KEY_TO_FAMILY.get(self.entity_description.key, SENSOR_FAMILY_BATTERY),
         )
 
+    def _local_coordinator(self):
+        """Return the PowerwallLocalCoordinator if paired and built, else None."""
+        if not self._entry.data.get(CONF_POWERWALL_LOCAL_PAIRED):
+            return None
+        bucket = (
+            self.hass.data.get(DOMAIN, {})
+            .get(self._entry.entry_id, {})
+            .get("powerwall_local", {})
+        )
+        return bucket.get("coordinator")
+
     @property
     def native_value(self) -> Any:
-        """Return the state of the sensor."""
+        """Prefer local snapshot value when paired AND fresh; else cloud value_fn.
+
+        Freshness guard: if the local coordinator's last successful update is
+        older than ``_LOCAL_STALE_SECONDS``, fall through to cloud. The local
+        coordinator can die silently (eg gateway unreachable, key rejection,
+        unhandled exception in update loop) and its ``data`` attribute keeps
+        the last successful snapshot. Without this guard, sensors would
+        cling to that stale value indefinitely.
+        """
+        if self.entity_description.key in _LOCAL_OVERRIDABLE:
+            local_coord = self._local_coordinator()
+            if local_coord is not None and _local_data_is_fresh(local_coord):
+                local_v = _local_value_for(
+                    self.entity_description.key, local_coord.data
+                )
+                if local_v is not None:
+                    return local_v
         if self.entity_description.value_fn:
             return self.entity_description.value_fn(self.coordinator.data)
         return None
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to both cloud and local coordinator updates."""
+        await super().async_added_to_hass()
+        if self.entity_description.key in _LOCAL_OVERRIDABLE:
+            local_coord = self._local_coordinator()
+            if local_coord is not None:
+                self._local_unsub = local_coord.async_add_listener(
+                    self.async_write_ha_state
+                )
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Drop the local coordinator listener cleanly."""
+        if self._local_unsub is not None:
+            self._local_unsub()
+            self._local_unsub = None
+        await super().async_will_remove_from_hass()
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return additional attributes."""
+        if self.entity_description.attr_fn:
+            attrs = self.entity_description.attr_fn(self.coordinator.data)
+        else:
+            attrs = {}
+        return _entity_currency_attrs(self, attrs)
+
+
+class _PowerwallLocalSensorBase(CoordinatorEntity, SensorEntity):
+    """Base class for sensors that read directly from the local TEDAPI snapshot."""
+
+    _attr_has_entity_name = True
+
+    def __init__(self, coordinator, entry: ConfigEntry, key: str, name: str) -> None:
+        super().__init__(coordinator)
+        self._entry = entry
+        self._attr_unique_id = f"{entry.entry_id}_{key}"
+        self._attr_suggested_object_id = f"power_sync_{key}"
+        self._attr_name = name
+
+    @property
+    def device_info(self):
+        return powerwall_device_info(self._entry.entry_id)
+
+    @property
+    def _snap(self):
+        return self.coordinator.data
+
+
+class PowerwallSystemIslandStateSensor(_PowerwallLocalSensorBase):
+    """Powerwall-reported island state (richer than the simple grid_status sensor)."""
+
+    _attr_icon = "mdi:transmission-tower"
+
+    def __init__(self, coordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "pw_system_island_state", "System Island State")
+
+    @property
+    def native_value(self) -> Any:
+        snap = self._snap
+        if snap is None:
+            return None
+        return snap.system_island_state or snap.grid_status
+
+
+class PowerwallCountSensor(_PowerwallLocalSensorBase):
+    """Number of in-service Powerwalls reported by the gateway."""
+
+    _attr_icon = "mdi:battery-multiple"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "pw_count", "Powerwall Count")
+
+    @property
+    def native_value(self) -> Any:
+        snap = self._snap
+        if snap is None:
+            return None
+        if snap.pw_count is not None:
+            return snap.pw_count
+        return len(snap.battery_blocks) if snap.battery_blocks else None
+
+
+class PowerwallActiveAlertsSensor(_PowerwallLocalSensorBase):
+    """Count of active alerts; alert names + severities exposed as attributes."""
+
+    _attr_icon = "mdi:alert-circle"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "pw_active_alerts", "Powerwall Active Alerts")
+
+    @property
+    def native_value(self) -> Any:
+        snap = self._snap
+        if snap is None or snap.alerts is None:
+            return None
+        return len(snap.alerts)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        snap = self._snap
+        if snap is None or not snap.alerts:
+            return {}
+        names = []
+        severities = {}
+        for alert in snap.alerts:
+            name = alert.get("name") or alert.get("alert_name") or "Unknown"
+            sev = alert.get("severity") or alert.get("alert_severity")
+            names.append(name)
+            if sev:
+                severities[name] = sev
+        return {"alerts": names, "severities": severities}
+
+
+class _PowerwallBlockSensorBase(CoordinatorEntity, SensorEntity):
+    """Base class for per-Powerwall block sensors. ``index`` is the position
+    in the snapshot's ``battery_blocks`` list (stable across polls)."""
+
+    _attr_has_entity_name = True
+
+    def __init__(self, coordinator, entry: ConfigEntry, index: int, key: str, name: str) -> None:
+        super().__init__(coordinator)
+        self._entry = entry
+        self._index = index
+        self._attr_unique_id = f"{entry.entry_id}_pw{index + 1}_{key}"
+        self._attr_suggested_object_id = f"power_sync_pw{index + 1}_{key}"
+        # Sub-device already carries "Powerwall N" — entity name is just the metric.
+        self._attr_name = name
+
+    @property
+    def device_info(self):
+        return powerwall_block_device_info(self._entry.entry_id, self._index)
+
+    @property
+    def _block(self) -> dict | None:
+        snap = self.coordinator.data
+        if snap is None or not snap.battery_blocks:
+            return None
+        if self._index >= len(snap.battery_blocks):
+            return None
+        return snap.battery_blocks[self._index]
+
+
+class PowerwallBlockSocSensor(_PowerwallBlockSensorBase):
+    _attr_native_unit_of_measurement = PERCENTAGE
+    _attr_device_class = SensorDeviceClass.BATTERY
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_suggested_display_precision = 1
+
+    def __init__(self, coordinator, entry: ConfigEntry, index: int) -> None:
+        super().__init__(coordinator, entry, index, "soc", "SOC")
+
+    @property
+    def native_value(self) -> Any:
+        block = self._block
+        if not block:
+            return None
+        full = block.get("nominal_full_pack_energy")
+        rem = block.get("nominal_energy_remaining")
+        if full and rem is not None and full > 0:
+            return round(rem / full * 100.0, 1)
+        return None
+
+
+class PowerwallBlockCapacitySensor(_PowerwallBlockSensorBase):
+    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+    _attr_device_class = SensorDeviceClass.ENERGY_STORAGE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_suggested_display_precision = 2
+    _attr_icon = "mdi:battery-high"
+
+    def __init__(self, coordinator, entry: ConfigEntry, index: int) -> None:
+        super().__init__(coordinator, entry, index, "capacity", "Capacity")
+
+    @property
+    def native_value(self) -> Any:
+        block = self._block
+        if not block:
+            return None
+        full = block.get("nominal_full_pack_energy")
+        return round(full / 1000.0, 2) if full else None
+
+
+class PowerwallBlockVoltageSensor(_PowerwallBlockSensorBase):
+    _attr_native_unit_of_measurement = "V"
+    _attr_device_class = SensorDeviceClass.VOLTAGE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_suggested_display_precision = 1
+
+    def __init__(self, coordinator, entry: ConfigEntry, index: int) -> None:
+        super().__init__(coordinator, entry, index, "voltage", "Voltage")
+
+    @property
+    def native_value(self) -> Any:
+        block = self._block
+        if not block:
+            return None
+        v = block.get("v_out") or block.get("voltage")
+        return round(float(v), 1) if v is not None else None
+
+
+class PowerwallBlockTemperatureSensor(_PowerwallBlockSensorBase):
+    _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
+    _attr_device_class = SensorDeviceClass.TEMPERATURE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_suggested_display_precision = 1
+
+    def __init__(self, coordinator, entry: ConfigEntry, index: int) -> None:
+        super().__init__(coordinator, entry, index, "temperature", "Temperature")
+
+    @property
+    def native_value(self) -> Any:
+        block = self._block
+        if not block:
+            return None
+        for key in ("pinv_temperature", "temperature_celsius", "battery_temp"):
+            v = block.get(key)
+            if v is not None:
+                try:
+                    return round(float(v), 1)
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+
+class PowerwallBlockSohSensor(_PowerwallBlockSensorBase):
+    """State of Health: pack capacity vs nameplate. PW2 nameplate = 13.5 kWh."""
+
+    _attr_native_unit_of_measurement = PERCENTAGE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_suggested_display_precision = 1
+    _attr_icon = "mdi:battery-heart"
+
+    _NAMEPLATE_WH = 13500.0  # PW2 baseline; PW3 reports its own nominal
+
+    def __init__(self, coordinator, entry: ConfigEntry, index: int) -> None:
+        super().__init__(coordinator, entry, index, "soh", "State of Health")
+
+    @property
+    def native_value(self) -> Any:
+        block = self._block
+        if not block:
+            return None
+        full = block.get("nominal_full_pack_energy")
+        if not full:
+            return None
+        return round(float(full) / self._NAMEPLATE_WH * 100.0, 1)
 
 
 class OptimizerActionSensor(CoordinatorEntity, SensorEntity):
@@ -1522,7 +2196,7 @@ class OptimizerActionSensor(CoordinatorEntity, SensorEntity):
         return {}
 
 
-class DemandChargeSensor(CoordinatorEntity, SensorEntity):
+class DemandChargeSensor(PowerSyncCurrencyMixin, CoordinatorEntity, SensorEntity):
     """Sensor for demand charge tracking (simplified - uses coordinator data)."""
 
     entity_description: PowerSyncSensorEntityDescription
@@ -1577,10 +2251,10 @@ class DemandChargeSensor(CoordinatorEntity, SensorEntity):
             attributes["peak_kw"] = peak_kw
             attributes["rate"] = rate
 
-        return attributes
+        return _entity_currency_attrs(self, attributes)
 
 
-class AEMOSpikeSensor(SensorEntity):
+class AEMOSpikeSensor(PowerSyncCurrencyMixin, SensorEntity):
     """Sensor for AEMO spike detection status."""
 
     entity_description: PowerSyncSensorEntityDescription
@@ -1615,8 +2289,10 @@ class AEMOSpikeSensor(SensorEntity):
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return additional attributes."""
         if self.entity_description.attr_fn:
-            return self.entity_description.attr_fn(self._spike_manager.get_status())
-        return {}
+            attrs = self.entity_description.attr_fn(self._spike_manager.get_status())
+        else:
+            attrs = {}
+        return _entity_currency_attrs(self, attrs)
 
 
 class SavingSessionSensor(CoordinatorEntity, SensorEntity):
@@ -1730,8 +2406,8 @@ LP_FORECAST_SENSORS: tuple[PowerSyncSensorEntityDescription, ...] = (
     PowerSyncSensorEntityDescription(
         key=SENSOR_TYPE_LP_IMPORT_PRICE_FORECAST,
         name="Import Price Forecast",
-        native_unit_of_measurement=f"{CURRENCY_DOLLAR}/{UnitOfEnergy.KILO_WATT_HOUR}",
-        device_class=SensorDeviceClass.MONETARY,
+        currency_unit="major_rate",
+        currency_attrs=True,
         suggested_display_precision=4,
         icon="mdi:cash-clock",
         value_fn=lambda data: data.get("import_price_avg") if data and data.get("available") else None,
@@ -1744,8 +2420,8 @@ LP_FORECAST_SENSORS: tuple[PowerSyncSensorEntityDescription, ...] = (
     PowerSyncSensorEntityDescription(
         key=SENSOR_TYPE_LP_EXPORT_PRICE_FORECAST,
         name="Export Price Forecast",
-        native_unit_of_measurement=f"{CURRENCY_DOLLAR}/{UnitOfEnergy.KILO_WATT_HOUR}",
-        device_class=SensorDeviceClass.MONETARY,
+        currency_unit="major_rate",
+        currency_attrs=True,
         suggested_display_precision=4,
         icon="mdi:cash-clock",
         value_fn=lambda data: data.get("export_price_avg") if data and data.get("available") else None,
@@ -1803,7 +2479,7 @@ AMBER_USAGE_SENSORS = (
 )
 
 
-class LPForecastSensor(CoordinatorEntity, SensorEntity):
+class LPForecastSensor(PowerSyncCurrencyMixin, CoordinatorEntity, SensorEntity):
     """Sensor for LP optimizer forecast data (solar, load, prices).
 
     Reads forecast data stored by the OptimizationCoordinator each
@@ -1848,8 +2524,10 @@ class LPForecastSensor(CoordinatorEntity, SensorEntity):
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return additional attributes."""
         if self.entity_description.attr_fn:
-            return self.entity_description.attr_fn(self._forecast_data)
-        return {}
+            attrs = self.entity_description.attr_fn(self._forecast_data)
+        else:
+            attrs = {}
+        return _entity_currency_attrs(self, attrs)
 
 
 SIGNAL_TARIFF_UPDATED = "power_sync_tariff_updated_{}"
@@ -1874,6 +2552,18 @@ class TariffScheduleSensor(SensorEntity):
         self._attr_icon = "mdi:calendar-clock"
         self._unsub_dispatcher = None
         self._unsub_time_interval = None
+        # Cache for the schedule-list / buy_prices / sell_prices dicts, which are
+        # expensive to rebuild and only change when the tariff data changes (every
+        # ~5 minutes on Amber). Rebuilt only when last_sync changes; the
+        # time-sensitive fields (current_period, buy_price, current_time) are
+        # computed fresh on every write from the cached tariff data.
+        self._schedule_cache: dict = {}
+        self._schedule_cache_sync: str | None = None
+        self._schedule_cache_dow: int = -1  # weekday the cache was built on (0=Mon)
+        # Last computed price tuple — shared between native_value and
+        # extra_state_attributes within the same HA state-write cycle to avoid
+        # calling get_current_price_from_tariff_schedule twice per update.
+        self._last_price_result: tuple[float, float, str] = (0.0, 0.0, "UNKNOWN")
 
     @property
     def device_info(self):
@@ -1921,61 +2611,42 @@ class TariffScheduleSensor(SensorEntity):
         if self._unsub_time_interval:
             self._unsub_time_interval()
 
-    @property
-    def native_value(self) -> Any:
-        """Return the state - current tariff period and price (recalculated in real-time)."""
-        tariff_data = self.hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {}).get("tariff_schedule")
-        if tariff_data:
-            from . import get_current_price_from_tariff_schedule
-            buy_price_cents, _, current_period = get_current_price_from_tariff_schedule(tariff_data)
-            if current_period and current_period != "UNKNOWN":
-                return f"{current_period} ({buy_price_cents:.1f}c/kWh)"
-            # Fallback to last sync time
-            return tariff_data.get("last_sync", "Unknown")
-        return "Not synced"
+    def _refresh_price(self, tariff_data: dict) -> tuple[float, float, str]:
+        """Compute current price once and cache on the instance for this write cycle."""
+        result = get_current_price_from_tariff_schedule(tariff_data)
+        self._last_price_result = result
+        return result
 
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        """Return the tariff schedule as attributes for visualization."""
-        tariff_data = self.hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {}).get("tariff_schedule")
-        if not tariff_data:
-            return {}
+    def _tariff_currency(self, tariff_data: dict[str, Any] | None = None) -> str:
+        """Return tariff currency, falling back to provider/HA metadata."""
+        return _entity_currency(self, tariff_data)
 
-        # Support both Amber format (buy_prices with PERIOD_HH_MM keys)
-        # and Tesla/Globird format (buy_rates with TOU period names)
+    def _rebuild_schedule_cache(self, tariff_data: dict) -> None:
+        """Rebuild the static parts of extra_state_attributes (schedule lists, raw dicts).
+
+        Called when last_sync changes (~5 min on Amber) OR when the weekday
+        changes (midnight rollover). Day-of-week is part of the cache key so
+        TOU tariffs with weekday/weekend rate differences stay correct.
+        The time-sensitive fields (current_period, buy_price, current_time) are
+        computed separately on every write.
+        """
         buy_prices = tariff_data.get("buy_prices", {})
         sell_prices = tariff_data.get("sell_prices", {})
         buy_rates = tariff_data.get("buy_rates", {})
         sell_rates = tariff_data.get("sell_rates", {})
         tou_periods = tariff_data.get("tou_periods", {})
+        today_dow = dt_util.now().weekday()  # 0=Monday; used for TOU day filtering — must use HA tz, not container UTC
 
-        # Calculate real-time current price and period
-        from . import get_current_price_from_tariff_schedule
-        now = datetime.now()
-        buy_price_cents, sell_price_cents, current_period = get_current_price_from_tariff_schedule(tariff_data)
-
-        attributes = {
+        attrs: dict[str, Any] = {
             "last_sync": tariff_data.get("last_sync"),
             "utility": tariff_data.get("utility"),
             "plan_name": tariff_data.get("plan_name"),
-            "current_period": current_period,
             "current_season": tariff_data.get("current_season"),
-            # Real-time prices (cents/kWh) - updated every minute
-            "buy_price": round(buy_price_cents, 2),
-            "sell_price": round(sell_price_cents, 2),
-            # Current time marker for chart vertical line/tooltip
-            "current_time": now.strftime("%H:%M"),
-            "current_hour": now.hour,
-            "current_minute": now.minute,
         }
 
-        # Amber format: PERIOD_HH_MM keys with 30-min granularity
         if buy_prices:
-            attributes["period_count"] = len(buy_prices)
-            # Create a list format suitable for apexcharts-card visualization
             schedule_list = []
             for period_key in sorted(buy_prices.keys()):
-                # Convert PERIOD_HH_MM to HH:MM
                 parts = period_key.replace("PERIOD_", "").split("_")
                 time_str = f"{parts[0]}:{parts[1]}"
                 schedule_list.append({
@@ -1983,44 +2654,32 @@ class TariffScheduleSensor(SensorEntity):
                     "buy": buy_prices.get(period_key, 0),
                     "sell": sell_prices.get(period_key, 0),
                 })
-            attributes["schedule"] = schedule_list
-            attributes["buy_prices"] = buy_prices
-            attributes["sell_prices"] = sell_prices
-
-        # Tesla/Globird format: TOU period names (ON_PEAK, OFF_PEAK, etc.)
+            attrs["period_count"] = len(buy_prices)
+            attrs["schedule"] = schedule_list
+            attrs["buy_prices"] = buy_prices
+            attrs["sell_prices"] = sell_prices
         elif buy_rates:
-            attributes["period_count"] = len(buy_rates)
-
-            # Create TOU schedule list with period names and rates
             tou_schedule = []
             for period_name, rate in buy_rates.items():
-                # Convert rate from $/kWh to c/kWh if needed
                 buy_cents = rate * 100 if rate < 1 else rate
                 sell_rate = sell_rates.get(period_name, 0)
                 sell_cents = sell_rate * 100 if sell_rate < 1 else sell_rate
-
-                # Get time windows for this period
                 period_times = tou_periods.get(period_name, [])
-                # Handle both list format and Tesla {"periods": [...]} format
                 if isinstance(period_times, dict) and "periods" in period_times:
                     periods_list = period_times["periods"]
                 elif isinstance(period_times, list):
                     periods_list = period_times
                 else:
                     periods_list = []
-                time_windows = []
-                for window in periods_list:
-                    from_hour = window.get("fromHour", 0)
-                    to_hour = window.get("toHour", 24)
-                    from_dow = window.get("fromDayOfWeek", 0)
-                    to_dow = window.get("toDayOfWeek", 6)
-                    time_windows.append({
-                        "from_hour": from_hour,
-                        "to_hour": to_hour,
-                        "from_day": from_dow,
-                        "to_day": to_dow,
-                    })
-
+                time_windows = [
+                    {
+                        "from_hour": w.get("fromHour", 0),
+                        "to_hour": w.get("toHour", 24),
+                        "from_day": w.get("fromDayOfWeek", 0),
+                        "to_day": w.get("toDayOfWeek", 6),
+                    }
+                    for w in periods_list
+                ]
                 tou_schedule.append({
                     "period": period_name,
                     "buy": round(buy_cents, 2),
@@ -2028,13 +2687,12 @@ class TariffScheduleSensor(SensorEntity):
                     "windows": time_windows,
                 })
 
-            attributes["tou_schedule"] = tou_schedule
-            attributes["buy_rates"] = {k: round(v * 100 if v < 1 else v, 2) for k, v in buy_rates.items()}
-            attributes["sell_rates"] = {k: round(v * 100 if v < 1 else v, 2) for k, v in sell_rates.items()}
+            attrs["period_count"] = len(buy_rates)
+            attrs["tou_schedule"] = tou_schedule
+            attrs["buy_rates"] = {k: round(v * 100 if v < 1 else v, 2) for k, v in buy_rates.items()}
+            attrs["sell_rates"] = {k: round(v * 100 if v < 1 else v, 2) for k, v in sell_rates.items()}
 
-            # Also generate 48-slot schedule list for price chart compatibility.
-            # Maps each half-hour of the day to its TOU period's buy/sell rate.
-            # Sort by priority: SUPER_OFF_PEAK > PEAK_N > PEAK > SHOULDER > OFF_PEAK
+            # 48-slot schedule list for price chart compatibility
             sorted_tou = sorted(
                 tou_schedule,
                 key=lambda e: (
@@ -2044,9 +2702,8 @@ class TariffScheduleSensor(SensorEntity):
                     3 if e["period"].startswith("SHOULDER") else 4
                 ),
             )
-            schedule_list = []
-            today_dow = now.weekday()
             tesla_dow = (today_dow + 1) % 7  # Tesla: 0=Sunday
+            schedule_list = []
             for slot in range(48):
                 hour = slot // 2
                 minute = (slot % 2) * 30
@@ -2062,19 +2719,63 @@ class TariffScheduleSensor(SensorEntity):
                         th = w.get("to_hour", 24)
                         if fd <= tesla_dow <= td:
                             if (fh <= th and fh <= hour < th) or (fh > th and (hour >= fh or hour < th)):
-                                slot_buy = entry["buy"] / 100  # cents → $/kWh
+                                slot_buy = entry["buy"] / 100
                                 slot_sell = entry["sell"] / 100
                                 matched = True
                                 break
                     if matched:
                         break
                 schedule_list.append({"time": time_str, "buy": slot_buy, "sell": slot_sell})
-            attributes["schedule"] = schedule_list
+            attrs["schedule"] = schedule_list
 
-        return attributes
+        self._schedule_cache = attrs
+        self._schedule_cache_sync = tariff_data.get("last_sync")
+        self._schedule_cache_dow = today_dow
+
+    @property
+    def native_value(self) -> Any:
+        """Return the state — current tariff period and price (recalculated in real-time)."""
+        tariff_data = self.hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {}).get("tariff_schedule")
+        if tariff_data:
+            buy_price_cents, _, current_period = self._refresh_price(tariff_data)
+            if current_period and current_period != "UNKNOWN":
+                unit = minor_price_unit(self._tariff_currency(tariff_data))
+                return f"{current_period} ({buy_price_cents:.1f}{unit})"
+            return tariff_data.get("last_sync", "Unknown")
+        return "Not synced"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return the tariff schedule as attributes for visualization."""
+        tariff_data = self.hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {}).get("tariff_schedule")
+        if not tariff_data:
+            return {}
+
+        # Rebuild when tariff changes OR when the day rolls over (TOU tariffs have
+        # weekday/weekend rate differences that depend on the current day).
+        if (
+            tariff_data.get("last_sync") != self._schedule_cache_sync
+            or dt_util.now().weekday() != self._schedule_cache_dow
+        ):
+            self._rebuild_schedule_cache(tariff_data)
+
+        # Reuse price already computed by native_value in this write cycle
+        buy_price_cents, sell_price_cents, current_period = self._last_price_result
+        now = dt_util.now()  # HA tz; naive datetime.now() returns UTC in containers
+
+        return {
+            **self._schedule_cache,
+            **currency_metadata(self._tariff_currency(tariff_data)),
+            "current_period": current_period,
+            "buy_price": round(buy_price_cents, 2),
+            "sell_price": round(sell_price_cents, 2),
+            "current_time": now.strftime("%H:%M"),
+            "current_hour": now.hour,
+            "current_minute": now.minute,
+        }
 
 
-class TariffPriceSensor(SensorEntity):
+class TariffPriceSensor(PowerSyncCurrencyMixin, SensorEntity):
     """Sensor for current price derived from TOU tariff schedule.
 
     This sensor provides current import/export prices for non-Amber users
@@ -2098,13 +2799,17 @@ class TariffPriceSensor(SensorEntity):
         # Use same entity naming as AmberPriceSensor for mobile app compatibility
         # Creates: sensor.power_sync_current_import_price, sensor.power_sync_current_export_price
         self._attr_suggested_object_id = f"power_sync_{sensor_type}"
-        self._attr_native_unit_of_measurement = f"{CURRENCY_DOLLAR}/{UnitOfEnergy.KILO_WATT_HOUR}"
-        self._attr_device_class = SensorDeviceClass.MONETARY
+        self._attr_currency_unit = "major_rate"
+        self._attr_currency_attrs = True
         self._attr_suggested_display_precision = 4
-        self._attr_icon = "mdi:currency-usd" if "import" in sensor_type else "mdi:transmission-tower-export"
+        self._attr_icon = "mdi:cash" if "import" in sensor_type else "mdi:transmission-tower-export"
         self._unsub_dispatcher = None
         self._unsub_time_interval = None
         self._current_period = None
+
+    def _currency_source_data(self) -> dict[str, Any] | None:
+        """Use tariff schedule currency for this tariff-backed price sensor."""
+        return self.hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {}).get("tariff_schedule")
 
     @property
     def device_info(self):
@@ -2192,7 +2897,7 @@ class TariffPriceSensor(SensorEntity):
         else:
             attributes["channel_type"] = "feedIn"
 
-        return attributes
+        return _entity_currency_attrs(self, attributes, tariff_data)
 
 
 SIGNAL_CURTAILMENT_UPDATED = "power_sync_curtailment_updated_{}"
@@ -2615,7 +3320,7 @@ class InverterStatusSensor(SensorEntity):
         return attrs
 
 
-class FlowPowerPriceSensor(CoordinatorEntity, SensorEntity):
+class FlowPowerPriceSensor(PowerSyncCurrencyMixin, CoordinatorEntity, SensorEntity):
     """Sensor for Flow Power electricity prices with PEA adjustment.
 
     Shows real-time import price calculated as:
@@ -2655,7 +3360,7 @@ class FlowPowerPriceSensor(CoordinatorEntity, SensorEntity):
             self._attr_icon = "mdi:lightning-bolt"
         elif sensor_type == SENSOR_TYPE_CURRENT_IMPORT_PRICE:
             self._attr_name = "Current Import Price"
-            self._attr_icon = "mdi:currency-usd"
+            self._attr_icon = "mdi:cash"
         elif sensor_type == SENSOR_TYPE_CURRENT_EXPORT_PRICE:
             self._attr_name = "Current Export Price"
             self._attr_icon = "mdi:transmission-tower-export"
@@ -2663,8 +3368,8 @@ class FlowPowerPriceSensor(CoordinatorEntity, SensorEntity):
             self._attr_name = "Flow Power Export Price"
             self._attr_icon = "mdi:solar-power"
 
-        self._attr_native_unit_of_measurement = f"{CURRENCY_DOLLAR}/{UnitOfEnergy.KILO_WATT_HOUR}"
-        self._attr_device_class = SensorDeviceClass.MONETARY
+        self._attr_currency_unit = "major_rate"
+        self._attr_currency_attrs = True
         self._attr_suggested_display_precision = 4
 
     @property
@@ -2894,10 +3599,10 @@ class FlowPowerPriceSensor(CoordinatorEntity, SensorEntity):
             attributes["is_happy_hour"] = self._is_happy_hour()
             attributes["happy_hour_rate"] = FLOW_POWER_EXPORT_RATES.get(state, 0.0)
 
-        return attributes
+        return _entity_currency_attrs(self, attributes)
 
 
-class FlowPowerTWAPSensor(SensorEntity):
+class FlowPowerTWAPSensor(PowerSyncCurrencyMixin, SensorEntity):
     """Sensor exposing the 30-day rolling TWAP used in PEA calculation.
 
     Shows the dynamic Time Weighted Average Price that replaces the
@@ -2914,7 +3619,8 @@ class FlowPowerTWAPSensor(SensorEntity):
         self._attr_suggested_object_id = f"power_sync_{SENSOR_TYPE_FLOW_POWER_TWAP}"
         self._attr_name = "Flow Power TWAP 30-Day Average"
         self._attr_icon = "mdi:chart-line"
-        self._attr_native_unit_of_measurement = "c/kWh"
+        self._attr_currency_unit = "minor_rate"
+        self._attr_currency_attrs = True
         self._attr_suggested_display_precision = 2
 
     @property
@@ -2963,10 +3669,10 @@ class FlowPowerTWAPSensor(SensorEntity):
                 "using_fallback": True,
                 "twap_dollars": round(FLOW_POWER_MARKET_AVG / 100, 4),
             })
-        return attrs
+        return _entity_currency_attrs(self, attrs)
 
 
-class FlowPowerNetworkTariffSensor(SensorEntity):
+class FlowPowerNetworkTariffSensor(PowerSyncCurrencyMixin, SensorEntity):
     """Sensor showing the current TOU network tariff rate.
 
     Displays the network charge component from the aemo_to_tariff library
@@ -2983,7 +3689,8 @@ class FlowPowerNetworkTariffSensor(SensorEntity):
         self._attr_suggested_object_id = f"power_sync_{SENSOR_TYPE_NETWORK_TARIFF}"
         self._attr_name = "Flow Power Network Tariff"
         self._attr_icon = "mdi:transmission-tower"
-        self._attr_native_unit_of_measurement = "c/kWh"
+        self._attr_currency_unit = "minor_rate"
+        self._attr_currency_attrs = True
         self._attr_suggested_display_precision = 2
 
     @property
@@ -3017,10 +3724,10 @@ class FlowPowerNetworkTariffSensor(SensorEntity):
         }
         if avg_daily is not None:
             attrs["avg_daily_tariff"] = round(avg_daily, 2)
-        return attrs
+        return _entity_currency_attrs(self, attrs)
 
 
-class FlowPowerAmberComparisonSensor(SensorEntity):
+class FlowPowerAmberComparisonSensor(PowerSyncCurrencyMixin, SensorEntity):
     """Sensor showing what the current price would be on Amber Electric.
 
     Calculates: 1.1 * Spot + Tariff + Markup
@@ -3038,8 +3745,8 @@ class FlowPowerAmberComparisonSensor(SensorEntity):
         self._attr_suggested_object_id = f"power_sync_{SENSOR_TYPE_AMBER_COMPARISON}"
         self._attr_name = "Flow Power Amber Comparison"
         self._attr_icon = "mdi:compare-horizontal"
-        self._attr_native_unit_of_measurement = f"{CURRENCY_DOLLAR}/{UnitOfEnergy.KILO_WATT_HOUR}"
-        self._attr_device_class = SensorDeviceClass.MONETARY
+        self._attr_currency_unit = "major_rate"
+        self._attr_currency_attrs = True
         self._attr_suggested_display_precision = 4
 
     @property
@@ -3116,7 +3823,7 @@ class FlowPowerAmberComparisonSensor(SensorEntity):
             amber_cents = FLOW_POWER_GST * wholesale_cents + tariff_rate + markup
             attrs["price_cents"] = round(amber_cents, 2)
 
-        return attrs
+        return _entity_currency_attrs(self, attrs)
 
 
 class FlowPowerPortalSensor(SensorEntity):
@@ -3179,7 +3886,7 @@ class BatteryHealthSensor(SensorEntity):
     """Sensor for battery health / state of health.
 
     Data sources:
-    - Tesla: TEDAPI scan via mobile app (capacity-based, with per-battery breakdown)
+    - Tesla: TEDAPI / Fleet API BMS scan (capacity-based, with per-battery breakdown)
     - Sungrow/Sigenergy/GoodWe: battery_soh from coordinator (Modbus SOH%)
     - FoxESS: no SOH register available (shows Unknown)
 
@@ -3216,6 +3923,7 @@ class BatteryHealthSensor(SensorEntity):
         self._degradation_percent: float | None = None
         self._battery_count: int | None = None
         self._scanned_at: str | None = None
+        self._source: str | None = None
         self._individual_batteries: list | None = None
 
     @property
@@ -3242,6 +3950,7 @@ class BatteryHealthSensor(SensorEntity):
             self._degradation_percent = stored_health.get("degradation_percent")
             self._battery_count = stored_health.get("battery_count")
             self._scanned_at = stored_health.get("scanned_at")
+            self._source = stored_health.get("source")
             self._individual_batteries = stored_health.get("individual_batteries")
             _LOGGER.info(f"Restored battery health from storage: {self._calculate_health_percent()}% health")
 
@@ -3262,6 +3971,7 @@ class BatteryHealthSensor(SensorEntity):
         self._degradation_percent = data.get("degradation_percent")
         self._battery_count = data.get("battery_count")
         self._scanned_at = data.get("scanned_at")
+        self._source = data.get("source")
         self._individual_batteries = data.get("individual_batteries")
 
         _LOGGER.info(
@@ -3355,7 +4065,7 @@ class BatteryHealthSensor(SensorEntity):
 
         # Source attribution
         if self._original_capacity_wh is not None:
-            attributes["source"] = "mobile_app_tedapi"
+            attributes["source"] = self._source or "mobile_app_tedapi"
         elif self._soh_percent is not None:
             attributes["source"] = "inverter_modbus"
             attributes["state_of_health_percent"] = self._soh_percent
@@ -3649,7 +4359,7 @@ class BatteryModeSensor(SensorEntity):
         return attributes
 
 
-class AmberUsageSensor(SensorEntity):
+class AmberUsageSensor(PowerSyncCurrencyMixin, SensorEntity):
     """Sensor for actual metered usage/cost data from Amber Usage API.
 
     Reads from AmberUsageCoordinator via hass.data. Refreshes hourly.
@@ -3657,7 +4367,8 @@ class AmberUsageSensor(SensorEntity):
 
     _attr_has_entity_name = True
     _attr_device_class = SensorDeviceClass.MONETARY
-    _attr_native_unit_of_measurement = CURRENCY_DOLLAR
+    _attr_currency_unit = "money"
+    _attr_currency_attrs = True
     _attr_state_class = SensorStateClass.TOTAL
     _attr_icon = "mdi:cash-check"
 
@@ -3726,7 +4437,7 @@ class AmberUsageSensor(SensorEntity):
         """Return additional attributes."""
         coord = self._get_usage_coordinator()
         if not coord:
-            return {"source": "amber_usage_api"}
+            return _entity_currency_attrs(self, {"source": "amber_usage_api"})
         summary = coord.get_savings_summary(self._period)
         attrs = {
             "import_kwh": summary.get("import_kwh"),
@@ -3740,4 +4451,4 @@ class AmberUsageSensor(SensorEntity):
         if self._value_key == "savings":
             attrs["baseline_cost"] = summary.get("baseline_cost")
             attrs["net_cost"] = summary.get("net_cost")
-        return attrs
+        return _entity_currency_attrs(self, attrs)

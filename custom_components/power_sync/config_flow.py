@@ -36,8 +36,13 @@ from .const import (
     CONF_AMBER_SITE_ID,
     CONF_AMBER_FORECAST_TYPE,
     CONF_BATTERY_CURTAILMENT_ENABLED,
+    CONF_AUTO_UPDATE_ENABLED,
+    CONF_AUTO_UPDATE_TIME,
+    DEFAULT_AUTO_UPDATE_TIME,
     CONF_TESLEMETRY_API_TOKEN,
     CONF_TESLA_ENERGY_SITE_ID,
+    CONF_POWERWALL_LOCAL_IP,
+    CONF_POWERWALL_LOCAL_PAIRED,
     CONF_AUTO_SYNC_ENABLED,
     CONF_DEMAND_CHARGE_ENABLED,
     CONF_DEMAND_CHARGE_RATE,
@@ -62,6 +67,7 @@ from .const import (
     AMBER_API_BASE_URL,
     TESLEMETRY_API_BASE_URL,
     FLEET_API_BASE_URL,
+    CONF_FLEET_API_BASE_URL,
     POWERSYNC_API_BASE_URL,
     POWERSYNC_AUTH_START_URL,
     POWERSYNC_AUTH_ME_URL,
@@ -93,6 +99,8 @@ from .const import (
     CONF_SAJ_CONFIG_ENTRY_ID,
     CONF_SAJ_BATTERY_CAPACITY_KWH,
     DEFAULT_SAJ_BATTERY_CAPACITY_KWH,
+    CONF_SAJ_INVERTER_RATED_KW,
+    DEFAULT_SAJ_INVERTER_RATED_KW,
     # Voltx battery system configuration
     CONF_VOLTX_HOST,
     CONF_VOLTX_PORT,
@@ -184,8 +192,6 @@ from .const import (
     DEFAULT_CHIP_MODE_THRESHOLD,
     # Spike protection configuration
     CONF_SPIKE_PROTECTION_ENABLED,
-    # Settled prices only mode
-    CONF_SETTLED_PRICES_ONLY,
     # Forecast discrepancy alert
     CONF_FORECAST_DISCREPANCY_ALERT,
     CONF_FORECAST_DISCREPANCY_THRESHOLD,
@@ -312,8 +318,13 @@ from .const import (
     CONF_OPTIMIZATION_ENABLED,
     CONF_OPTIMIZATION_COST_FUNCTION,
     CONF_OPTIMIZATION_BACKUP_RESERVE,
+    CONF_OPTIMIZATION_BATTERY_CAPACITY_WH,
+    CONF_OPTIMIZATION_MAX_CHARGE_W,
+    CONF_OPTIMIZATION_MAX_DISCHARGE_W,
     COST_FUNCTION_COST,
     DEFAULT_OPTIMIZATION_BACKUP_RESERVE,
+    BATTERY_CAPACITY_DEFAULTS,
+    BATTERY_POWER_DEFAULTS,
     # Optimization provider selection
     CONF_OPTIMIZATION_PROVIDER,
     OPT_PROVIDER_NATIVE,
@@ -361,11 +372,65 @@ from .const import (
     NZ_RETAILERS,
     NZ_DISTRIBUTION_ZONES,
 )
+from .currency import (
+    currency_for_provider,
+    normalize_currency,
+    selector_unit_for_provider,
+)
 
 # Combined network tariff key for config flow
 CONF_NETWORK_TARIFF_COMBINED = "network_tariff_combined"
+CUSTOM_TOU_PROVIDER_OPTIONS = ("globird", "aemo_vpp", "other", "tou_only")
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _stored_wh_to_kwh(value: Any, default_wh: int) -> float:
+    """Convert a stored Wh/kWh value to kWh for config flow display."""
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        amount = float(default_wh)
+    return amount / 1000.0 if amount > 1000 else amount
+
+
+def _stored_w_to_kw(value: Any, default_w: int) -> float:
+    """Convert a stored W/kW value to kW for config flow display."""
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        amount = float(default_w)
+    return amount / 1000.0 if amount > 100 else amount
+
+
+def _form_kwh_to_wh(value: Any, default_kwh: float) -> int:
+    """Convert a config flow kWh field to Wh for persisted optimizer config."""
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        amount = default_kwh
+    return int(round(amount * 1000))
+
+
+def _form_kw_to_w(value: Any, default_kw: float) -> int:
+    """Convert a config flow kW field to W for persisted optimizer config."""
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        amount = default_kw
+    return int(round(amount * 1000))
+
+
+def _default_optimizer_specs_for(battery_system: str) -> tuple[int, int, int]:
+    capacity_wh = BATTERY_CAPACITY_DEFAULTS.get(
+        battery_system,
+        BATTERY_CAPACITY_DEFAULTS[BATTERY_SYSTEM_TESLA],
+    )
+    power_w = BATTERY_POWER_DEFAULTS.get(
+        battery_system,
+        BATTERY_POWER_DEFAULTS[BATTERY_SYSTEM_TESLA],
+    )
+    return capacity_wh, power_w, power_w
 
 
 async def validate_amber_token(hass: HomeAssistant, api_token: str) -> dict[str, Any]:
@@ -459,44 +524,61 @@ async def validate_teslemetry_token(
         return {"success": False, "error": "unknown"}
 
 
-async def validate_fleet_api_token(
-    hass: HomeAssistant, api_token: str
+async def _validate_fleet_api_token_at(
+    hass: HomeAssistant, api_token: str, base_url: str
 ) -> dict[str, Any]:
-    """Validate the Fleet API token and get sites."""
+    """Validate a Fleet API token against a specific base URL."""
     session = async_get_clientsession(hass)
     headers = {
         "Authorization": f"Bearer {api_token}",
         "Content-Type": "application/json",
     }
+    async with session.get(
+        f"{base_url}/api/1/products",
+        headers=headers,
+        timeout=aiohttp.ClientTimeout(total=30),
+    ) as response:
+        if response.status == 200:
+            data = await response.json()
+            products = data.get("response", [])
+            energy_sites = [p for p in products if "energy_site_id" in p]
+            if energy_sites:
+                return {"success": True, "sites": energy_sites, "base_url": base_url}
+            return {"success": False, "error": "no_energy_sites"}
+        if response.status == 401:
+            return {"success": False, "error": "invalid_auth"}
+        if response.status == 421:
+            error_text = await response.text()
+            return {"success": False, "error": "out_of_region", "error_text": error_text}
+        error_text = await response.text()
+        _LOGGER.error("Fleet API error %s: %s", response.status, error_text[:200])
+        return {"success": False, "error": "cannot_connect"}
 
+
+async def validate_fleet_api_token(
+    hass: HomeAssistant, api_token: str
+) -> dict[str, Any]:
+    """Validate the Fleet API token and get sites.
+
+    On a 421 "user out of region" response, Tesla returns the correct regional
+    base URL in the error body.  We parse it out and retry automatically so EU
+    and AP users don't hit a dead end during setup.
+    """
     try:
-        async with session.get(
-            f"{FLEET_API_BASE_URL}/api/1/products",
-            headers=headers,
-            timeout=aiohttp.ClientTimeout(total=30),
-        ) as response:
-            if response.status == 200:
-                data = await response.json()
-                products = data.get("response", [])
-
-                # Filter for energy sites
-                energy_sites = [p for p in products if "energy_site_id" in p]
-
-                if energy_sites:
-                    return {
-                        "success": True,
-                        "sites": energy_sites,
-                    }
-                else:
-                    return {"success": False, "error": "no_energy_sites"}
-            elif response.status == 401:
-                return {"success": False, "error": "invalid_auth"}
-            else:
-                error_text = await response.text()
-                _LOGGER.error(
-                    "Fleet API error %s: %s", response.status, error_text[:200]
+        result = await _validate_fleet_api_token_at(hass, api_token, FLEET_API_BASE_URL)
+        if result.get("error") == "out_of_region":
+            import re
+            error_text = result.get("error_text", "")
+            match = re.search(r"use base URL:\s*(https://[^\s,]+)", error_text)
+            if match:
+                regional_url = match.group(1).rstrip("/")
+                _LOGGER.info(
+                    "Fleet API 421 — retrying with regional endpoint: %s", regional_url
                 )
-                return {"success": False, "error": "cannot_connect"}
+                return await _validate_fleet_api_token_at(hass, api_token, regional_url)
+            _LOGGER.error("Fleet API 421 but could not parse regional URL from: %s", error_text[:300])
+            return {"success": False, "error": "cannot_connect"}
+        return result
     except aiohttp.ClientError as err:
         _LOGGER.exception("Error connecting to Fleet API: %s", err)
         return {"success": False, "error": "cannot_connect"}
@@ -785,6 +867,18 @@ class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._optimization_provider: str = OPT_PROVIDER_NATIVE
         self._ml_options: dict[str, Any] = {}  # Smart Optimization options
 
+    def _currency(self) -> str:
+        """Return the currency for the currently selected provider."""
+        return currency_for_provider(self._selected_electricity_provider, self.hass)
+
+    def _selector_unit(self, unit_kind: str = "minor_rate") -> str:
+        """Return a provider-aware unit label for setup selectors."""
+        return selector_unit_for_provider(
+            self._selected_electricity_provider,
+            self.hass,
+            unit_kind,
+        )
+
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
@@ -1026,7 +1120,7 @@ class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                             min=0.0,
                             max=100.0,
                             step=0.01,
-                            unit_of_measurement="c/kWh",
+                            unit_of_measurement=self._selector_unit(),
                             mode=NumberSelectorMode.BOX,
                         )
                     ),
@@ -1611,7 +1705,15 @@ class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_ml_options(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Configure Smart Optimization options - backup reserve."""
+        """Configure Smart Optimization options."""
+        battery_system = self._selected_battery_system or BATTERY_SYSTEM_TESLA
+        default_capacity_wh, default_charge_w, default_discharge_w = (
+            _default_optimizer_specs_for(battery_system)
+        )
+        default_capacity_kwh = default_capacity_wh / 1000
+        default_charge_kw = default_charge_w / 1000
+        default_discharge_kw = default_discharge_w / 1000
+
         if user_input is not None:
             self._ml_options = {
                 CONF_OPTIMIZATION_COST_FUNCTION: COST_FUNCTION_COST,
@@ -1620,6 +1722,18 @@ class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     int(DEFAULT_OPTIMIZATION_BACKUP_RESERVE * 100),
                 )
                 / 100.0,
+                CONF_OPTIMIZATION_BATTERY_CAPACITY_WH: _form_kwh_to_wh(
+                    user_input.get(CONF_OPTIMIZATION_BATTERY_CAPACITY_WH),
+                    default_capacity_kwh,
+                ),
+                CONF_OPTIMIZATION_MAX_CHARGE_W: _form_kw_to_w(
+                    user_input.get(CONF_OPTIMIZATION_MAX_CHARGE_W),
+                    default_charge_kw,
+                ),
+                CONF_OPTIMIZATION_MAX_DISCHARGE_W: _form_kw_to_w(
+                    user_input.get(CONF_OPTIMIZATION_MAX_DISCHARGE_W),
+                    default_discharge_kw,
+                ),
             }
             # Proceed to battery connection setup
             return await self._route_to_battery_setup()
@@ -1638,6 +1752,42 @@ class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                             step=5,
                             unit_of_measurement="%",
                             mode=NumberSelectorMode.SLIDER,
+                        )
+                    ),
+                    vol.Required(
+                        CONF_OPTIMIZATION_BATTERY_CAPACITY_WH,
+                        default=default_capacity_kwh,
+                    ): NumberSelector(
+                        NumberSelectorConfig(
+                            min=1,
+                            max=200,
+                            step=0.1,
+                            unit_of_measurement="kWh",
+                            mode=NumberSelectorMode.BOX,
+                        )
+                    ),
+                    vol.Required(
+                        CONF_OPTIMIZATION_MAX_CHARGE_W,
+                        default=default_charge_kw,
+                    ): NumberSelector(
+                        NumberSelectorConfig(
+                            min=0.1,
+                            max=50,
+                            step=0.1,
+                            unit_of_measurement="kW",
+                            mode=NumberSelectorMode.BOX,
+                        )
+                    ),
+                    vol.Required(
+                        CONF_OPTIMIZATION_MAX_DISCHARGE_W,
+                        default=default_discharge_kw,
+                    ): NumberSelector(
+                        NumberSelectorConfig(
+                            min=0.1,
+                            max=50,
+                            step=0.1,
+                            unit_of_measurement="kW",
+                            mode=NumberSelectorMode.BOX,
                         )
                     ),
                 }
@@ -1855,6 +2005,7 @@ class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 CONF_ALPHAESS_MODBUS_SLAVE_ID, DEFAULT_ALPHAESS_MODBUS_SLAVE_ID
             )
             export_limit_kw = user_input.get(CONF_ALPHAESS_EXPORT_LIMIT_KW)
+            dc_curtailment = user_input.get(CONF_ALPHAESS_DC_CURTAILMENT_ENABLED, False)
 
             if not host:
                 errors["base"] = "alphaess_host_required"
@@ -1886,6 +2037,7 @@ class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         CONF_ALPHAESS_MODBUS_HOST: host,
                         CONF_ALPHAESS_MODBUS_PORT: int(port),
                         CONF_ALPHAESS_MODBUS_SLAVE_ID: int(slave_id),
+                        CONF_ALPHAESS_DC_CURTAILMENT_ENABLED: dc_curtailment,
                     }
                     if export_limit_kw is not None:
                         self._alphaess_data[CONF_ALPHAESS_EXPORT_LIMIT_KW] = float(
@@ -1922,6 +2074,10 @@ class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                             unit_of_measurement="kW",
                         )
                     ),
+                    vol.Optional(
+                        CONF_ALPHAESS_DC_CURTAILMENT_ENABLED,
+                        default=False,
+                    ): BooleanSelector(),
                 }
             ),
             errors=errors,
@@ -1930,6 +2086,14 @@ class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     "Connect to your AlphaESS inverter. Default slave ID is 85 "
                     "(0x55) — the AlphaESS factory default. Export limit is "
                     "optional; leave blank for unlimited."
+                ),
+                "alphaess_curtailment_warning": (
+                    "⚠️ DC Curtailment requires Modbus curtailment to be enabled in "
+                    "your AlphaESS firmware settings first. Without this, PowerSync "
+                    "can write the export-limit register but the inverter will not "
+                    "physically curtail PV. Enable it in the AlphaESS app under "
+                    "Settings → Grid → Export Limit (or equivalent for your firmware "
+                    "version) before turning this on. See the PowerSync wiki for details."
                 ),
             },
         )
@@ -2269,17 +2433,23 @@ class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 CONF_SAJ_BATTERY_CAPACITY_KWH,
                 DEFAULT_SAJ_BATTERY_CAPACITY_KWH,
             )
+            inverter_rated_kw = user_input.get(
+                CONF_SAJ_INVERTER_RATED_KW,
+                DEFAULT_SAJ_INVERTER_RATED_KW,
+            )
 
             try:
                 ctrl = SajH2BatteryController(
                     self.hass,
                     saj_entry_id=selected_entry_id,
                     battery_capacity_kwh=float(capacity_kwh),
+                    inverter_rated_kw=float(inverter_rated_kw),
                 )
                 await ctrl.connect()
                 self._saj_h2_data = {
                     CONF_SAJ_CONFIG_ENTRY_ID: selected_entry_id,
                     CONF_SAJ_BATTERY_CAPACITY_KWH: float(capacity_kwh),
+                    CONF_SAJ_INVERTER_RATED_KW: float(inverter_rated_kw),
                 }
                 return self._create_final_entry()
             except ValueError as exc:
@@ -2304,6 +2474,18 @@ class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                             step=0.1,
                             mode=NumberSelectorMode.BOX,
                             unit_of_measurement="kWh",
+                        )
+                    ),
+                    vol.Required(
+                        CONF_SAJ_INVERTER_RATED_KW,
+                        default=DEFAULT_SAJ_INVERTER_RATED_KW,
+                    ): NumberSelector(
+                        NumberSelectorConfig(
+                            min=1,
+                            max=50,
+                            step=0.5,
+                            mode=NumberSelectorMode.BOX,
+                            unit_of_measurement="kW",
                         )
                     ),
                 }
@@ -2331,6 +2513,18 @@ class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                             step=0.1,
                             mode=NumberSelectorMode.BOX,
                             unit_of_measurement="kWh",
+                        )
+                    ),
+                    vol.Required(
+                        CONF_SAJ_INVERTER_RATED_KW,
+                        default=DEFAULT_SAJ_INVERTER_RATED_KW,
+                    ): NumberSelector(
+                        NumberSelectorConfig(
+                            min=1,
+                            max=50,
+                            step=0.5,
+                            mode=NumberSelectorMode.BOX,
+                            unit_of_measurement="kW",
                         )
                     ),
                 }
@@ -2875,9 +3069,12 @@ class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     # integration remembers we picked Fleet API instead of
                     # defaulting back to Teslemetry (which would then 401 on
                     # the empty token and break the Tesla coordinator).
+                    # Also persist the regional base URL so EU/AP users don't hit
+                    # the hardcoded NA endpoint on every subsequent API call.
                     self._teslemetry_data = {
                         CONF_TESLEMETRY_API_TOKEN: "",
                         CONF_TESLA_API_PROVIDER: TESLA_PROVIDER_FLEET_API,
+                        CONF_FLEET_API_BASE_URL: validation_result.get("base_url", FLEET_API_BASE_URL),
                     }
                     self._tesla_sites = validation_result.get("sites", [])
                     return await self.async_step_site_selection()
@@ -3088,7 +3285,7 @@ class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         min=0,
                         max=20000,
                         step=100,
-                        unit_of_measurement="$/MWh",
+                        unit_of_measurement=self._selector_unit("market_rate"),
                         mode=NumberSelectorMode.BOX,
                     )
                 ),
@@ -3236,10 +3433,18 @@ class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         }.get(getattr(self, "_selected_electricity_provider", "other"), "Custom")
 
         plan_name = getattr(self, "_tariff_plan_name", "") or f"{provider_name} TOU"
+        tariff_currency = normalize_currency(
+            getattr(self, "_tariff_currency", None),
+            currency_for_provider(
+                getattr(self, "_selected_electricity_provider", "other"),
+                getattr(self, "hass", None),
+            ),
+        )
 
         return {
             "name": plan_name,
             "utility": provider_name,
+            "currency": tariff_currency,
             "seasons": {
                 "All Year": {
                     "fromMonth": 1,
@@ -3315,6 +3520,7 @@ class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
         if user_input is not None:
+            gateway_ip = (user_input.get(CONF_POWERWALL_LOCAL_IP) or "").strip()
             # Handle Amber site selection (only if we have Amber sites)
             amber_site_id = None
             if has_amber_sites:
@@ -3339,6 +3545,9 @@ class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self._site_data = {
                 CONF_TESLA_ENERGY_SITE_ID: user_input[CONF_TESLA_ENERGY_SITE_ID],
             }
+
+            if gateway_ip:
+                self._site_data[CONF_POWERWALL_LOCAL_IP] = gateway_ip
 
             # Add Amber site if we have one
             if amber_site_id:
@@ -3386,6 +3595,12 @@ class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     mode=SelectSelectorMode.DROPDOWN,
                 )
             )
+
+            # Optional gateway LAN IP for direct local features (snapshot
+            # polling, automated curtailment, fast operation-mode toggles).
+            # Pairing itself is cloud-based (Fleet API key registration);
+            # gateway control uses RSA signing — no password required.
+            data_schema_dict[vol.Optional(CONF_POWERWALL_LOCAL_IP, default="")] = str
         else:
             # No sites found - should not happen if validation worked
             _LOGGER.error("No Tesla energy sites found in Teslemetry account")
@@ -3519,7 +3734,7 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                     "Cannot restore export rule - Fleet API token not available"
                 )
                 return
-            base_url = FLEET_API_BASE_URL
+            base_url = self.config_entry.data.get(CONF_FLEET_API_BASE_URL, FLEET_API_BASE_URL)
         elif api_provider == TESLA_PROVIDER_POWERSYNC:
             # PowerSync.cc proxy users store their `psync_...` token in the
             # same CONF_TESLEMETRY_API_TOKEN slot, but it must be sent to
@@ -3580,6 +3795,22 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
             key, self.config_entry.data.get(key, default)
         )
 
+    def _electricity_provider(self) -> str:
+        """Return the configured electricity provider."""
+        return self._get_option(CONF_ELECTRICITY_PROVIDER, "amber")
+
+    def _selector_unit(self, unit_kind: str = "minor_rate") -> str:
+        """Return a provider-aware unit label for options selectors."""
+        return selector_unit_for_provider(
+            self._electricity_provider(),
+            self.hass,
+            unit_kind,
+        )
+
+    def _currency(self) -> str:
+        """Return the configured currency."""
+        return currency_for_provider(self._electricity_provider(), self.hass)
+
     def _save_and_finish(self, section_data: dict[str, Any]) -> FlowResult:
         """Save a single section's data merged with existing options and finish."""
         final = dict(self.config_entry.options)
@@ -3626,11 +3857,54 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
             "demand_charges",
             "ev_charging",
             "weather",
+            "auto_update",
         ])
 
         return self.async_show_menu(
             step_id="init",
             menu_options=menu_options,
+        )
+
+    async def async_step_auto_update(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Menu handler: scheduled PowerSync HACS auto-update settings."""
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            from .auto_update import normalize_auto_update_time
+
+            try:
+                update_time = normalize_auto_update_time(
+                    user_input.get(CONF_AUTO_UPDATE_TIME, DEFAULT_AUTO_UPDATE_TIME)
+                )
+            except (TypeError, ValueError):
+                errors[CONF_AUTO_UPDATE_TIME] = "invalid_time"
+            else:
+                return self._save_and_finish({
+                    CONF_AUTO_UPDATE_ENABLED: user_input.get(
+                        CONF_AUTO_UPDATE_ENABLED,
+                        False,
+                    ),
+                    CONF_AUTO_UPDATE_TIME: update_time,
+                })
+
+        return self.async_show_form(
+            step_id="auto_update",
+            data_schema=vol.Schema({
+                vol.Optional(
+                    CONF_AUTO_UPDATE_ENABLED,
+                    default=self._get_option(CONF_AUTO_UPDATE_ENABLED, False),
+                ): BooleanSelector(),
+                vol.Optional(
+                    CONF_AUTO_UPDATE_TIME,
+                    default=self._get_option(
+                        CONF_AUTO_UPDATE_TIME,
+                        DEFAULT_AUTO_UPDATE_TIME,
+                    ),
+                ): TextSelector(TextSelectorConfig(type=TextSelectorType.TEXT)),
+            }),
+            errors=errors,
         )
 
     async def async_step_pricing(
@@ -3653,7 +3927,7 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                 return await self.async_step_amber_options()
             if provider == "flow_power":
                 return await self.async_step_flow_power_options()
-            if provider in ("globird", "aemo_vpp"):
+            if provider in CUSTOM_TOU_PROVIDER_OPTIONS:
                 return await self.async_step_globird_options()
             if provider == "localvolts":
                 return await self.async_step_localvolts_options()
@@ -3689,7 +3963,7 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
     async def async_step_tesla_connection(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Menu handler: Tesla Energy/EV API provider settings."""
+        """Menu handler: Tesla Energy/EV API provider + local gateway IP."""
         errors: dict[str, str] = {}
 
         if user_input is not None:
@@ -3699,6 +3973,11 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
             ev_choice = user_input.get(
                 CONF_TESLA_EV_API_PROVIDER, TESLA_EV_API_PROVIDER_NONE
             )
+            # Optional Powerwall local LAN access. Empty gateway IP clears it
+            # (back to cloud-only mode); a non-empty IP requires the gateway
+            # customer password.
+            gateway_ip_raw = user_input.get(CONF_POWERWALL_LOCAL_IP, "")
+            gateway_ip = (gateway_ip_raw or "").strip()
 
             # Validate EV provider
             detected = _detect_tesla_ev_integrations(self.hass)
@@ -3720,6 +3999,13 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                 new_data = dict(self.config_entry.data)
                 new_data[CONF_TESLA_API_PROVIDER] = tesla_provider
                 new_data[CONF_TESLA_EV_API_PROVIDER] = ev_choice
+                # Persist gateway IP changes; remove the key entirely when
+                # cleared so the diagnostic binary_sensor flips correctly
+                # rather than reading an empty string as "set".
+                if gateway_ip:
+                    new_data[CONF_POWERWALL_LOCAL_IP] = gateway_ip
+                else:
+                    new_data.pop(CONF_POWERWALL_LOCAL_IP, None)
                 self.hass.config_entries.async_update_entry(
                     self.config_entry, data=new_data
                 )
@@ -3743,6 +4029,9 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
         )
         current_ev_provider = self.config_entry.data.get(
             CONF_TESLA_EV_API_PROVIDER, TESLA_EV_API_PROVIDER_NONE
+        )
+        current_gateway_ip = self.config_entry.data.get(
+            CONF_POWERWALL_LOCAL_IP, ""
         )
 
         tesla_providers = {
@@ -3776,6 +4065,13 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                         ],
                         mode=SelectSelectorMode.DROPDOWN,
                     )),
+                    # Optional gateway LAN IP for direct local features.
+                    # Pairing is cloud-based; gateway control uses RSA
+                    # signing — no password required.
+                    vol.Optional(
+                        CONF_POWERWALL_LOCAL_IP,
+                        default=current_gateway_ip,
+                    ): str,
                 }
             ),
             errors=errors,
@@ -4464,16 +4760,22 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                 CONF_SAJ_BATTERY_CAPACITY_KWH,
                 DEFAULT_SAJ_BATTERY_CAPACITY_KWH,
             )
+            inverter_rated_kw = user_input.get(
+                CONF_SAJ_INVERTER_RATED_KW,
+                DEFAULT_SAJ_INVERTER_RATED_KW,
+            )
             try:
                 ctrl = SajH2BatteryController(
                     self.hass,
                     saj_entry_id=selected_entry_id,
                     battery_capacity_kwh=float(capacity_kwh),
+                    inverter_rated_kw=float(inverter_rated_kw),
                 )
                 await ctrl.connect()
                 new_data = dict(self.config_entry.data)
                 new_data[CONF_SAJ_CONFIG_ENTRY_ID] = selected_entry_id
                 new_data[CONF_SAJ_BATTERY_CAPACITY_KWH] = float(capacity_kwh)
+                new_data[CONF_SAJ_INVERTER_RATED_KW] = float(inverter_rated_kw)
                 self.hass.config_entries.async_update_entry(self.config_entry, data=new_data)
                 return self.async_create_entry(title="", data=dict(self.config_entry.options))
             except ValueError as exc:
@@ -4495,6 +4797,13 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
             self.config_entry.data.get(
                 CONF_SAJ_BATTERY_CAPACITY_KWH,
                 DEFAULT_SAJ_BATTERY_CAPACITY_KWH,
+            ),
+        )
+        current_rated_kw = self._get_option(
+            CONF_SAJ_INVERTER_RATED_KW,
+            self.config_entry.data.get(
+                CONF_SAJ_INVERTER_RATED_KW,
+                DEFAULT_SAJ_INVERTER_RATED_KW,
             ),
         )
 
@@ -4525,6 +4834,18 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                         unit_of_measurement="kWh",
                     )
                 ),
+                vol.Required(
+                    CONF_SAJ_INVERTER_RATED_KW,
+                    default=current_rated_kw,
+                ): NumberSelector(
+                    NumberSelectorConfig(
+                        min=1,
+                        max=50,
+                        step=0.5,
+                        mode=NumberSelectorMode.BOX,
+                        unit_of_measurement="kW",
+                    )
+                ),
             }),
             errors=errors,
         )
@@ -4538,19 +4859,52 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                 CONF_OPTIMIZATION_PROVIDER, OPT_PROVIDER_NATIVE
             )
             new_data = dict(self.config_entry.data)
+            new_options = dict(self.config_entry.options)
             new_data[CONF_OPTIMIZATION_PROVIDER] = optimization_provider
             if optimization_provider == OPT_PROVIDER_POWERSYNC:
-                new_data[CONF_OPTIMIZATION_COST_FUNCTION] = COST_FUNCTION_COST
-                new_data[CONF_OPTIMIZATION_BACKUP_RESERVE] = (
+                default_capacity_wh, default_charge_w, default_discharge_w = (
+                    _default_optimizer_specs_for(
+                        self.config_entry.data.get(
+                            CONF_BATTERY_SYSTEM,
+                            BATTERY_SYSTEM_TESLA,
+                        )
+                    )
+                )
+                default_capacity_kwh = default_capacity_wh / 1000
+                default_charge_kw = default_charge_w / 1000
+                default_discharge_kw = default_discharge_w / 1000
+                backup_reserve = (
                     user_input.get(
                         CONF_OPTIMIZATION_BACKUP_RESERVE,
                         int(DEFAULT_OPTIMIZATION_BACKUP_RESERVE * 100),
                     )
                     / 100.0
                 )
+                capacity_wh = _form_kwh_to_wh(
+                    user_input.get(CONF_OPTIMIZATION_BATTERY_CAPACITY_WH),
+                    default_capacity_kwh,
+                )
+                charge_w = _form_kw_to_w(
+                    user_input.get(CONF_OPTIMIZATION_MAX_CHARGE_W),
+                    default_charge_kw,
+                )
+                discharge_w = _form_kw_to_w(
+                    user_input.get(CONF_OPTIMIZATION_MAX_DISCHARGE_W),
+                    default_discharge_kw,
+                )
+                new_data[CONF_OPTIMIZATION_COST_FUNCTION] = COST_FUNCTION_COST
+                new_options[CONF_OPTIMIZATION_COST_FUNCTION] = COST_FUNCTION_COST
+                new_data[CONF_OPTIMIZATION_BACKUP_RESERVE] = backup_reserve
+                new_options[CONF_OPTIMIZATION_BACKUP_RESERVE] = backup_reserve
+                new_data[CONF_OPTIMIZATION_BATTERY_CAPACITY_WH] = capacity_wh
+                new_options[CONF_OPTIMIZATION_BATTERY_CAPACITY_WH] = capacity_wh
+                new_data[CONF_OPTIMIZATION_MAX_CHARGE_W] = charge_w
+                new_options[CONF_OPTIMIZATION_MAX_CHARGE_W] = charge_w
+                new_data[CONF_OPTIMIZATION_MAX_DISCHARGE_W] = discharge_w
+                new_options[CONF_OPTIMIZATION_MAX_DISCHARGE_W] = discharge_w
 
             self.hass.config_entries.async_update_entry(
-                self.config_entry, data=new_data
+                self.config_entry, data=new_data, options=new_options
             )
             return self.async_create_entry(
                 title="", data=dict(self.config_entry.options)
@@ -4562,8 +4916,45 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
         current_opt_provider = self.config_entry.data.get(
             CONF_OPTIMIZATION_PROVIDER, OPT_PROVIDER_NATIVE
         )
-        current_backup_reserve = self.config_entry.data.get(
-            CONF_OPTIMIZATION_BACKUP_RESERVE, DEFAULT_OPTIMIZATION_BACKUP_RESERVE
+        current_backup_reserve = self._get_option(
+            CONF_OPTIMIZATION_BACKUP_RESERVE,
+            self.config_entry.data.get(
+                CONF_OPTIMIZATION_BACKUP_RESERVE,
+                DEFAULT_OPTIMIZATION_BACKUP_RESERVE,
+            ),
+        )
+        default_capacity_wh, default_charge_w, default_discharge_w = (
+            _default_optimizer_specs_for(battery_system)
+        )
+        current_capacity_kwh = _stored_wh_to_kwh(
+            self._get_option(
+                CONF_OPTIMIZATION_BATTERY_CAPACITY_WH,
+                self.config_entry.data.get(
+                    CONF_OPTIMIZATION_BATTERY_CAPACITY_WH,
+                    default_capacity_wh,
+                ),
+            ),
+            default_capacity_wh,
+        )
+        current_charge_kw = _stored_w_to_kw(
+            self._get_option(
+                CONF_OPTIMIZATION_MAX_CHARGE_W,
+                self.config_entry.data.get(
+                    CONF_OPTIMIZATION_MAX_CHARGE_W,
+                    default_charge_w,
+                ),
+            ),
+            default_charge_w,
+        )
+        current_discharge_kw = _stored_w_to_kw(
+            self._get_option(
+                CONF_OPTIMIZATION_MAX_DISCHARGE_W,
+                self.config_entry.data.get(
+                    CONF_OPTIMIZATION_MAX_DISCHARGE_W,
+                    default_discharge_w,
+                ),
+            ),
+            default_discharge_w,
         )
 
         # Build native label based on battery system
@@ -4606,6 +4997,27 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                     ): NumberSelector(NumberSelectorConfig(
                         min=0, max=100, step=1, unit_of_measurement="%",
                         mode=NumberSelectorMode.SLIDER,
+                    )),
+                    vol.Required(
+                        CONF_OPTIMIZATION_BATTERY_CAPACITY_WH,
+                        default=current_capacity_kwh,
+                    ): NumberSelector(NumberSelectorConfig(
+                        min=1, max=200, step=0.1, unit_of_measurement="kWh",
+                        mode=NumberSelectorMode.BOX,
+                    )),
+                    vol.Required(
+                        CONF_OPTIMIZATION_MAX_CHARGE_W,
+                        default=current_charge_kw,
+                    ): NumberSelector(NumberSelectorConfig(
+                        min=0.1, max=50, step=0.1, unit_of_measurement="kW",
+                        mode=NumberSelectorMode.BOX,
+                    )),
+                    vol.Required(
+                        CONF_OPTIMIZATION_MAX_DISCHARGE_W,
+                        default=current_discharge_kw,
+                    ): NumberSelector(NumberSelectorConfig(
+                        min=0.1, max=50, step=0.1, unit_of_measurement="kW",
+                        mode=NumberSelectorMode.BOX,
                     )),
                 }
             ),
@@ -4729,7 +5141,7 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                     return await self.async_step_amber_options()
                 elif self._provider == "flow_power":
                     return await self.async_step_flow_power_options()
-                elif self._provider in ("globird", "aemo_vpp"):
+                elif self._provider in CUSTOM_TOU_PROVIDER_OPTIONS:
                     return await self.async_step_globird_options()
                 elif self._provider == "localvolts":
                     return await self.async_step_localvolts_options()
@@ -4957,7 +5369,7 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                     return await self.async_step_amber_options()
                 elif self._provider == "flow_power":
                     return await self.async_step_flow_power_options()
-                elif self._provider in ("globird", "aemo_vpp"):
+                elif self._provider in CUSTOM_TOU_PROVIDER_OPTIONS:
                     return await self.async_step_globird_options()
                 elif self._provider == "octopus":
                     return await self.async_step_octopus_options()
@@ -5171,7 +5583,7 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                     return await self.async_step_amber_options()
                 elif self._provider == "flow_power":
                     return await self.async_step_flow_power_options()
-                elif self._provider in ("globird", "aemo_vpp"):
+                elif self._provider in CUSTOM_TOU_PROVIDER_OPTIONS:
                     return await self.async_step_globird_options()
                 elif self._provider == "octopus":
                     return await self.async_step_octopus_options()
@@ -5366,7 +5778,7 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                     return await self.async_step_amber_options()
                 elif self._provider == "flow_power":
                     return await self.async_step_flow_power_options()
-                elif self._provider in ("globird", "aemo_vpp"):
+                elif self._provider in CUSTOM_TOU_PROVIDER_OPTIONS:
                     return await self.async_step_globird_options()
                 elif self._provider == "octopus":
                     return await self.async_step_octopus_options()
@@ -5532,7 +5944,7 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                     return await self.async_step_amber_options()
                 elif self._provider == "flow_power":
                     return await self.async_step_flow_power_options()
-                elif self._provider in ("globird", "aemo_vpp"):
+                elif self._provider in CUSTOM_TOU_PROVIDER_OPTIONS:
                     return await self.async_step_globird_options()
                 elif self._provider == "octopus":
                     return await self.async_step_octopus_options()
@@ -5640,11 +6052,12 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
         provider = getattr(self, "_provider", None) or self._get_option(
             CONF_ELECTRICITY_PROVIDER, "amber"
         )
+        self._provider = provider
         if provider == "amber":
             return await self.async_step_amber_options()
         if provider == "flow_power":
             return await self.async_step_flow_power_options()
-        if provider in ("globird", "aemo_vpp"):
+        if provider in CUSTOM_TOU_PROVIDER_OPTIONS:
             return await self.async_step_globird_options()
         if provider == "localvolts":
             return await self.async_step_localvolts_options()
@@ -5922,10 +6335,6 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                 default=self._get_option(CONF_SPIKE_PROTECTION_ENABLED, False),
             ): BooleanSelector(),
             vol.Optional(
-                CONF_SETTLED_PRICES_ONLY,
-                default=self._get_option(CONF_SETTLED_PRICES_ONLY, False),
-            ): BooleanSelector(),
-            vol.Optional(
                 CONF_FORECAST_DISCREPANCY_ALERT,
                 default=self._get_option(CONF_FORECAST_DISCREPANCY_ALERT, False),
             ): BooleanSelector(),
@@ -5936,7 +6345,7 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                     DEFAULT_FORECAST_DISCREPANCY_THRESHOLD,
                 ),
             ): NumberSelector(NumberSelectorConfig(
-                min=0.0, max=100.0, step=0.1, unit_of_measurement="c/kWh",
+                min=0.0, max=100.0, step=0.1, unit_of_measurement=self._selector_unit(),
                 mode=NumberSelectorMode.BOX,
             )),
         })
@@ -5960,14 +6369,14 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                     CONF_EXPORT_PRICE_OFFSET,
                     default=self._get_option(CONF_EXPORT_PRICE_OFFSET, 0.0),
                 ): NumberSelector(NumberSelectorConfig(
-                    min=0.0, max=50.0, step=0.1, unit_of_measurement="c/kWh",
+                    min=0.0, max=50.0, step=0.1, unit_of_measurement=self._selector_unit(),
                     mode=NumberSelectorMode.BOX,
                 )),
                 vol.Optional(
                     CONF_EXPORT_MIN_PRICE,
                     default=self._get_option(CONF_EXPORT_MIN_PRICE, 0.0),
                 ): NumberSelector(NumberSelectorConfig(
-                    min=0.0, max=100.0, step=0.1, unit_of_measurement="c/kWh",
+                    min=0.0, max=100.0, step=0.1, unit_of_measurement=self._selector_unit(),
                     mode=NumberSelectorMode.BOX,
                 )),
                 vol.Optional(
@@ -5988,7 +6397,7 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                         CONF_EXPORT_BOOST_THRESHOLD, DEFAULT_EXPORT_BOOST_THRESHOLD
                     ),
                 ): NumberSelector(NumberSelectorConfig(
-                    min=0.0, max=50.0, step=0.1, unit_of_measurement="c/kWh",
+                    min=0.0, max=50.0, step=0.1, unit_of_measurement=self._selector_unit(),
                     mode=NumberSelectorMode.BOX,
                 )),
                 # Chip Mode (inverse of export boost)
@@ -6012,7 +6421,7 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                         CONF_CHIP_MODE_THRESHOLD, DEFAULT_CHIP_MODE_THRESHOLD
                     ),
                 ): NumberSelector(NumberSelectorConfig(
-                    min=0.0, max=200.0, step=0.1, unit_of_measurement="c/kWh",
+                    min=0.0, max=200.0, step=0.1, unit_of_measurement=self._selector_unit(),
                     mode=NumberSelectorMode.BOX,
                 )),
             }
@@ -6073,7 +6482,7 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                 CONF_DEMAND_CHARGE_RATE,
                 default=self._get_option(CONF_DEMAND_CHARGE_RATE, 10.0),
             ): NumberSelector(NumberSelectorConfig(
-                min=0.0, max=100.0, step=0.1, unit_of_measurement="$/kW",
+                min=0.0, max=100.0, step=0.1, unit_of_measurement=self._selector_unit("demand_rate"),
                 mode=NumberSelectorMode.BOX,
             )),
             vol.Optional(
@@ -6125,14 +6534,14 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                     CONF_DAILY_SUPPLY_CHARGE,
                     default=self._get_option(CONF_DAILY_SUPPLY_CHARGE, 0.0),
                 ): NumberSelector(NumberSelectorConfig(
-                    min=0.0, max=500.0, step=0.01, unit_of_measurement="$/day",
+                    min=0.0, max=500.0, step=0.01, unit_of_measurement=self._selector_unit("daily"),
                     mode=NumberSelectorMode.BOX,
                 )),
                 vol.Optional(
                     CONF_MONTHLY_SUPPLY_CHARGE,
                     default=self._get_option(CONF_MONTHLY_SUPPLY_CHARGE, 0.0),
                 ): NumberSelector(NumberSelectorConfig(
-                    min=0.0, max=500.0, step=0.01, unit_of_measurement="$/month",
+                    min=0.0, max=500.0, step=0.01, unit_of_measurement=self._selector_unit("monthly"),
                     mode=NumberSelectorMode.BOX,
                 )),
             }
@@ -6899,7 +7308,7 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                     CONF_FLOW_POWER_BASE_RATE, FLOW_POWER_DEFAULT_BASE_RATE
                 ),
             ): NumberSelector(NumberSelectorConfig(
-                min=0.0, max=100.0, step=0.01, unit_of_measurement="c/kWh",
+                min=0.0, max=100.0, step=0.01, unit_of_measurement=self._selector_unit(),
                 mode=NumberSelectorMode.BOX,
             )),
             vol.Optional(
@@ -7142,21 +7551,21 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                         CONF_FP_TWAP_OVERRIDE,
                         default=self._get_option(CONF_FP_TWAP_OVERRIDE, None) or 0.0,
                     ): NumberSelector(NumberSelectorConfig(
-                        min=0.0, max=50.0, step=0.01, unit_of_measurement="c/kWh",
+                        min=0.0, max=50.0, step=0.01, unit_of_measurement=self._selector_unit(),
                         mode=NumberSelectorMode.BOX,
                     )),
                     vol.Optional(
                         CONF_FP_AMBER_MARKUP,
                         default=self._get_option(CONF_FP_AMBER_MARKUP, None) or default_markup,
                     ): NumberSelector(NumberSelectorConfig(
-                        min=0.0, max=20.0, step=0.01, unit_of_measurement="c/kWh",
+                        min=0.0, max=20.0, step=0.01, unit_of_measurement=self._selector_unit(),
                         mode=NumberSelectorMode.BOX,
                     )),
                     vol.Optional(
                         CONF_PEA_CUSTOM_VALUE,
                         default=self._get_option(CONF_PEA_CUSTOM_VALUE, None) or 0.0,
                     ): NumberSelector(NumberSelectorConfig(
-                        min=-50.0, max=50.0, step=0.01, unit_of_measurement="c/kWh",
+                        min=-50.0, max=50.0, step=0.01, unit_of_measurement=self._selector_unit(),
                         mode=NumberSelectorMode.BOX,
                     )),
                     vol.Optional(
@@ -7177,28 +7586,28 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                         CONF_NETWORK_FLAT_RATE,
                         default=self._get_option(CONF_NETWORK_FLAT_RATE, 8.0),
                     ): NumberSelector(NumberSelectorConfig(
-                        min=0.0, max=50.0, step=0.01, unit_of_measurement="c/kWh",
+                        min=0.0, max=50.0, step=0.01, unit_of_measurement=self._selector_unit(),
                         mode=NumberSelectorMode.BOX,
                     )),
                     vol.Optional(
                         CONF_NETWORK_PEAK_RATE,
                         default=self._get_option(CONF_NETWORK_PEAK_RATE, 15.0),
                     ): NumberSelector(NumberSelectorConfig(
-                        min=0.0, max=50.0, step=0.01, unit_of_measurement="c/kWh",
+                        min=0.0, max=50.0, step=0.01, unit_of_measurement=self._selector_unit(),
                         mode=NumberSelectorMode.BOX,
                     )),
                     vol.Optional(
                         CONF_NETWORK_SHOULDER_RATE,
                         default=self._get_option(CONF_NETWORK_SHOULDER_RATE, 5.0),
                     ): NumberSelector(NumberSelectorConfig(
-                        min=0.0, max=50.0, step=0.01, unit_of_measurement="c/kWh",
+                        min=0.0, max=50.0, step=0.01, unit_of_measurement=self._selector_unit(),
                         mode=NumberSelectorMode.BOX,
                     )),
                     vol.Optional(
                         CONF_NETWORK_OFFPEAK_RATE,
                         default=self._get_option(CONF_NETWORK_OFFPEAK_RATE, 2.0),
                     ): NumberSelector(NumberSelectorConfig(
-                        min=0.0, max=50.0, step=0.01, unit_of_measurement="c/kWh",
+                        min=0.0, max=50.0, step=0.01, unit_of_measurement=self._selector_unit(),
                         mode=NumberSelectorMode.BOX,
                     )),
                     vol.Optional(
@@ -7233,7 +7642,7 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                         CONF_NETWORK_OTHER_FEES,
                         default=self._get_option(CONF_NETWORK_OTHER_FEES, 1.5),
                     ): NumberSelector(NumberSelectorConfig(
-                        min=0.0, max=20.0, step=0.01, unit_of_measurement="c/kWh",
+                        min=0.0, max=20.0, step=0.01, unit_of_measurement=self._selector_unit(),
                         mode=NumberSelectorMode.BOX,
                     )),
                     vol.Optional(
@@ -7250,7 +7659,11 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
         """Step 2c: Globird specific options."""
         if user_input is not None:
             # Add provider to the data
-            user_input[CONF_ELECTRICITY_PROVIDER] = self._provider
+            user_input[CONF_ELECTRICITY_PROVIDER] = getattr(
+                self,
+                "_provider",
+                self._get_option(CONF_ELECTRICITY_PROVIDER, "globird"),
+            )
 
             # If spike not enabled, ensure region/threshold don't cause issues
             if not user_input.get(CONF_AEMO_SPIKE_ENABLED, False):
@@ -7296,7 +7709,7 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                 CONF_AEMO_SPIKE_THRESHOLD,
                 default=self._get_option(CONF_AEMO_SPIKE_THRESHOLD, 3000.0),
             ): NumberSelector(NumberSelectorConfig(
-                min=0.0, max=20000.0, step=1.0, unit_of_measurement="$/MWh",
+                min=0.0, max=20000.0, step=1.0, unit_of_measurement=self._selector_unit("market_rate"),
                 mode=NumberSelectorMode.BOX,
             )),
         }
@@ -7765,6 +8178,7 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
             custom_tariff = {
                 "name": f"{retailer_name} TOU",
                 "utility": retailer_name,
+                "currency": self._currency(),
                 "seasons": {
                     "All Year": {
                         "fromMonth": 1,
@@ -7797,7 +8211,8 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                         from . import convert_custom_tariff_to_schedule
 
                         tariff_schedule = convert_custom_tariff_to_schedule(
-                            custom_tariff
+                            custom_tariff,
+                            currency=self._currency(),
                         )
                         entry_data["tariff_schedule"] = tariff_schedule
                         _LOGGER.info(
@@ -7836,42 +8251,42 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                         CONF_NZ_PEAK_RATE,
                         default=self._get_option(CONF_NZ_PEAK_RATE, 40.0),
                     ): NumberSelector(NumberSelectorConfig(
-                        min=0, max=200, step=0.1, unit_of_measurement="c/kWh",
+                        min=0, max=200, step=0.1, unit_of_measurement=self._selector_unit(),
                         mode=NumberSelectorMode.BOX,
                     )),
                     vol.Required(
                         CONF_NZ_SHOULDER_RATE,
                         default=self._get_option(CONF_NZ_SHOULDER_RATE, 25.0),
                     ): NumberSelector(NumberSelectorConfig(
-                        min=0, max=200, step=0.1, unit_of_measurement="c/kWh",
+                        min=0, max=200, step=0.1, unit_of_measurement=self._selector_unit(),
                         mode=NumberSelectorMode.BOX,
                     )),
                     vol.Required(
                         CONF_NZ_OFFPEAK_RATE,
                         default=self._get_option(CONF_NZ_OFFPEAK_RATE, 15.0),
                     ): NumberSelector(NumberSelectorConfig(
-                        min=0, max=200, step=0.1, unit_of_measurement="c/kWh",
+                        min=0, max=200, step=0.1, unit_of_measurement=self._selector_unit(),
                         mode=NumberSelectorMode.BOX,
                     )),
                     vol.Required(
                         CONF_NZ_PEAK_EXPORT,
                         default=self._get_option(CONF_NZ_PEAK_EXPORT, 8.0),
                     ): NumberSelector(NumberSelectorConfig(
-                        min=0, max=100, step=0.1, unit_of_measurement="c/kWh",
+                        min=0, max=100, step=0.1, unit_of_measurement=self._selector_unit(),
                         mode=NumberSelectorMode.BOX,
                     )),
                     vol.Required(
                         CONF_NZ_OFFPEAK_EXPORT,
                         default=self._get_option(CONF_NZ_OFFPEAK_EXPORT, 8.0),
                     ): NumberSelector(NumberSelectorConfig(
-                        min=0, max=100, step=0.1, unit_of_measurement="c/kWh",
+                        min=0, max=100, step=0.1, unit_of_measurement=self._selector_unit(),
                         mode=NumberSelectorMode.BOX,
                     )),
                     vol.Required(
                         CONF_NZ_DAILY_SUPPLY,
                         default=self._get_option(CONF_NZ_DAILY_SUPPLY, 200.0),
                     ): NumberSelector(NumberSelectorConfig(
-                        min=0, max=1000, step=0.1, unit_of_measurement="c/day",
+                        min=0, max=1000, step=0.1, unit_of_measurement=self._selector_unit("minor_daily"),
                         mode=NumberSelectorMode.BOX,
                     )),
                 }
@@ -7968,19 +8383,19 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                     ),
                     vol.Optional("flat_rate", default=30): NumberSelector(
                         NumberSelectorConfig(
-                            min=0, max=200, step=0.1, unit_of_measurement="c/kWh",
+                            min=0, max=200, step=0.1, unit_of_measurement=self._selector_unit(),
                             mode=NumberSelectorMode.BOX,
                         )
                     ),
                     vol.Required("offpeak_rate", default=default_offpeak): NumberSelector(
                         NumberSelectorConfig(
-                            min=0, max=200, step=0.1, unit_of_measurement="c/kWh",
+                            min=0, max=200, step=0.1, unit_of_measurement=self._selector_unit(),
                             mode=NumberSelectorMode.BOX,
                         )
                     ),
                     vol.Required("fit_rate", default=default_fit): NumberSelector(
                         NumberSelectorConfig(
-                            min=0, max=100, step=0.1, unit_of_measurement="c/kWh",
+                            min=0, max=100, step=0.1, unit_of_measurement=self._selector_unit(),
                             mode=NumberSelectorMode.BOX,
                         )
                     ),
@@ -7988,7 +8403,7 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
             ),
             errors=errors,
             description_placeholders={
-                "info": "Configure your electricity tariff. All rates in cents/kWh.\nFor TOU, you'll add time periods in the next step.",
+                "info": f"Configure your electricity tariff. All rates in {self._selector_unit()}.\nFor TOU, you'll add time periods in the next step.",
             },
         )
 
@@ -8047,6 +8462,7 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
         added_desc = ""
         if count > 0:
             lines = []
+            minor_unit = self._selector_unit()
             for i, p in enumerate(self._tariff_periods, 1):
                 label = {
                     "PEAK": "Peak",
@@ -8056,7 +8472,8 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                 }.get(p["name"], p["name"])
                 lines.append(
                     f"{i}. {label} {p['start']:02d}:00-{p['end']:02d}:00 "
-                    f"({p['import_rate'] * 100:.0f}c import, {p['export_rate'] * 100:.0f}c export)"
+                    f"({p['import_rate'] * 100:.0f}{minor_unit} import, "
+                    f"{p['export_rate'] * 100:.0f}{minor_unit} export)"
                 )
             added_desc = "Periods added:\n" + "\n".join(lines)
 
@@ -8096,13 +8513,13 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                     ),
                     vol.Required("import_rate", default=45): NumberSelector(
                         NumberSelectorConfig(
-                            min=0, max=200, step=0.1, unit_of_measurement="c/kWh",
+                            min=0, max=200, step=0.1, unit_of_measurement=self._selector_unit(),
                             mode=NumberSelectorMode.BOX,
                         )
                     ),
                     vol.Required("export_rate", default=5): NumberSelector(
                         NumberSelectorConfig(
-                            min=0, max=200, step=0.1, unit_of_measurement="c/kWh",
+                            min=0, max=200, step=0.1, unit_of_measurement=self._selector_unit(),
                             mode=NumberSelectorMode.BOX,
                         )
                     ),
@@ -8131,6 +8548,8 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
         ctx._selected_electricity_provider = self.config_entry.data.get(
             CONF_ELECTRICITY_PROVIDER, "other"
         )
+        ctx._tariff_currency = self._currency()
+        ctx.hass = self.hass
         return PowerSyncConfigFlow._build_tariff_from_periods(ctx, periods)
 
     async def _save_custom_tariff(self, custom_tariff: dict) -> None:
@@ -8141,12 +8560,20 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
             for entry_id, entry_data in self.hass.data.get(DOMAIN, {}).items():
                 if isinstance(entry_data, dict) and "automation_store" in entry_data:
                     store = entry_data["automation_store"]
+                    tariff_currency = normalize_currency(
+                        custom_tariff.get("currency"),
+                        self._currency(),
+                    )
+                    custom_tariff["currency"] = tariff_currency
                     store.set_custom_tariff(custom_tariff)
                     await store.async_save()
 
                     from . import convert_custom_tariff_to_schedule
 
-                    tariff_schedule = convert_custom_tariff_to_schedule(custom_tariff)
+                    tariff_schedule = convert_custom_tariff_to_schedule(
+                        custom_tariff,
+                        currency=tariff_currency,
+                    )
                     entry_data["tariff_schedule"] = tariff_schedule
                     _LOGGER.info("Custom tariff saved via options flow")
                     break

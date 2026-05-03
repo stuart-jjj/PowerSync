@@ -28,12 +28,20 @@ from ..const import (
     DOMAIN,
     CONF_ZAPTEC_STANDALONE_ENABLED,
     CONF_ZAPTEC_USERNAME,
-    CONF_ZAPTEC_PASSWORD,
-    CONF_ZAPTEC_CHARGER_ID,
     CONF_ZAPTEC_INSTALLATION_ID_CLOUD,
+)
+from ..automations.ev_ownership import (
+    DEFAULT_VEHICLE_ID,
+    can_claim_ev_ownership,
+    claim_ev_ownership,
+    get_active_ev_owner_mode,
+    owner_family,
+    record_ev_command,
+    release_ev_ownership,
 )
 
 _LOGGER = logging.getLogger(__name__)
+EV_COORDINATOR_OWNER_MODE = "ev_coordinator"
 
 
 class EVChargingMode(Enum):
@@ -112,6 +120,7 @@ class EVCoordinator:
         battery_schedule_getter: Callable[[], Any] | None = None,
         solar_forecast_getter: Callable[[], list[float]] | None = None,
         grid_capacity_w: float = 7400,  # 32A single phase default
+        config_entry: Any | None = None,
     ):
         """Initialize EV coordinator.
 
@@ -129,6 +138,7 @@ class EVCoordinator:
         self._get_battery_schedule = battery_schedule_getter
         self._get_solar_forecast = solar_forecast_getter
         self._grid_capacity_w = grid_capacity_w
+        self._config_entry = config_entry
 
         self._mode = EVChargingMode.SMART
         self._enabled = False
@@ -140,9 +150,6 @@ class EVCoordinator:
         self._last_update: datetime | None = None
         self._charging_plan: list[ChargingWindow] = []
         self._current_charge_amps: dict[str, int] = {}  # Track current amps per charger
-
-        # Cached Zaptec standalone client
-        self._zaptec_client = None
 
     @property
     def enabled(self) -> bool:
@@ -316,7 +323,7 @@ class EVCoordinator:
                 continue
 
             if status.soc and status.soc >= config.target_soc:
-                await self._stop_charging(config)
+                await self._stop_charging(config, reason="target reached")
                 continue
 
             # Check if we should charge now
@@ -328,8 +335,9 @@ class EVCoordinator:
             if should_charge:
                 if not status.charging:
                     # Start charging with calculated power
-                    await self._start_charging(config, power_w=available_power)
-                    self._ev_statuses[config.entity_id].state = EVChargingState.CHARGING
+                    started = await self._start_charging(config, power_w=available_power)
+                    if started:
+                        self._ev_statuses[config.entity_id].state = EVChargingState.CHARGING
                 else:
                     # Already charging - adjust amps if power changed significantly
                     current_amps = self._current_charge_amps.get(config.entity_id, 0)
@@ -339,8 +347,9 @@ class EVCoordinator:
                         self._current_charge_amps[config.entity_id] = new_amps
                         _LOGGER.debug(f"Adjusted {config.name} charging: {current_amps}A -> {new_amps}A")
             elif status.charging:
-                await self._stop_charging(config)
-                self._ev_statuses[config.entity_id].state = EVChargingState.WAITING_CHEAP_RATE
+                stopped = await self._stop_charging(config, reason="waiting for cheap rate")
+                if stopped:
+                    self._ev_statuses[config.entity_id].state = EVChargingState.WAITING_CHEAP_RATE
 
     async def _get_price_data(self) -> list[dict]:
         """Get price forecast data."""
@@ -574,40 +583,202 @@ class EVCoordinator:
                 return opts
         return {}
 
-    async def _get_zaptec_client(self):
-        """Get or create a cached ZaptecCloudClient instance."""
-        if self._zaptec_client is not None:
-            return self._zaptec_client
-
-        config = self._get_zaptec_config()
-        username = config.get(CONF_ZAPTEC_USERNAME, "")
-        password = config.get(CONF_ZAPTEC_PASSWORD, "")
-        if not username or not password:
-            return None
-
-        # Check if client is already stored in hass.data
+    def _get_zaptec_cached_state(self) -> dict:
+        """Return the latest cached Zaptec standalone state."""
         for entry in self.hass.config_entries.async_entries(DOMAIN):
             entry_data = self.hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
-            client = entry_data.get("zaptec_client")
-            if client is not None:
-                self._zaptec_client = client
-                return client
+            cached_state = entry_data.get("zaptec_cached_state", {})
+            if cached_state:
+                return cached_state
+        return {}
 
-        # Create new client
-        from ..zaptec_api import ZaptecCloudClient
-        client = ZaptecCloudClient(username, password)
-        self._zaptec_client = client
-        return client
+    def _ownership_vehicle_id(self, config: EVConfig) -> str:
+        """Use the charger entity as this legacy coordinator's loadpoint id."""
+        return config.entity_id or DEFAULT_VEHICLE_ID
 
-    async def _start_charging(self, config: EVConfig, power_w: float | None = None) -> None:
+    def _can_control_loadpoint(self, config: EVConfig, command: str) -> bool:
+        """Return whether the optimizer EV coordinator may control this charger."""
+        if self._config_entry is None:
+            return True
+
+        vehicle_id = self._ownership_vehicle_id(config)
+        allowed, _lease_id, _lease, reason = can_claim_ev_ownership(
+            self.hass,
+            self._config_entry,
+            vehicle_id,
+            owner_mode=EV_COORDINATOR_OWNER_MODE,
+        )
+        if allowed:
+            return True
+
+        block_reason = reason or "another EV mode owns this loadpoint"
+        _LOGGER.info(
+            "EV optimizer coordinator: %s blocked for %s because %s",
+            command,
+            config.name,
+            block_reason,
+        )
+        record_ev_command(
+            self.hass,
+            self._config_entry,
+            vehicle_id,
+            command=command,
+            success=False,
+            reason=block_reason,
+        )
+        return False
+
+    def _claim_loadpoint(self, config: EVConfig, command: str, reason: str) -> None:
+        """Claim this charger's loadpoint after a successful physical command."""
+        if self._config_entry is None:
+            return
+
+        claim_ev_ownership(
+            self.hass,
+            self._config_entry,
+            self._ownership_vehicle_id(config),
+            owner_mode=EV_COORDINATOR_OWNER_MODE,
+            command=command,
+            reason=reason,
+            extra={"charger_entity_id": config.entity_id},
+        )
+
+    def _release_loadpoint(self, config: EVConfig, command: str, reason: str) -> None:
+        """Release this charger's loadpoint after stop or passive cleanup."""
+        if self._config_entry is None:
+            return
+
+        release_ev_ownership(
+            self.hass,
+            self._config_entry,
+            self._ownership_vehicle_id(config),
+            reason=reason,
+            command=command,
+        )
+
+    def _record_loadpoint_failure(self, config: EVConfig, command: str, reason: str) -> None:
+        """Record a failed command for diagnostics."""
+        if self._config_entry is None:
+            return
+
+        record_ev_command(
+            self.hass,
+            self._config_entry,
+            self._ownership_vehicle_id(config),
+            command=command,
+            success=False,
+            reason=reason,
+        )
+
+    def _legacy_action_amps_entity(self, config: EVConfig) -> str | None:
+        """Find the number entity that controls charger amps, if one exists."""
+        entity_id = config.entity_id
+        candidates = [
+            entity_id.replace("switch.", "number.").replace("_charger", "_charging_amps"),
+        ]
+        candidates.extend(
+            entity_id.replace("switch.", "number.") + suffix
+            for suffix in ("_amps", "_charging_amps", "_current", "_charging_current")
+        )
+        for number_entity in candidates:
+            if self.hass.states.get(number_entity):
+                return number_entity
+        return None
+
+    def _legacy_shared_action_params(self, config: EVConfig) -> dict[str, Any] | None:
+        """Build params for the shared EV action layer when this config maps cleanly."""
+        vehicle_id = self._ownership_vehicle_id(config)
+
+        if self._is_zaptec_standalone():
+            return {
+                "charger_type": "zaptec",
+                "vehicle_id": vehicle_id,
+                "vehicle_vin": None,
+            }
+
+        domain = config.entity_id.split(".")[0]
+        if domain == "switch":
+            return {
+                "charger_type": "generic",
+                "vehicle_id": vehicle_id,
+                "vehicle_vin": None,
+                "charger_switch_entity": config.entity_id,
+                "charger_amps_entity": self._legacy_action_amps_entity(config) or "",
+            }
+
+        if domain == "ocpp":
+            return {
+                "charger_type": "ha_native",
+                "vehicle_id": vehicle_id,
+                "vehicle_vin": None,
+                "charger_entity_id": config.entity_id,
+                "charger_domain": domain,
+                "charger_amps_entity": self._legacy_action_amps_entity(config) or "",
+            }
+
+        params = {
+            "charger_type": "ha_native",
+            "vehicle_id": vehicle_id,
+            "vehicle_vin": None,
+            "charger_entity_id": config.entity_id,
+            "charger_domain": domain,
+            "charger_amps_entity": self._legacy_action_amps_entity(config) or "",
+        }
+        if domain == "zaptec":
+            params["zaptec_installation_id"] = self._get_zaptec_installation_id(config.entity_id) or ""
+        return params
+
+    async def _set_shared_action_amps(self, config: EVConfig, amps: int) -> bool | None:
+        """Set/start/stop via shared EV actions; None means unsupported config."""
+        params = self._legacy_shared_action_params(config)
+        if params is None:
+            return None
+
+        from ..automations.actions import _set_vehicle_amps
+
+        return await _set_vehicle_amps(
+            self.hass,
+            self._config_entry,
+            self._ownership_vehicle_id(config),
+            amps,
+            params,
+        )
+
+    def _shared_start_failure_reason(self, config: EVConfig) -> str:
+        """Return a more useful reason for known shared-action start failures."""
+        if self._is_zaptec_standalone():
+            cached_state = self._get_zaptec_cached_state()
+            zaptec_config = self._get_zaptec_config()
+            if (
+                cached_state.get("charger_operation_mode") == "connected_waiting"
+                and not zaptec_config.get(CONF_ZAPTEC_INSTALLATION_ID_CLOUD, "")
+            ):
+                return "Zaptec waiting but installation current could not be set"
+        return "physical start failed"
+
+    def _owns_loadpoint(self, config: EVConfig) -> bool:
+        """Return whether this coordinator currently owns the charger."""
+        if self._config_entry is None:
+            return True
+
+        owner_mode = get_active_ev_owner_mode(
+            self.hass,
+            self._config_entry,
+            self._ownership_vehicle_id(config),
+        )
+        return owner_family(owner_mode) == owner_family(EV_COORDINATOR_OWNER_MODE)
+
+    async def _start_charging(self, config: EVConfig, power_w: float | None = None) -> bool:
         """Start EV charging with dynamic amp adjustment.
 
         Args:
             config: EV charger configuration
             power_w: Available power in watts (used to calculate amps)
         """
+        if not self._can_control_loadpoint(config, "start_ev_coordinator"):
+            return False
+
         entity_id = config.entity_id
-        domain = entity_id.split(".")[0]
 
         # Calculate optimal amps based on available power
         if power_w:
@@ -622,60 +793,29 @@ class EVCoordinator:
         _LOGGER.info(f"Starting EV charging: {config.name} at {target_amps}A ({power_w or config.max_charging_power_w}W)")
 
         try:
-            # Zaptec standalone takes priority over HA integration
-            if self._is_zaptec_standalone():
-                client = await self._get_zaptec_client()
-                zaptec_config = self._get_zaptec_config()
-                charger_id = zaptec_config.get(CONF_ZAPTEC_CHARGER_ID, "")
-                if client and charger_id:
-                    await self._set_charging_amps(config, target_amps)
-                    self._current_charge_amps[entity_id] = target_amps
-                    # State-aware start: check charger operation mode
-                    cached_state = {}
-                    for entry in self.hass.config_entries.async_entries(DOMAIN):
-                        ed = self.hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
-                        cached_state = ed.get("zaptec_cached_state", {})
-                        if cached_state:
-                            break
-                    charger_mode = cached_state.get("charger_operation_mode", "")
-                    if charger_mode == "charging":
-                        _LOGGER.info("Zaptec already charging, skipping Resume")
-                    elif charger_mode == "connected_waiting":
-                        # Car just plugged in — MaxCurrent already set by _set_charging_amps
-                        _LOGGER.info("Zaptec in connected_waiting: MaxCurrent set, skipping Resume")
-                    else:
-                        await client.resume_charging(charger_id)
-                    _LOGGER.info(f"Started Zaptec standalone charging: {charger_id}")
-                    return
-                else:
-                    _LOGGER.warning("Zaptec standalone configured but missing client or charger_id")
+            shared_result = await self._set_shared_action_amps(config, target_amps)
+            if shared_result is None:
+                reason = "unsupported charger configuration"
+                self._record_loadpoint_failure(config, "start_ev_coordinator", reason)
+                return False
+            if not shared_result:
+                reason = self._shared_start_failure_reason(config)
+                self._record_loadpoint_failure(config, "start_ev_coordinator", reason)
+                return False
 
-            # Set charging amps first (if supported)
-            await self._set_charging_amps(config, target_amps)
             self._current_charge_amps[entity_id] = target_amps
-
-            # Then start charging
-            if domain == "switch":
-                await self.hass.services.async_call(
-                    "switch", "turn_on",
-                    {"entity_id": entity_id}
-                )
-            elif domain in ("ev_charger", "ocpp", "wallbox", "easee", "zaptec"):
-                service = "resume_charging" if domain == "zaptec" else "start_charging"
-                await self.hass.services.async_call(
-                    domain, service,
-                    {"entity_id": entity_id}
-                )
-            else:
-                # Generic turn_on
-                await self.hass.services.async_call(
-                    "homeassistant", "turn_on",
-                    {"entity_id": entity_id}
-                )
+            self._claim_loadpoint(
+                config,
+                "start_ev_coordinator",
+                f"{self._mode.value} charging",
+            )
+            return True
         except Exception as e:
             _LOGGER.error(f"Failed to start EV charging: {e}")
+            self._record_loadpoint_failure(config, "start_ev_coordinator", str(e))
+            return False
 
-    async def _set_charging_amps(self, config: EVConfig, amps: int) -> None:
+    async def _set_charging_amps(self, config: EVConfig, amps: int) -> bool:
         """Set EV charging amps for dynamic power sharing.
 
         Args:
@@ -684,143 +824,72 @@ class EVCoordinator:
         """
         entity_id = config.entity_id
 
-        # 0. Zaptec standalone — set installation current directly via API
-        if self._is_zaptec_standalone():
-            client = await self._get_zaptec_client()
-            zaptec_config = self._get_zaptec_config()
-            installation_id = zaptec_config.get(CONF_ZAPTEC_INSTALLATION_ID_CLOUD, "")
-            if client and installation_id:
-                try:
-                    await client.set_installation_current(installation_id, amps)
-                    _LOGGER.debug(f"Set Zaptec standalone charging amps to {amps}A")
-                    return
-                except Exception as e:
-                    # Rate limit or other error — log but don't fail
-                    _LOGGER.debug(f"Zaptec standalone set_current: {e}")
+        shared_result = await self._set_shared_action_amps(config, amps)
+        if shared_result is not None:
+            return shared_result
+        _LOGGER.debug("No shared EV action method found to set charging amps for %s", entity_id)
+        return False
 
-        # Try various methods to set charging amps
-        # 1. Tesla BLE number entity
-        tesla_ble_amps = entity_id.replace("switch.", "number.").replace("_charger", "_charging_amps")
-        if self.hass.states.get(tesla_ble_amps):
-            try:
-                await self.hass.services.async_call(
-                    "number", "set_value",
-                    {"entity_id": tesla_ble_amps, "value": amps}
-                )
-                _LOGGER.debug(f"Set Tesla BLE charging amps to {amps}A")
-                return
-            except Exception as e:
-                _LOGGER.debug(f"Failed to set Tesla BLE amps: {e}")
-
-        # 2. OCPP charger
-        domain = entity_id.split(".")[0]
-        if domain == "ocpp":
-            try:
-                await self.hass.services.async_call(
-                    "ocpp", "set_charge_rate",
-                    {"entity_id": entity_id, "limit_amps": amps}
-                )
-                _LOGGER.debug(f"Set OCPP charging amps to {amps}A")
-                return
-            except Exception as e:
-                _LOGGER.debug(f"Failed to set OCPP amps: {e}")
-
-        # 3. Wallbox charger
-        if domain == "wallbox":
-            try:
-                await self.hass.services.async_call(
-                    "wallbox", "set_charging_current",
-                    {"entity_id": entity_id, "charging_current": amps}
-                )
-                _LOGGER.debug(f"Set Wallbox charging amps to {amps}A")
-                return
-            except Exception as e:
-                _LOGGER.debug(f"Failed to set Wallbox amps: {e}")
-
-        # 4. Easee charger
-        if domain == "easee":
-            try:
-                await self.hass.services.async_call(
-                    "easee", "set_charger_dynamic_limit",
-                    {"entity_id": entity_id, "current": amps}
-                )
-                _LOGGER.debug(f"Set Easee charging amps to {amps}A")
-                return
-            except Exception as e:
-                _LOGGER.debug(f"Failed to set Easee amps: {e}")
-
-        # 5. Zaptec charger (uses installation-level current limit)
-        if domain == "zaptec":
-            zaptec_installation_id = self._get_zaptec_installation_id(entity_id)
-            if zaptec_installation_id:
-                try:
-                    await self.hass.services.async_call(
-                        "zaptec", "limit_current",
-                        {"device_id": zaptec_installation_id, "available_current": amps}
-                    )
-                    _LOGGER.debug(f"Set Zaptec charging amps to {amps}A")
-                    return
-                except Exception as e:
-                    _LOGGER.debug(f"Failed to set Zaptec amps: {e}")
-
-        # 6. Generic number entity (common pattern: entity_id + "_amps" or "_current")
-        for suffix in ["_amps", "_charging_amps", "_current", "_charging_current"]:
-            number_entity = entity_id.replace("switch.", "number.") + suffix
-            if self.hass.states.get(number_entity):
-                try:
-                    await self.hass.services.async_call(
-                        "number", "set_value",
-                        {"entity_id": number_entity, "value": amps}
-                    )
-                    _LOGGER.debug(f"Set charging amps via {number_entity} to {amps}A")
-                    return
-                except Exception:
-                    pass
-
-        _LOGGER.debug(f"No method found to set charging amps for {entity_id}")
-
-    async def _stop_charging(self, config: EVConfig) -> None:
+    async def _stop_charging(self, config: EVConfig, reason: str = "stopped") -> bool:
         """Stop EV charging."""
+        if not self._owns_loadpoint(config):
+            _LOGGER.info(
+                "EV optimizer coordinator: stop blocked for %s because it does not own the loadpoint",
+                config.name,
+            )
+            if self._config_entry is not None:
+                record_ev_command(
+                    self.hass,
+                    self._config_entry,
+                    self._ownership_vehicle_id(config),
+                    command="stop_ev_coordinator",
+                    success=False,
+                    reason="not owned by EV optimizer coordinator",
+                )
+            return False
+
         _LOGGER.info(f"Stopping EV charging: {config.name}")
 
-        entity_id = config.entity_id
-        domain = entity_id.split(".")[0]
-
         try:
-            # Zaptec standalone takes priority
-            if self._is_zaptec_standalone():
-                client = await self._get_zaptec_client()
-                zaptec_config = self._get_zaptec_config()
-                charger_id = zaptec_config.get(CONF_ZAPTEC_CHARGER_ID, "")
-                if client and charger_id:
-                    await client.stop_charging(charger_id)
-                    _LOGGER.info(f"Stopped Zaptec standalone charging: {charger_id}")
-                    return
+            shared_result = await self._set_shared_action_amps(config, 0)
+            if shared_result is None:
+                self._record_loadpoint_failure(
+                    config,
+                    "stop_ev_coordinator",
+                    "unsupported charger configuration",
+                )
+                return False
+            if not shared_result:
+                self._record_loadpoint_failure(
+                    config,
+                    "stop_ev_coordinator",
+                    "physical stop failed",
+                )
+                return False
 
-            if domain == "switch":
-                await self.hass.services.async_call(
-                    "switch", "turn_off",
-                    {"entity_id": entity_id}
+            release_command = "stop_ev_coordinator"
+            if self._is_zaptec_standalone():
+                charger_mode = self._get_zaptec_cached_state().get(
+                    "charger_operation_mode",
+                    "",
                 )
-            elif domain in ("ev_charger", "ocpp", "wallbox", "easee", "zaptec"):
-                await self.hass.services.async_call(
-                    domain, "stop_charging",
-                    {"entity_id": entity_id}
-                )
-            else:
-                await self.hass.services.async_call(
-                    "homeassistant", "turn_off",
-                    {"entity_id": entity_id}
-                )
+                if charger_mode in ("connected_waiting", "disconnected", ""):
+                    release_command = "release"
+            self._release_loadpoint(config, release_command, reason)
+            return True
         except Exception as e:
             _LOGGER.error(f"Failed to stop EV charging: {e}")
+            self._record_loadpoint_failure(config, "stop_ev_coordinator", str(e))
+            return False
 
     async def _start_all_charging(self) -> None:
         """Start charging all connected EVs (immediate mode)."""
         for config in self._ev_configs:
             status = self._ev_statuses.get(config.entity_id)
             if status and status.connected and not status.charging:
-                await self._start_charging(config)
+                started = await self._start_charging(config)
+                if started:
+                    self._ev_statuses[config.entity_id].state = EVChargingState.CHARGING
 
     def _get_zaptec_installation_id(self, charger_entity_id: str) -> str | None:
         """Get the Zaptec installation device_id from config or device registry.

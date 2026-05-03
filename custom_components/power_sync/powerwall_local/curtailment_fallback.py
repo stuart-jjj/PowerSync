@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
 
 from ..const import (
     CONF_POWERWALL_LOCAL_PAIRED,
@@ -399,7 +400,8 @@ class PowerwallCurtailmentFallback:
         return total < cap
 
     def _maybe_reset_daily_counter(self) -> None:
-        today = date.today()
+        # Daily cap rolls over at HA-local midnight, not container UTC midnight
+        today = dt_util.now().date()
         if self._daily_reset_date != today:
             self._daily_duration_s = 0.0
             self._daily_reset_date = today

@@ -145,7 +145,7 @@ class BatteryControllerWrapper:
 
             await self.hass.services.async_call(
                 "power_sync", "set_self_consumption",
-                {},
+                {"source": "optimizer"},
                 blocking=True,
             )
             return True

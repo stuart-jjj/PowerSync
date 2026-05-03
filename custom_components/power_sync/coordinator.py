@@ -15,8 +15,15 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
+
+# Dispatcher signal fired by AEMOPriceCoordinator when a new dispatch file is
+# detected on NEMWEB (settled price for the period that just ended). TOU sync
+# subscribes to this in __init__.py to issue exactly one tariff POST per
+# 5-min period, aligned with AEMO's publish event instead of a fixed cron.
+SIGNAL_AEMO_NEW_DISPATCH = "power_sync_aemo_new_dispatch"
 
 from .const import (
     DOMAIN,
@@ -33,11 +40,22 @@ from .const import (
     DEFAULT_TWAP_WINDOW_DAYS,
     MIN_TWAP_SAMPLES,
     FLOW_POWER_MARKET_AVG,
+    CONF_FLEET_API_BASE_URL,
+    TESLA_SITE_INFO_CACHE_TTL_SECONDS,
 )
 
 
 ENERGY_ACC_STORE_VERSION = 1
 ENERGY_ACC_SAVE_DELAY = 300  # Flush at most every 5 minutes
+LIFETIME_TOTALS_STORE_VERSION = 1
+LIFETIME_TOTAL_KEYS = (
+    "lifetime_solar_kwh",
+    "lifetime_grid_import_kwh",
+    "lifetime_grid_export_kwh",
+    "lifetime_battery_charged_kwh",
+    "lifetime_battery_discharged_kwh",
+    "lifetime_home_kwh",
+)
 
 
 class EnergyAccumulator:
@@ -325,9 +343,12 @@ def _get_current_prices(hass: HomeAssistant, entry_id: str) -> tuple[float | Non
                         CONF_PEA_ENABLED,
                         CONF_FLOW_POWER_BASE_RATE,
                         CONF_PEA_CUSTOM_VALUE,
+                        CONF_FLOW_POWER_STATE,
                         FLOW_POWER_DEFAULT_BASE_RATE,
                         FLOW_POWER_MARKET_AVG,
                         FLOW_POWER_BENCHMARK,
+                        FLOW_POWER_EXPORT_RATES,
+                        FLOW_POWER_HAPPY_HOUR_PERIODS,
                     )
                     provider = config_entry.options.get(
                         CONF_ELECTRICITY_PROVIDER,
@@ -352,9 +373,21 @@ def _get_current_prices(hass: HomeAssistant, entry_id: str) -> tuple[float | Non
                         else:
                             pea = 0.0
                         buy_cents_fp = max(0.0, fp_base_rate + pea)
-                        # feedIn for Flow Power: AEMO stores as negative-of-wholesale; negate to get positive earnings
-                        sell_cents_fp = max(0.0, -(sell_cents_raw or 0))
-                        return (buy_cents_fp / 100.0, sell_cents_fp / 100.0)
+                        # Export: Flow Power pays a flat happy hour rate, not the AEMO spot price.
+                        # The AEMO feedIn channel reflects the wholesale price, which is unrelated
+                        # to the fixed 45c/kWh happy hour credit Flow Power actually pays.
+                        fp_state = config_entry.options.get(
+                            CONF_FLOW_POWER_STATE,
+                            config_entry.data.get(CONF_FLOW_POWER_STATE, "QLD1"),
+                        )
+                        now_local = dt_util.now()
+                        period_key = f"PERIOD_{now_local.hour:02d}_{(now_local.minute // 30) * 30:02d}"
+                        sell_dollar_fp = (
+                            FLOW_POWER_EXPORT_RATES.get(fp_state, 0.0)
+                            if period_key in FLOW_POWER_HAPPY_HOUR_PERIODS
+                            else 0.0
+                        )
+                        return (buy_cents_fp / 100.0, sell_dollar_fp)
                     else:
                         # Generic AEMO (non-Flow-Power): wholesale price is the retail price
                         buy_dollar = wholesale_cents / 100.0
@@ -766,6 +799,9 @@ def _merge_amber_forecasts(forecast_5min: list, forecast_30min: list) -> list:
 class AmberPriceCoordinator(DataUpdateCoordinator):
     """Coordinator to fetch Amber electricity price data."""
 
+    _FORECAST_5MIN_TTL = timedelta(minutes=4, seconds=30)
+    _FORECAST_30MIN_TTL = timedelta(minutes=30)
+
     def __init__(
         self,
         hass: HomeAssistant,
@@ -778,6 +814,10 @@ class AmberPriceCoordinator(DataUpdateCoordinator):
         self.site_id = site_id
         self.session = async_get_clientsession(hass)
         self.ws_client = ws_client  # WebSocket client for real-time prices
+        self._forecast_5min_cache: list[dict[str, Any]] | None = None
+        self._forecast_5min_fetched_at: datetime | None = None
+        self._forecast_30min_cache: list[dict[str, Any]] | None = None
+        self._forecast_30min_fetched_at: datetime | None = None
 
         super().__init__(
             hass,
@@ -785,6 +825,60 @@ class AmberPriceCoordinator(DataUpdateCoordinator):
             name=f"{DOMAIN}_amber_prices",
             update_interval=UPDATE_INTERVAL_PRICES,
         )
+
+    async def _fetch_forecast_with_cache(
+        self,
+        *,
+        url: str,
+        headers: dict[str, str],
+        params: dict[str, Any],
+        label: str,
+        ttl: timedelta,
+        cache_attr: str,
+        fetched_at_attr: str,
+    ) -> list[dict[str, Any]]:
+        """Fetch Amber forecast data, reusing cached data within the TTL."""
+        cached = getattr(self, cache_attr)
+        fetched_at = getattr(self, fetched_at_attr)
+        now = dt_util.utcnow()
+
+        if cached is not None and fetched_at is not None and now - fetched_at < ttl:
+            age_seconds = (now - fetched_at).total_seconds()
+            _LOGGER.debug(
+                "Using cached Amber %s forecast (age %.0fs, ttl %.0fs)",
+                label,
+                age_seconds,
+                ttl.total_seconds(),
+            )
+            return cached
+
+        try:
+            forecast = await _fetch_with_retry(
+                self.session,
+                url,
+                headers,
+                params=params,
+                max_retries=2,
+                timeout_seconds=30,
+            )
+        except UpdateFailed:
+            if cached is not None:
+                age_minutes = (
+                    (now - fetched_at).total_seconds() / 60
+                    if fetched_at is not None
+                    else -1
+                )
+                _LOGGER.warning(
+                    "Amber %s forecast refresh failed; using cached data (age %.1fm)",
+                    label,
+                    age_minutes,
+                )
+                return cached
+            raise
+
+        setattr(self, cache_attr, forecast or [])
+        setattr(self, fetched_at_attr, now)
+        return forecast or []
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from Amber API with WebSocket-first approach."""
@@ -836,24 +930,26 @@ class AmberPriceCoordinator(DataUpdateCoordinator):
             #    not /prices (which is date-range based and ignores `next`).
 
             # Step 1: Get 5-min resolution data for current period spike detection
-            forecast_5min = await _fetch_with_retry(
-                self.session,
-                f"{AMBER_API_BASE_URL}/sites/{self.site_id}/prices",
-                headers,
+            forecast_5min = await self._fetch_forecast_with_cache(
+                url=f"{AMBER_API_BASE_URL}/sites/{self.site_id}/prices",
+                headers=headers,
                 params={"resolution": 5},
-                max_retries=2,
-                timeout_seconds=30,
+                label="5-minute",
+                ttl=self._FORECAST_5MIN_TTL,
+                cache_attr="_forecast_5min_cache",
+                fetched_at_attr="_forecast_5min_fetched_at",
             )
 
             # Step 2: Get 30-min forecast via /prices/current (supports `next`)
             # Request 288 intervals (144h) — API returns whatever AEMO has (~40h)
-            forecast_30min = await _fetch_with_retry(
-                self.session,
-                f"{AMBER_API_BASE_URL}/sites/{self.site_id}/prices/current",
-                headers,
+            forecast_30min = await self._fetch_forecast_with_cache(
+                url=f"{AMBER_API_BASE_URL}/sites/{self.site_id}/prices/current",
+                headers=headers,
                 params={"next": 288, "resolution": 30},
-                max_retries=2,
-                timeout_seconds=30,
+                label="30-minute",
+                ttl=self._FORECAST_30MIN_TTL,
+                cache_attr="_forecast_30min_cache",
+                fetched_at_attr="_forecast_30min_fetched_at",
             )
 
             return {
@@ -1474,6 +1570,7 @@ class TeslaEnergyCoordinator(DataUpdateCoordinator):
         api_provider: str = TESLA_PROVIDER_TESLEMETRY,
         token_getter: callable = None,
         entry_id: str = "",
+        fleet_base_url: str | None = None,
     ) -> None:
         """Initialize the coordinator.
 
@@ -1485,14 +1582,17 @@ class TeslaEnergyCoordinator(DataUpdateCoordinator):
             token_getter: Optional callable that returns (token, provider) tuple.
                           If provided, this is called before each request to get fresh token.
             entry_id: Config entry ID for price lookups
+            fleet_base_url: Regional Fleet API base URL override (EU/AP users).
+                            Stored in entry.data[CONF_FLEET_API_BASE_URL].
         """
         self.site_id = site_id
         self._api_token = api_token  # Fallback token
         self._token_getter = token_getter  # Callable to get fresh token
         self.api_provider = api_provider
         self._entry_id = entry_id
+        self._fleet_base_url = fleet_base_url  # Per-entry regional URL override
         self.session = async_get_clientsession(hass)
-        self._site_info_cache = None  # Cache site_info (refreshed every 6 hours)
+        self._site_info_cache = None  # Cache site_info (normally refreshed every 6 hours)
         self._site_info_last_fetch: float = 0  # Timestamp of last successful fetch
         self._site_info_fetch_failed = False  # Negative cache to avoid retrying on every sync cycle
         self._energy_acc = EnergyAccumulator(hass, "tesla")
@@ -1520,13 +1620,24 @@ class TeslaEnergyCoordinator(DataUpdateCoordinator):
         self._outage_start: float = 0  # monotonic timestamp
         self._last_outage_notification: float = 0  # monotonic timestamp (cooldown)
 
+        # Lifetime energy totals (refreshed hourly from calendar_history period=lifetime)
+        self._lifetime_totals: dict[str, float] | None = None
+        self._lifetime_last_fetch: float = 0
+        self._lifetime_fetch_failed: bool = False
+        self._lifetime_totals_restored: bool = False
+        self._lifetime_totals_store = Store(
+            hass,
+            LIFETIME_TOTALS_STORE_VERSION,
+            f"power_sync.lifetime_totals.{entry_id or site_id}",
+        )
+
         # Determine API base URL based on provider
         if api_provider == TESLA_PROVIDER_POWERSYNC:
             self.api_base_url = POWERSYNC_API_BASE_URL
             _LOGGER.info(f"TeslaEnergyCoordinator initialized with PowerSync.cc proxy for site {site_id}")
         elif api_provider == TESLA_PROVIDER_FLEET_API:
-            self.api_base_url = FLEET_API_BASE_URL
-            _LOGGER.info(f"TeslaEnergyCoordinator initialized with Fleet API for site {site_id}")
+            self.api_base_url = fleet_base_url or FLEET_API_BASE_URL
+            _LOGGER.info(f"TeslaEnergyCoordinator initialized with Fleet API for site {site_id} (base: {self.api_base_url})")
         else:
             self.api_base_url = TESLEMETRY_API_BASE_URL
             _LOGGER.info(f"TeslaEnergyCoordinator initialized with Teslemetry for site {site_id}")
@@ -1555,7 +1666,7 @@ class TeslaEnergyCoordinator(DataUpdateCoordinator):
                         if provider == TESLA_PROVIDER_POWERSYNC:
                             self.api_base_url = POWERSYNC_API_BASE_URL
                         elif provider == TESLA_PROVIDER_FLEET_API:
-                            self.api_base_url = FLEET_API_BASE_URL
+                            self.api_base_url = self._fleet_base_url or FLEET_API_BASE_URL
                         else:
                             self.api_base_url = TESLEMETRY_API_BASE_URL
                         _LOGGER.debug("Token provider changed to %s", provider)
@@ -1568,10 +1679,76 @@ class TeslaEnergyCoordinator(DataUpdateCoordinator):
                 return None
         return self._api_token
 
+    def _coerce_lifetime_totals(self, data: Any) -> dict[str, float]:
+        """Extract persisted lifetime totals as floats."""
+        if not isinstance(data, dict):
+            return {}
+        totals: dict[str, float] = {}
+        for key in LIFETIME_TOTAL_KEYS:
+            value = data.get(key)
+            if value is None:
+                continue
+            try:
+                totals[key] = float(value)
+            except (TypeError, ValueError):
+                continue
+        return totals
+
+    def _clamp_lifetime_totals(self, totals: dict[str, float]) -> dict[str, float]:
+        """Keep lifetime counters monotonic for total_increasing sensors."""
+        previous = self._lifetime_totals or {}
+        if not previous:
+            return totals
+
+        clamped = dict(totals)
+        for key, value in totals.items():
+            previous_value = previous.get(key)
+            if previous_value is None or value >= previous_value:
+                continue
+            clamped[key] = previous_value
+            _LOGGER.debug(
+                "Keeping %s monotonic: Tesla reported %.3f kWh after %.3f kWh",
+                key,
+                value,
+                previous_value,
+            )
+        return clamped
+
+    async def async_restore_lifetime_totals(self) -> None:
+        """Restore persisted lifetime totals before the first coordinator state."""
+        if self._lifetime_totals_restored:
+            return
+        self._lifetime_totals_restored = True
+
+        if not hasattr(self._lifetime_totals_store, "async_load"):
+            return
+        try:
+            data = await self._lifetime_totals_store.async_load()
+        except Exception as err:
+            _LOGGER.warning("Failed to load persisted lifetime totals: %s", err)
+            return
+
+        totals = self._coerce_lifetime_totals(data)
+        if not totals:
+            return
+
+        self._lifetime_totals = totals
+        _LOGGER.info("Restored Tesla lifetime totals from storage")
+
+    async def async_flush_lifetime_totals(self) -> None:
+        """Persist lifetime totals so recorder-safe maxima survive restarts."""
+        if not self._lifetime_totals or not hasattr(self._lifetime_totals_store, "async_save"):
+            return
+        await self._lifetime_totals_store.async_save(
+            {key: round(value, 3) for key, value in self._lifetime_totals.items()}
+        )
+
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from Tesla API (Teslemetry or Fleet API)."""
         if not self._energy_acc._last_update:
             await self._energy_acc.async_restore()
+        if not self._lifetime_totals_restored:
+            await self.async_restore_lifetime_totals()
 
         current_token = self._get_current_token()
         if not current_token:
@@ -1643,7 +1820,9 @@ class TeslaEnergyCoordinator(DataUpdateCoordinator):
             self._energy_acc.update(max(0, solar_kw), grid_kw, battery_kw, load_kw, buy, sell)
 
             # Fetch site_info periodically to detect firmware updates (every 6 hours)
-            _site_info_stale = (time.monotonic() - self._site_info_last_fetch) > 21600
+            _site_info_stale = (
+                time.monotonic() - self._site_info_last_fetch
+            ) > TESLA_SITE_INFO_CACHE_TTL_SECONDS
             if _site_info_stale and not self._site_info_fetch_failed:
                 try:
                     await self.async_get_site_info()
@@ -1696,6 +1875,62 @@ class TeslaEnergyCoordinator(DataUpdateCoordinator):
                 nameplate_w = self._site_info_cache.get("nameplate_power")
             nameplate_kw = round(nameplate_w / 1000.0, 2) if nameplate_w else None
 
+            # Total pack energy (nameplate Wh) and energy_left (stored Wh) come
+            # from live_status, not site_info — that was the v2.12.236 bug that
+            # left these sensors stuck at "Unknown". site_info exposes
+            # nameplate_power but NOT pack capacity, so we fall back to
+            # battery_count × per-unit nameplate when live_status omits it.
+            total_pack_kwh: float | None = None
+            tpe_w = live_status.get("total_pack_energy")
+            if tpe_w is not None:
+                try:
+                    total_pack_kwh = round(float(tpe_w) / 1000.0, 2)
+                except (TypeError, ValueError):
+                    total_pack_kwh = None
+            if total_pack_kwh is None and self._site_info_cache:
+                # Fallback: derive from battery_count × per-unit nameplate.
+                # PW2 = 13.5 kWh, PW3 = 13.5 kWh; the battery_count field is
+                # reliably present even when total_pack_energy isn't.
+                count = (
+                    (self._site_info_cache.get("components") or {}).get("battery_count")
+                    or self._site_info_cache.get("battery_count")
+                )
+                if count:
+                    try:
+                        total_pack_kwh = round(int(count) * 13.5, 2)
+                    except (TypeError, ValueError):
+                        pass
+
+            soc_pct = live_status.get("percentage_charged", 0) or 0
+            energy_left_kwh: float | None = None
+            el_w = live_status.get("energy_left")
+            if el_w is not None:
+                try:
+                    energy_left_kwh = round(float(el_w) / 1000.0, 2)
+                except (TypeError, ValueError):
+                    energy_left_kwh = None
+            if energy_left_kwh is None and total_pack_kwh is not None:
+                energy_left_kwh = round(total_pack_kwh * (soc_pct / 100.0), 2)
+
+            # Backup time remaining (hours): stored kWh / current home load.
+            # Caps at 999 to keep the UI sane when load drops near zero.
+            backup_hours: float | None = None
+            if energy_left_kwh is not None and load_kw and load_kw > 0.05:
+                backup_hours = round(min(999.0, energy_left_kwh / load_kw), 1)
+
+            # Grid services / VPP — present in live_status when site is enrolled.
+            # When the site has no VPP the field is typically absent or 0;
+            # default the power reading to 0 so the sensor reads a real value
+            # ("0 W") rather than "Unknown" — much more useful for graphs.
+            grid_services_active = bool(live_status.get("grid_services_active", False))
+            grid_services_power_kw: float = 0.0
+            gsp = live_status.get("grid_services_power")
+            if gsp is not None:
+                try:
+                    grid_services_power_kw = round(float(gsp) / 1000.0, 3)
+                except (TypeError, ValueError):
+                    grid_services_power_kw = 0.0
+
             energy_data = {
                 "solar_power": solar_kw,
                 "grid_power": grid_kw,
@@ -1712,7 +1947,23 @@ class TeslaEnergyCoordinator(DataUpdateCoordinator):
                 "battery_max_discharge_power": nameplate_kw,
                 "battery_max_charge_power_w": nameplate_w,
                 "battery_max_discharge_power_w": nameplate_w,
+                # Powerwall extended fields
+                "total_pack_energy_kwh": total_pack_kwh,
+                "energy_left_kwh": energy_left_kwh,
+                "backup_time_remaining_hours": backup_hours,
+                "grid_services_active": grid_services_active,
+                "grid_services_power_kw": grid_services_power_kw,
+                "lifetime_totals": self._lifetime_totals,
             }
+
+            # Refresh lifetime totals once per hour (best-effort, never fails the poll)
+            _lifetime_stale = (time.monotonic() - self._lifetime_last_fetch) > 3600
+            if _lifetime_stale and not self._lifetime_fetch_failed:
+                try:
+                    await self.async_refresh_lifetime_totals()
+                    energy_data["lifetime_totals"] = self._lifetime_totals
+                except Exception as err:
+                    _LOGGER.debug("Lifetime totals refresh failed: %s", err)
 
             # Tesla API recovered — send recovery notification if we were in outage
             if self._outage_notified:
@@ -1778,7 +2029,10 @@ class TeslaEnergyCoordinator(DataUpdateCoordinator):
                 raise
             raise UpdateFailed(f"Unexpected error fetching Tesla energy data: {err}") from err
 
-    async def async_get_site_info(self) -> dict[str, Any] | None:
+    async def async_get_site_info(
+        self,
+        max_age: float | None = None,
+    ) -> dict[str, Any] | None:
         """
         Fetch site_info from Tesla API (Teslemetry or Fleet API).
 
@@ -1788,8 +2042,17 @@ class TeslaEnergyCoordinator(DataUpdateCoordinator):
         Returns:
             Site info dict containing installation_time_zone, or None if fetch fails
         """
-        # Return cached value if still fresh (< 6 hours old)
-        if self._site_info_cache and (time.monotonic() - self._site_info_last_fetch) <= 21600:
+        cache_ttl = (
+            TESLA_SITE_INFO_CACHE_TTL_SECONDS
+            if max_age is None
+            else max(0, float(max_age))
+        )
+
+        # Return cached value if still fresh.
+        if (
+            self._site_info_cache
+            and (time.monotonic() - self._site_info_last_fetch) <= cache_ttl
+        ):
             _LOGGER.debug("Returning cached site_info")
             return self._site_info_cache
 
@@ -1926,13 +2189,10 @@ class TeslaEnergyCoordinator(DataUpdateCoordinator):
         up to six hours until the next natural refresh.
         """
         # Clear the cached payload itself, not just the timestamp.
-        # async_get_site_info() checks `if self._site_info_cache and age
-        # <= 21600` — resetting _site_info_last_fetch to 0 only invalidates
-        # via the age check when time.monotonic() > 21600, i.e. after HA
-        # has been running 6+ hours. On shorter uptimes the age check
-        # still passes (time.monotonic() - 0 is small), and the stale
-        # _site_info_cache is returned anyway. Clearing _site_info_cache
-        # makes the first half of the `and` fail unconditionally.
+        # async_get_site_info() returns cached data while it is inside the
+        # caller's max_age window. Resetting only _site_info_last_fetch can
+        # still leave a shorter-uptime HA instance inside that window, so clear
+        # the cached payload itself to force the next call to refetch.
         self._site_info_cache = None
         self._site_info_last_fetch = 0
         self._site_info_fetch_failed = False
@@ -2436,6 +2696,47 @@ class TeslaEnergyCoordinator(DataUpdateCoordinator):
             _LOGGER.error(f"Error fetching calendar history: {err}")
             return None
 
+    async def async_refresh_lifetime_totals(self) -> dict[str, float] | None:
+        """Sum calendar_history period=lifetime into a small dict of kWh totals.
+
+        Tesla returns Wh per bucket (yearly bins from install date). Result is
+        cached in ``self._lifetime_totals`` so sensors return the last good value
+        between refreshes; on permanent failure (e.g. unsupported endpoint),
+        ``_lifetime_fetch_failed`` short-circuits subsequent calls.
+        """
+        history = await self.async_get_calendar_history(period="lifetime")
+        if not history:
+            return self._lifetime_totals
+
+        totals = {key: 0.0 for key in LIFETIME_TOTAL_KEYS}
+        for ts in history.get("time_series", []) or []:
+            totals["lifetime_solar_kwh"] += (ts.get("solar_energy_exported") or 0)
+            totals["lifetime_grid_import_kwh"] += (ts.get("grid_energy_imported") or 0)
+            totals["lifetime_grid_export_kwh"] += (
+                (ts.get("grid_energy_exported_from_solar") or 0)
+                + (ts.get("grid_energy_exported_from_battery") or 0)
+            )
+            totals["lifetime_battery_charged_kwh"] += (
+                (ts.get("battery_energy_imported_from_grid") or 0)
+                + (ts.get("battery_energy_imported_from_solar") or 0)
+            )
+            totals["lifetime_battery_discharged_kwh"] += (ts.get("battery_energy_exported") or 0)
+            totals["lifetime_home_kwh"] += (
+                (ts.get("consumer_energy_imported_from_grid") or 0)
+                + (ts.get("consumer_energy_imported_from_solar") or 0)
+                + (ts.get("consumer_energy_imported_from_battery") or 0)
+            )
+
+        # Tesla returns Wh; convert to kWh
+        for k in totals:
+            totals[k] = round(totals[k] / 1000.0, 3)
+
+        totals = self._clamp_lifetime_totals(totals)
+        self._lifetime_totals = totals
+        self._lifetime_last_fetch = time.monotonic()
+        await self.async_flush_lifetime_totals()
+        return totals
+
 
 class DemandChargeCoordinator(DataUpdateCoordinator):
     """Coordinator to track demand charges."""
@@ -2725,11 +3026,19 @@ class AEMOPriceCoordinator(DataUpdateCoordinator):
         now = datetime.now()
         secs = (self._next_boundary - now).total_seconds()
 
+        # Mode-transition logs are demoted to DEBUG: each one fires once per
+        # 5-min period and the wording ("ACTIVE mode (1 s intervals) -
+        # searching for new dispatch file") read as alarming to users with
+        # debug logging enabled even though the underlying poll is just a
+        # cheap directory listing on AEMO's public NEMWEB. The actual
+        # dispatch arrival is still logged at INFO ("AEMO: New dispatch -
+        # next boundary X" / "NEMWEB dispatch: ... -> N regions") which is
+        # the line that matters for users debugging tariff sync.
         if secs > self._PRE_ACTIVE_WINDOW:
             # WAIT mode - too early to expect a new file
             if self._polling_mode != "wait":
                 self._polling_mode = "wait"
-                _LOGGER.info(
+                _LOGGER.debug(
                     "AEMO: WAIT mode - next boundary %s in %ds",
                     self._next_boundary.strftime("%H:%M:%S"),
                     int(secs),
@@ -2741,14 +3050,14 @@ class AEMOPriceCoordinator(DataUpdateCoordinator):
             # PRE-ACTIVE mode - gently start checking
             if self._polling_mode != "pre-active":
                 self._polling_mode = "pre-active"
-                _LOGGER.info("AEMO: PRE-ACTIVE mode (5 s intervals)")
+                _LOGGER.debug("AEMO: PRE-ACTIVE mode (5 s intervals)")
             self.update_interval = timedelta(seconds=self._PRE_ACTIVE_INTERVAL)
             return True
 
         # ACTIVE mode - new file could appear any second
         if self._polling_mode != "active":
             self._polling_mode = "active"
-            _LOGGER.info("AEMO: ACTIVE mode (1 s intervals) - searching for new dispatch file")
+            _LOGGER.debug("AEMO: ACTIVE mode (1 s intervals)")
         self.update_interval = timedelta(seconds=self._ACTIVE_INTERVAL)
         return True
 
@@ -2860,6 +3169,15 @@ class AEMOPriceCoordinator(DataUpdateCoordinator):
                 _LOGGER.info(
                     "AEMO API data for %s: current=%.2fc/kWh (%s), forecast_periods=%d",
                     self.region, current_price_cents, price_source, len(forecast) // 2
+                )
+                async_dispatcher_send(
+                    self.hass,
+                    SIGNAL_AEMO_NEW_DISPATCH,
+                    {
+                        "region": self.region,
+                        "file": dispatch_file,
+                        "price_cents": current_price_cents,
+                    },
                 )
 
             return {
@@ -4775,7 +5093,7 @@ class SolaxBatteryEnergyCoordinator(DataUpdateCoordinator):
         buy, sell = _get_current_prices(self.hass, self._entry_id)
         self._energy_acc.update(max(0.0, solar_kw), grid_kw, battery_kw, load_kw, buy, sell)
 
-        result = {
+        return {
             "solar_power": solar_kw,
             "grid_power": grid_kw,
             "battery_power": battery_kw,
@@ -4783,9 +5101,8 @@ class SolaxBatteryEnergyCoordinator(DataUpdateCoordinator):
             "battery_level": soc,
             "battery_temperature": status.get("battery_temperature"),
             "mode": status.get("mode"),
+            "energy_summary": self._energy_acc.as_dict(),
         }
-        result.update(self._energy_acc.totals())
-        return result
 
     async def force_charge(self, duration_minutes: int, power_w: int) -> bool:
         return await self._controller.force_charge(duration_minutes, power_w)
@@ -4821,6 +5138,8 @@ class SajH2EnergyCoordinator(DataUpdateCoordinator):
         saj_entry_id: str,
         battery_capacity_kwh: float = 10.0,
         entry_id: str = "",
+        min_soc_pct: float = 5.0,
+        inverter_rated_kw: float = 10.0,
     ) -> None:
         from .inverters.saj_h2 import SajH2BatteryController
 
@@ -4829,6 +5148,8 @@ class SajH2EnergyCoordinator(DataUpdateCoordinator):
             hass,
             saj_entry_id=saj_entry_id,
             battery_capacity_kwh=battery_capacity_kwh,
+            min_soc_pct=min_soc_pct,
+            inverter_rated_kw=inverter_rated_kw,
         )
         self._energy_acc = EnergyAccumulator(hass, "saj_h2")
 
@@ -4839,10 +5160,17 @@ class SajH2EnergyCoordinator(DataUpdateCoordinator):
             update_interval=timedelta(seconds=30),
         )
 
+    def set_min_soc_pct(self, min_soc_pct: float) -> None:
+        """Propagate min_soc updates from the optimizer's backup_reserve setting."""
+        self._controller.set_min_soc_pct(min_soc_pct)
+
     async def _async_update_data(self) -> dict[str, Any]:
         """Return SAJ data assembled from HA entity states."""
         if not self._energy_acc._last_update:
             await self._energy_acc.async_restore()
+
+        if not self._controller._entity_map:
+            self._controller._discover_entities()
 
         try:
             status = self._controller.get_status()
@@ -4861,20 +5189,20 @@ class SajH2EnergyCoordinator(DataUpdateCoordinator):
         buy, sell = _get_current_prices(self.hass, self._entry_id)
         self._energy_acc.update(max(0.0, solar_kw), grid_kw, battery_kw, load_kw, buy, sell)
 
-        result = {
+        return {
             "solar_power": solar_kw,
             "grid_power": grid_kw,
             "battery_power": battery_kw,
             "load_power": load_kw,
             "battery_level": soc,
             "battery_temperature": status.get("battery_temperature"),
+            "battery_soh": status.get("battery_soh"),
             "battery_capacity_kwh": status.get("battery_capacity_kwh"),
             "battery_max_charge_power_w": status.get("battery_max_charge_power_w"),
             "battery_max_discharge_power_w": status.get("battery_max_discharge_power_w"),
             "app_mode": status.get("app_mode"),
+            "energy_summary": self._energy_acc.as_dict(),
         }
-        result.update(self._energy_acc.totals())
-        return result
 
     async def force_charge(self, duration_minutes: int, power_w: int) -> bool:
         return await self._controller.force_charge(duration_minutes, power_w)
@@ -4883,6 +5211,14 @@ class SajH2EnergyCoordinator(DataUpdateCoordinator):
         return await self._controller.force_discharge(duration_minutes, power_w)
 
     async def restore_normal(self) -> bool:
+        return await self._controller.restore_normal()
+
+    async def set_backup_mode(self) -> bool:
+        """IDLE hold — lock battery at current SOC, no discharge."""
+        return await self._controller.set_idle()
+
+    async def restore_work_mode_from_idle(self) -> bool:
+        """Exit IDLE — restore full self-consumption."""
         return await self._controller.restore_normal()
 
     async def async_shutdown(self) -> None:
@@ -6134,7 +6470,7 @@ class OctopusPriceCoordinator(DataUpdateCoordinator):
 
         oe_data = self.hass.data.get("octopus_energy")
         if not oe_data or not isinstance(oe_data, dict):
-            return None
+            return self._read_from_octopus_energy_entities()
 
         now = datetime.now(timezone.utc)
         import_rates_raw: list[dict] = []
@@ -6196,7 +6532,22 @@ class OctopusPriceCoordinator(DataUpdateCoordinator):
                     import_tariff = tariff_code
 
         if not import_rates_raw:
-            return None
+            return self._read_from_octopus_energy_entities()
+
+        # Promote BottlecapDave's active tariff/product code so callers (e.g.
+        # the LP optimizer's AGILE/FLUX dynamic-pricing gate) see the live
+        # tariff rather than whatever was set in the config flow.
+        if import_tariff:
+            self.tariff_code = import_tariff
+            # Tariff code format: E-1R-AGILE-24-10-01-A (region letter trailing).
+            # Derive product_code by stripping the leading E-{1R|2R}- prefix and
+            # the trailing -A region letter, keeping the middle segment.
+            try:
+                parts = import_tariff.split("-")
+                if len(parts) >= 5 and parts[0] == "E":
+                    self.product_code = "-".join(parts[2:-1])
+            except Exception:
+                pass
 
         # Convert octopus_energy rate format to our Amber-compatible format
         current_prices: list[dict] = []
@@ -6217,6 +6568,12 @@ class OctopusPriceCoordinator(DataUpdateCoordinator):
             if isinstance(end, str):
                 end = datetime.fromisoformat(end.replace("Z", "+00:00"))
 
+            # Duration in minutes — BottlecapDave usually emits 30-min slots,
+            # but block tariffs (Go/Cosy off-peak windows) can come through
+            # as wider intervals. Compute from timestamps so downstream LP
+            # expansion sees the correct slot count.
+            duration_min = max(1, int((end - start).total_seconds() // 60))
+
             if start <= now < end:
                 interval_type = "CurrentInterval"
             elif end <= now:
@@ -6229,7 +6586,7 @@ class OctopusPriceCoordinator(DataUpdateCoordinator):
                 "perKwh": price_pence,  # pence/kWh maps to cents
                 "channelType": "general",
                 "type": interval_type,
-                "duration": 30,
+                "duration": duration_min,
                 "valid_from": start.isoformat(),
                 "valid_to": end.isoformat(),
             }
@@ -6251,6 +6608,8 @@ class OctopusPriceCoordinator(DataUpdateCoordinator):
             if isinstance(end, str):
                 end = datetime.fromisoformat(end.replace("Z", "+00:00"))
 
+            duration_min = max(1, int((end - start).total_seconds() // 60))
+
             if start <= now < end:
                 interval_type = "CurrentInterval"
             elif end <= now:
@@ -6263,7 +6622,7 @@ class OctopusPriceCoordinator(DataUpdateCoordinator):
                 "perKwh": -price_pence,  # Negative = you get paid (Amber convention)
                 "channelType": "feedIn",
                 "type": interval_type,
-                "duration": 30,
+                "duration": duration_min,
                 "valid_from": start.isoformat(),
                 "valid_to": end.isoformat(),
             }
@@ -6271,6 +6630,18 @@ class OctopusPriceCoordinator(DataUpdateCoordinator):
             if interval_type == "CurrentInterval":
                 current_prices.append(amber_entry)
             export_forecast.append(amber_entry)
+
+        if not export_forecast:
+            default_export_pence = 4.1
+            for price in forecast_prices:
+                amber_entry = dict(price)
+                amber_entry["perKwh"] = -default_export_pence
+                amber_entry["channelType"] = "feedIn"
+
+                if amber_entry.get("type") == "CurrentInterval":
+                    current_prices.append(amber_entry)
+                export_forecast.append(amber_entry)
+            export_tariff = export_tariff or "synthetic_seg"
 
         combined_forecast = forecast_prices + export_forecast
 
@@ -6297,12 +6668,221 @@ class OctopusPriceCoordinator(DataUpdateCoordinator):
             export_tariff or "none",
         )
 
+        if not current_prices:
+            entity_data = self._read_from_octopus_energy_entities()
+            if entity_data:
+                return entity_data
+
         return {
             "current": current_prices,
             "forecast": combined_forecast,
             "export_rates": export_forecast,
             "last_update": dt_util.utcnow(),
             "source": "octopus_energy_integration",
+            "product_code": self.product_code,
+            "tariff_code": import_tariff or self.tariff_code,
+            "gsp_region": self.gsp_region,
+        }
+
+    @staticmethod
+    def _parse_octopus_datetime(value: Any) -> datetime | None:
+        if isinstance(value, datetime):
+            dt_value = value
+        elif isinstance(value, str) and value:
+            try:
+                dt_value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        else:
+            return None
+        if dt_value.tzinfo is None:
+            from datetime import timezone
+            dt_value = dt_value.replace(tzinfo=timezone.utc)
+        return dt_value
+
+    @staticmethod
+    def _octopus_rate_to_pence(value: Any) -> float | None:
+        """Normalize BottlecapDave public entity GBP rates or internal pence rates."""
+        try:
+            rate = float(value)
+        except (TypeError, ValueError):
+            return None
+        # Public current_rate entities are GBP/kWh (e.g. 0.245), while internal
+        # coordinator/API rates are p/kWh (e.g. 24.5).
+        return round(rate * 100 if abs(rate) <= 2 else rate, 6)
+
+    def _octopus_state_entries(self, domain: str) -> list[Any]:
+        states = getattr(self.hass, "states", None)
+        if states is None:
+            return []
+        if hasattr(states, "async_all"):
+            return list(states.async_all(domain))
+        if isinstance(states, dict):
+            return [
+                state for entity_id, state in states.items()
+                if str(entity_id).split(".", 1)[0] == domain
+            ]
+        return []
+
+    def _build_octopus_amber_entry(
+        self,
+        start: Any,
+        end: Any,
+        rate_value: Any,
+        channel: str,
+        now: datetime,
+    ) -> dict[str, Any] | None:
+        start_dt = self._parse_octopus_datetime(start)
+        end_dt = self._parse_octopus_datetime(end)
+        rate_pence = self._octopus_rate_to_pence(rate_value)
+        if start_dt is None or end_dt is None or rate_pence is None:
+            return None
+
+        if start_dt <= now < end_dt:
+            interval_type = "CurrentInterval"
+        elif end_dt <= now:
+            interval_type = "ActualInterval"
+        else:
+            interval_type = "ForecastInterval"
+
+        return {
+            "nemTime": end_dt.isoformat(),
+            "perKwh": -rate_pence if channel == "feedIn" else rate_pence,
+            "channelType": channel,
+            "type": interval_type,
+            "duration": max(1, int((end_dt - start_dt).total_seconds() // 60)),
+            "valid_from": start_dt.isoformat(),
+            "valid_to": end_dt.isoformat(),
+        }
+
+    def _read_from_octopus_energy_entities(self) -> dict[str, Any] | None:
+        """Read BottlecapDave's documented public entities as a compatibility fallback."""
+        from datetime import timezone
+
+        now = datetime.now(timezone.utc)
+        current_prices: list[dict[str, Any]] = []
+        import_forecast: list[dict[str, Any]] = []
+        export_forecast: list[dict[str, Any]] = []
+        import_tariff = None
+        export_tariff = None
+
+        for state in self._octopus_state_entries("sensor"):
+            entity_id = getattr(state, "entity_id", "")
+            if (
+                not entity_id.startswith("sensor.octopus_energy_electricity_")
+                or not entity_id.endswith("_current_rate")
+            ):
+                continue
+            if getattr(state, "state", None) in (None, "unknown", "unavailable", ""):
+                continue
+
+            attrs = getattr(state, "attributes", None) or {}
+            is_export = bool(attrs.get("is_export")) or "_export_" in entity_id
+            channel = "feedIn" if is_export else "general"
+            entry = self._build_octopus_amber_entry(
+                attrs.get("start"),
+                attrs.get("end"),
+                getattr(state, "state", None),
+                channel,
+                now,
+            )
+            if not entry:
+                continue
+            if entry["type"] == "CurrentInterval":
+                current_prices.append(entry)
+            if channel == "feedIn":
+                export_forecast.append(entry)
+                export_tariff = attrs.get("tariff") or export_tariff
+            else:
+                import_forecast.append(entry)
+                import_tariff = attrs.get("tariff") or import_tariff
+
+        for state in self._octopus_state_entries("event"):
+            entity_id = getattr(state, "entity_id", "")
+            if (
+                not entity_id.startswith("event.octopus_energy_electricity_")
+                or not (
+                    entity_id.endswith("_current_day_rates")
+                    or entity_id.endswith("_next_day_rates")
+                )
+            ):
+                continue
+
+            attrs = getattr(state, "attributes", None) or {}
+            rates = attrs.get("rates")
+            if not isinstance(rates, list):
+                continue
+            is_export = bool(attrs.get("is_export")) or "_export_" in entity_id
+            channel = "feedIn" if is_export else "general"
+            for rate in rates:
+                if not isinstance(rate, dict):
+                    continue
+                entry = self._build_octopus_amber_entry(
+                    rate.get("start"),
+                    rate.get("end"),
+                    rate.get("value_inc_vat"),
+                    channel,
+                    now,
+                )
+                if not entry:
+                    continue
+                if entry["type"] == "CurrentInterval":
+                    current_prices.append(entry)
+                if channel == "feedIn":
+                    export_forecast.append(entry)
+                    export_tariff = attrs.get("tariff_code") or export_tariff
+                else:
+                    import_forecast.append(entry)
+                    import_tariff = attrs.get("tariff_code") or import_tariff
+
+        if not import_forecast and not any(
+            price.get("channelType") == "general" for price in current_prices
+        ):
+            return None
+
+        if not import_forecast:
+            import_forecast = [
+                price for price in current_prices
+                if price.get("channelType") == "general"
+            ]
+        if not export_forecast:
+            for price in import_forecast:
+                entry = dict(price)
+                entry["perKwh"] = -4.1
+                entry["channelType"] = "feedIn"
+                if entry.get("type") == "CurrentInterval":
+                    current_prices.append(entry)
+                export_forecast.append(entry)
+            export_tariff = export_tariff or "synthetic_seg"
+
+        if not any(price.get("channelType") == "feedIn" for price in current_prices):
+            current_export = next(
+                (price for price in export_forecast if price.get("type") == "CurrentInterval"),
+                None,
+            )
+            if current_export:
+                current_prices.append(current_export)
+
+        combined_forecast = import_forecast + export_forecast
+        if not current_prices:
+            return None
+
+        _LOGGER.info(
+            "🐙 Using octopus_energy public entity data: periods=%d (import=%d, export=%d), "
+            "import_tariff=%s, export_tariff=%s",
+            len(combined_forecast),
+            len(import_forecast),
+            len(export_forecast),
+            import_tariff or "unknown",
+            export_tariff or "none",
+        )
+
+        return {
+            "current": current_prices,
+            "forecast": combined_forecast,
+            "export_rates": export_forecast,
+            "last_update": dt_util.utcnow(),
+            "source": "octopus_energy_entities",
             "product_code": self.product_code,
             "tariff_code": import_tariff or self.tariff_code,
             "gsp_region": self.gsp_region,

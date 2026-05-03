@@ -10,11 +10,11 @@
   [![hacs_badge](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/custom-components/hacs)
 
   <a href="https://testflight.apple.com/join/FhnUtSFy"><img src="https://img.shields.io/badge/iOS-TestFlight-blue?logo=apple&logoColor=white" alt="iOS TestFlight"></a>
-  <a href="https://play.google.com/apps/testing/com.powersync.mobile"><img src="https://img.shields.io/badge/Android-Beta-3DDC84?logo=android&logoColor=white" alt="Android Beta"></a>
+  <a href="https://play.google.com/store/apps/details?id=com.powersync.mobile"><img src="https://img.shields.io/badge/Android-Google%20Play-3DDC84?logo=android&logoColor=white" alt="Android Google Play"></a>
 
 </div>
 
-> **Disclaimer:** This is an unofficial integration and is not affiliated with or endorsed by Tesla, Sigenergy, Sungrow, FoxESS, GoodWe, AlphaESS, ESY Sunhome, Solax, Amber Electric, Localvolts, Octopus Energy, or EPEX/ENTSO-E. Use at your own risk.
+> **Disclaimer:** This is an unofficial integration and is not affiliated with or endorsed by Tesla, Sigenergy, Sungrow, FoxESS, GoodWe, AlphaESS, ESY Sunhome, Solax, SAJ, Amber Electric, Localvolts, Flow Power, GloBird, Octopus Energy, EPEX/ENTSO-E, or AEMO. Use at your own risk.
 
 > [!WARNING]
 > **The built-in optimizer is actively under development.** You should expect occasional bugs and schedules that don't behave as expected — particularly on unusual tariffs, battery configurations, or edge cases. If you see something odd, please report it on [Discord](https://discord.gg/eaWDWxEWE3) or open a [GitHub issue](https://github.com/bolagnaise/PowerSync/issues) with your tariff details and the action plan it generated.
@@ -35,6 +35,7 @@
 | **Sungrow SH-series** | Modbus TCP | Force charge/discharge, rate limiting, export control, dual inverter |
 | **AlphaESS** (SMILE5, SMILE-Hi5/Hi10, SMILE-B3, SMILE-T10, SMILE-G3, Storion-T30) | Modbus TCP + optional Cloud API | Force charge/discharge, dispatch SOC targeting, DC solar curtailment |
 | **ESY Sunhome** (HM series) | Via [ESY Sunhome](https://github.com/branko-lazarevic/esysunhome) companion integration (HACS) | LP optimizer, AEMO spike export, Saving Sessions (mode-only control) |
+| **SAJ H2 / HS2** | Via [SAJ H2 Modbus](https://github.com/stanus74/home-assistant-saj-h2-modbus) companion integration (HACS) | LP optimizer, force charge/discharge, AEMO spike export (no backup reserve write) |
 
 ### AC-Coupled Inverter Curtailment
 
@@ -88,7 +89,7 @@ Solar inverters that bypass the battery can be curtailed during negative feed-in
 
 - Home Assistant with [HACS](https://hacs.xyz/) installed
 - A supported battery system with network access
-- Electricity provider API credentials (Amber requires a token; others are automatic)
+- Electricity provider credentials where required: Amber API token, Localvolts API key + Partner ID, and optional credentials for Flow Power portal or Octopus Saving Sessions
 
 ### Steps
 
@@ -108,12 +109,12 @@ Or manually:
 
 | Feature | Description | Wiki |
 |---------|-------------|------|
-| **Battery System Setup** | Tesla, FoxESS, Sigenergy, GoodWe, Sungrow, AlphaESS, ESY Sunhome, Solax Hybrid connection guides | [Setup Guide](https://github.com/bolagnaise/PowerSync/wiki/Battery-System-Setup) |
+| **Battery System Setup** | Tesla, FoxESS, Sigenergy, GoodWe, Sungrow, AlphaESS, ESY Sunhome, Solax Hybrid, SAJ H2/HS2 connection guides | [Setup Guide](https://github.com/bolagnaise/PowerSync/wiki/Battery-System-Setup) |
 | **Smart Optimization** | Built-in LP optimizer calculates optimal charge/discharge schedule using prices, solar, and load. **Solar forecasting (Solcast) must be configured for accurate scheduling.** | [Details](https://github.com/bolagnaise/PowerSync/wiki/Smart-Optimization) |
 | **EV Smart Charging** | Coordinate EV charging with battery optimization — Solar, Cheapest, Deadline modes | [Details](https://github.com/bolagnaise/PowerSync/wiki/EV-Smart-Charging) |
 | **Advanced Features** | AEMO spike detection, solar curtailment, spike protection, export boost, **off-grid control** | [Details](https://github.com/bolagnaise/PowerSync/wiki/Advanced-Features) |
 | **Sensors** | Core power sensors, daily energy tracking, FoxESS Modbus sensors, optimizer status | [Full List](https://github.com/bolagnaise/PowerSync/wiki/Sensors) |
-| **Services** | Force charge/discharge, TOU sync, backup reserve, inverter curtailment, **off-grid/reconnect** | [Reference](https://github.com/bolagnaise/PowerSync/wiki/Services-Reference) |
+| **Services** | Force charge/discharge, hold SOC, TOU sync, backup reserve, inverter curtailment, **off-grid/reconnect** | [Reference](https://github.com/bolagnaise/PowerSync/wiki/Services-Reference) |
 | **Troubleshooting** | Connection issues, debug logging, common fixes | [Guide](https://github.com/bolagnaise/PowerSync/wiki/Troubleshooting) |
 
 ---
@@ -122,7 +123,7 @@ Or manually:
 
 Remote monitoring and control via iOS and Android.
 
-**iOS:** [Join TestFlight](https://testflight.apple.com/join/FhnUtSFy) | **Android:** [Join Beta](https://play.google.com/apps/testing/com.powersync.mobile) (join [testers group](https://groups.google.com/g/powersync-testers) first)
+**iOS:** [Join TestFlight](https://testflight.apple.com/join/FhnUtSFy) | **Android:** [Google Play](https://play.google.com/store/apps/details?id=com.powersync.mobile)
 
 ### Setup
 
@@ -155,7 +156,7 @@ Remote monitoring and control via iOS and Android.
 
 ## Sponsors
 
-<!-- sponsors --><a href="https://github.com/barry-heap"><img src="https:&#x2F;&#x2F;github.com&#x2F;barry-heap.png" width="60px" alt="User avatar: " /></a><a href="https://github.com/richardkeit"><img src="https:&#x2F;&#x2F;github.com&#x2F;richardkeit.png" width="60px" alt="User avatar: Richard Keit" /></a><a href="https://github.com/drsamking86-coder"><img src="https:&#x2F;&#x2F;github.com&#x2F;drsamking86-coder.png" width="60px" alt="User avatar: " /></a><a href="https://github.com/JoelyMoley"><img src="https:&#x2F;&#x2F;github.com&#x2F;JoelyMoley.png" width="60px" alt="User avatar: " /></a><a href="https://github.com/sgdodds"><img src="https:&#x2F;&#x2F;github.com&#x2F;sgdodds.png" width="60px" alt="User avatar: " /></a><a href="https://github.com/philsweetnam"><img src="https:&#x2F;&#x2F;github.com&#x2F;philsweetnam.png" width="60px" alt="User avatar: PhilS" /></a><a href="https://github.com/Barbars11"><img src="https:&#x2F;&#x2F;github.com&#x2F;Barbars11.png" width="60px" alt="User avatar: " /></a><a href="https://github.com/Teslemetry"><img src="https:&#x2F;&#x2F;github.com&#x2F;Teslemetry.png" width="60px" alt="User avatar: Teslemetry.com" /></a><a href="https://github.com/zhenya-y"><img src="https:&#x2F;&#x2F;github.com&#x2F;zhenya-y.png" width="60px" alt="User avatar: " /></a><a href="https://github.com/tmorrison89"><img src="https:&#x2F;&#x2F;github.com&#x2F;tmorrison89.png" width="60px" alt="User avatar: " /></a><a href="https://github.com/Elmojnr21"><img src="https:&#x2F;&#x2F;github.com&#x2F;Elmojnr21.png" width="60px" alt="User avatar: Emerson Connors" /></a><a href="https://github.com/rpcai"><img src="https:&#x2F;&#x2F;github.com&#x2F;rpcai.png" width="60px" alt="User avatar: " /></a><a href="https://github.com/Artic0din"><img src="https:&#x2F;&#x2F;github.com&#x2F;Artic0din.png" width="60px" alt="User avatar: Artic0din" /></a><a href="https://github.com/coolscotty"><img src="https:&#x2F;&#x2F;github.com&#x2F;coolscotty.png" width="60px" alt="User avatar: Scott Cassidy" /></a><a href="https://github.com/maxkalcic-arch"><img src="https:&#x2F;&#x2F;github.com&#x2F;maxkalcic-arch.png" width="60px" alt="User avatar: " /></a><!-- sponsors -->
+<!-- sponsors --><a href="https://github.com/barry-heap"><img src="https:&#x2F;&#x2F;github.com&#x2F;barry-heap.png" width="60px" alt="User avatar: " /></a><a href="https://github.com/richardkeit"><img src="https:&#x2F;&#x2F;github.com&#x2F;richardkeit.png" width="60px" alt="User avatar: Richard Keit" /></a><a href="https://github.com/drsamking86-coder"><img src="https:&#x2F;&#x2F;github.com&#x2F;drsamking86-coder.png" width="60px" alt="User avatar: " /></a><a href="https://github.com/JoelyMoley"><img src="https:&#x2F;&#x2F;github.com&#x2F;JoelyMoley.png" width="60px" alt="User avatar: " /></a><a href="https://github.com/sgdodds"><img src="https:&#x2F;&#x2F;github.com&#x2F;sgdodds.png" width="60px" alt="User avatar: " /></a><a href="https://github.com/philsweetnam"><img src="https:&#x2F;&#x2F;github.com&#x2F;philsweetnam.png" width="60px" alt="User avatar: PhilS" /></a><a href="https://github.com/Barbars11"><img src="https:&#x2F;&#x2F;github.com&#x2F;Barbars11.png" width="60px" alt="User avatar: " /></a><a href="https://github.com/Teslemetry"><img src="https:&#x2F;&#x2F;github.com&#x2F;Teslemetry.png" width="60px" alt="User avatar: Teslemetry.com" /></a><a href="https://github.com/zhenya-y"><img src="https:&#x2F;&#x2F;github.com&#x2F;zhenya-y.png" width="60px" alt="User avatar: " /></a><a href="https://github.com/tmorrison89"><img src="https:&#x2F;&#x2F;github.com&#x2F;tmorrison89.png" width="60px" alt="User avatar: " /></a><a href="https://github.com/Elmojnr21"><img src="https:&#x2F;&#x2F;github.com&#x2F;Elmojnr21.png" width="60px" alt="User avatar: Emerson Connors" /></a><a href="https://github.com/rpcai"><img src="https:&#x2F;&#x2F;github.com&#x2F;rpcai.png" width="60px" alt="User avatar: " /></a><a href="https://github.com/Artic0din"><img src="https:&#x2F;&#x2F;github.com&#x2F;Artic0din.png" width="60px" alt="User avatar: Artic0din" /></a><a href="https://github.com/coolscotty"><img src="https:&#x2F;&#x2F;github.com&#x2F;coolscotty.png" width="60px" alt="User avatar: Scott Cassidy" /></a><a href="https://github.com/maxkalcic-arch"><img src="https:&#x2F;&#x2F;github.com&#x2F;maxkalcic-arch.png" width="60px" alt="User avatar: " /></a><a href="https://github.com/greiginsydney"><img src="https:&#x2F;&#x2F;github.com&#x2F;greiginsydney.png" width="60px" alt="User avatar: Greig Sheridan" /></a><!-- sponsors -->
 
 ## Support
 

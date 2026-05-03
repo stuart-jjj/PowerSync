@@ -35,13 +35,28 @@ _LOGGER = logging.getLogger(__name__)
 # variants, and older firmware/plugin combinations may still surface
 # `manual_mode` rather than `manual_mode_select`.
 _READ_ENTITIES = {
-    "battery_level": ("battery_capacity",),            # %
-    "battery_power_raw": ("battery_power_charge",),    # W, +charge/-discharge
+    "battery_level": ("battery_capacity", "battery_1_capacity"),  # %
+    "battery_power_raw": (
+        "battery_power_charge",
+        "total_battery_power_charge",
+        "battery_1_power_charge",
+        "energy_dashboard_solax_battery_power",
+    ),                                                  # W, +charge/-discharge
     "grid_power": ("measured_power",),                 # W, +import/-export
     "pv1_power": ("pv_power_1",),                      # W
     "pv2_power": ("pv_power_2",),                      # W
-    "solar_power": ("solar_power", "pv_total_power"),  # W, Energy Dashboard / AC Retro-Fit
-    "load_power": ("inverter_power", "house_load", "house_load_alt"),  # W
+    "pv3_power": ("pv_power_3",),                      # W
+    "solar_power": (
+        "solar_power",
+        "pv_total_power",
+        "energy_dashboard_solax_solar_power",
+    ),                                                  # W, Energy Dashboard / AC Retro-Fit
+    "load_power": (
+        "inverter_power",
+        "house_load",
+        "house_load_alt",
+        "energy_dashboard_solax_home_consumption_power",
+    ),                                                  # W
     "battery_temp": ("battery_temperature",),          # C
 }
 
@@ -59,6 +74,66 @@ _WRITE_ENTITIES = {
     "manual_mode_control": (
         "manual_mode_control",
         "inverter_manual_mode_control",
+    ),
+    "remotecontrol_power_control": (
+        "remotecontrol_power_control",
+        "remotecontrol_power_control_mode_1",
+        "remote_control_power_control",
+        "inverter_remotecontrol_power_control",
+        "inverter_remotecontrol_power_control_mode_1",
+        "inverter_remote_control_power_control",
+    ),
+    "remotecontrol_set_type": (
+        "remotecontrol_set_type",
+        "remotecontrol_set_type_mode_1",
+        "remote_control_set_type",
+        "inverter_remotecontrol_set_type",
+        "inverter_remotecontrol_set_type_mode_1",
+        "inverter_remote_control_set_type",
+    ),
+    "remotecontrol_active_power": (
+        "remotecontrol_active_power",
+        "remotecontrol_active_power_mode_1",
+        "remote_control_active_power",
+        "inverter_remotecontrol_active_power",
+        "inverter_remotecontrol_active_power_mode_1",
+        "inverter_remote_control_active_power",
+    ),
+    "remotecontrol_reactive_power": (
+        "remotecontrol_reactive_power",
+        "remotecontrol_reactive_power_mode_1",
+        "remote_control_reactive_power",
+        "inverter_remotecontrol_reactive_power",
+        "inverter_remotecontrol_reactive_power_mode_1",
+        "inverter_remote_control_reactive_power",
+    ),
+    "remotecontrol_duration": (
+        "remotecontrol_duration",
+        "remotecontrol_duration_mode_1",
+        "remote_control_duration",
+        "inverter_remotecontrol_duration",
+        "inverter_remotecontrol_duration_mode_1",
+        "inverter_remote_control_duration",
+        "remotecontrol_duration_mode_1_9",
+        "inverter_remotecontrol_duration_mode_1_9",
+    ),
+    "remotecontrol_autorepeat_duration": (
+        "remotecontrol_autorepeat_duration",
+        "remotecontrol_autorepeat_duration_mode_1",
+        "remote_control_autorepeat_duration",
+        "inverter_remotecontrol_autorepeat_duration",
+        "inverter_remotecontrol_autorepeat_duration_mode_1",
+        "inverter_remote_control_autorepeat_duration",
+        "remotecontrol_autorepeat_duration_mode_1_9",
+        "inverter_remotecontrol_autorepeat_duration_mode_1_9",
+    ),
+    "remotecontrol_trigger": (
+        "remotecontrol_trigger",
+        "remotecontrol_trigger_mode_1",
+        "remote_control_trigger",
+        "inverter_remotecontrol_trigger",
+        "inverter_remotecontrol_trigger_mode_1",
+        "inverter_remote_control_trigger",
     ),
     "allow_grid_charge": ("allow_grid_charge",),
     "charge_start_1": ("charge_start_1",),
@@ -93,6 +168,11 @@ _MANUAL_CHARGE = "Force Charge"
 _MANUAL_DISCHARGE = "Force Discharge"
 _MANUAL_CONTROL_ON = "On"
 _MANUAL_CONTROL_OFF = "Off"
+_REMOTE_CONTROL_BATTERY = ("Enabled Battery Control",)
+_REMOTE_CONTROL_SELF_USE = ("Enabled Self Use",)
+_REMOTE_CONTROL_DISABLED = ("Disabled", "Disable", "Off")
+_REMOTE_CONTROL_SET = ("Set", "Update")
+_REMOTE_CONTROL_SLOT_SECONDS = 20
 _ALLOW_GRID_PERIOD_1_CANDIDATES = (
     "Period 1 Allowed",
     "Period 1 Enabled",
@@ -207,12 +287,22 @@ class SolaxBatteryController:
             "grid_export_limit",
             "grid_tied_min_soc",
         )
+        remote_control_required = (
+            "remotecontrol_power_control",
+            "remotecontrol_active_power",
+            "remotecontrol_autorepeat_duration",
+            "remotecontrol_trigger",
+        )
 
         base_missing = self._missing_keys(base_required)
         manual_missing = self._missing_keys(manual_required)
         force_time_missing = self._missing_keys(force_time_required)
+        remote_control_missing = self._missing_keys(remote_control_required)
 
-        if not base_missing and not manual_missing:
+        if not base_missing and not remote_control_missing:
+            self._control_profile = "remote_control"
+            missing = []
+        elif not base_missing and not manual_missing:
             self._control_profile = "manual"
             missing = []
         elif not base_missing and not force_time_missing:
@@ -220,10 +310,9 @@ class SolaxBatteryController:
             missing = []
         else:
             self._control_profile = "unknown"
-            profile_missing = (
-                force_time_missing
-                if len(force_time_missing) < len(manual_missing)
-                else manual_missing
+            profile_missing = min(
+                (manual_missing, remote_control_missing, force_time_missing),
+                key=len,
             )
             missing = [*base_missing, *profile_missing]
 
@@ -257,6 +346,7 @@ class SolaxBatteryController:
         grid_w = self._read_float("grid_power") or 0.0
         pv1_w = self._read_float("pv1_power") or 0.0
         pv2_w = self._read_float("pv2_power") or 0.0
+        pv3_w = self._read_float("pv3_power") or 0.0
         solar_total_w = self._read_float("solar_power")
         load_w = self._read_float("load_power") or 0.0
         bat_temp = self._read_float("battery_temp")
@@ -269,7 +359,7 @@ class SolaxBatteryController:
         grid_kw = grid_w / 1000.0
 
         if solar_total_w is None:
-            solar_total_w = pv1_w + pv2_w
+            solar_total_w = pv1_w + pv2_w + pv3_w
         solar_kw = max(0.0, solar_total_w / 1000.0)
         load_kw = max(0.0, load_w / 1000.0)
 
@@ -308,6 +398,13 @@ class SolaxBatteryController:
                 self.hass, duration_minutes * 60, self._timer_restore
             )
             return True
+        if self._control_profile == "remote_control":
+            await self._remote_control_power(duration_minutes, effective_power_w)
+            self._cancel_timer()
+            self._timer_cancel = async_call_later(
+                self.hass, duration_minutes * 60, self._timer_restore
+            )
+            return True
 
         await self._set_number("charge_current", amps)
         await self._set_select("charger_use_mode", _MODE_MANUAL)
@@ -340,6 +437,13 @@ class SolaxBatteryController:
                 self.hass, duration_minutes * 60, self._timer_restore
             )
             return True
+        if self._control_profile == "remote_control":
+            await self._remote_control_power(duration_minutes, -abs(effective_power_w))
+            self._cancel_timer()
+            self._timer_cancel = async_call_later(
+                self.hass, duration_minutes * 60, self._timer_restore
+            )
+            return True
 
         await self._set_number("discharge_current", amps)
         await self._set_select("charger_use_mode", _MODE_MANUAL)
@@ -360,6 +464,10 @@ class SolaxBatteryController:
             if self._entity_exists("charger_use_mode"):
                 await self._set_select("charger_use_mode", _MODE_SELF_USE)
             _LOGGER.info("Solax restored to Self Use mode")
+            return True
+        if self._control_profile == "remote_control":
+            await self._remote_control_stop()
+            _LOGGER.info("Solax Mode1 remote control stopped")
             return True
 
         await self._set_select("manual_mode_select", _MANUAL_STOP)
@@ -385,6 +493,10 @@ class SolaxBatteryController:
         if not option:
             _LOGGER.warning("Solax: unknown operation mode '%s'", mode)
             return False
+        if self._control_profile == "remote_control" and mode == "self_consumption":
+            await self._remote_control_self_use()
+            _LOGGER.info("Solax Mode1 self-use emulation enabled (%s)", mode)
+            return True
         await self._set_select("charger_use_mode", option)
         _LOGGER.info("Solax operation mode set to '%s' (%s)", option, mode)
         return True
@@ -421,6 +533,12 @@ class SolaxBatteryController:
             registry = er.async_get(self.hass)
             entries = er.async_entries_for_config_entry(registry, self._solax_entry_id)
             entity_ids = [entry.entity_id for entry in entries if entry.entity_id]
+            entity_ids.extend(
+                state.entity_id
+                for state in self.hass.states.async_all()
+                if state.entity_id.startswith(("sensor.", "number.", "select.", "time.", "button."))
+                and state.entity_id not in entity_ids
+            )
             self._discover_entities_from_ids(
                 entity_ids,
                 legacy_prefix=self._prefix or None,
@@ -466,7 +584,19 @@ class SolaxBatteryController:
                 candidate = f"{domain}.{legacy_prefix}_{suffix}"
                 if self.hass.states.get(candidate) is not None:
                     return candidate
-        return self._find_entity_by_suffix(entity_ids, domain, suffixes)
+
+        matches: list[str] = []
+        domain_prefix = f"{domain}."
+        for suffix in suffixes:
+            tail = f"_{suffix}"
+            for entity_id in entity_ids:
+                if entity_id.startswith(domain_prefix) and entity_id.endswith(tail):
+                    matches.append(entity_id)
+
+        for entity_id in matches:
+            if self.hass.states.get(entity_id) is not None:
+                return entity_id
+        return matches[0] if matches else None
 
     def _expected_entity_hint(self, key: str) -> str | None:
         """Return a likely entity-id hint for error reporting."""
@@ -497,7 +627,7 @@ class SolaxBatteryController:
         """Return the HA domain for a write entity key."""
         if key in ("charge_start_1", "charge_end_1"):
             return "time"
-        if key == "grid_export_button":
+        if key in ("grid_export_button", "remotecontrol_trigger"):
             return "button"
         if key in (
             "charge_current",
@@ -507,6 +637,10 @@ class SolaxBatteryController:
             "grid_export_limit",
             "grid_tied_min_soc",
             "forcetime_period_1_max_capacity",
+            "remotecontrol_active_power",
+            "remotecontrol_reactive_power",
+            "remotecontrol_duration",
+            "remotecontrol_autorepeat_duration",
         ):
             return "number"
         return "select"
@@ -618,6 +752,49 @@ class SolaxBatteryController:
         if not entity_id or self.hass.states.get(entity_id) is None:
             return
         await self._set_select("manual_mode_control", option)
+
+    async def _remote_control_power(self, duration_minutes: int, power_w: int) -> None:
+        """Use Solax Mode1 remotecontrol entities for non-EEPROM power control."""
+        duration_seconds = max(60, int(duration_minutes) * 60)
+        if self._entity_exists("remotecontrol_set_type"):
+            await self._set_select_first_match("remotecontrol_set_type", _REMOTE_CONTROL_SET)
+        if self._entity_exists("remotecontrol_duration"):
+            await self._set_number("remotecontrol_duration", _REMOTE_CONTROL_SLOT_SECONDS)
+        if self._entity_exists("remotecontrol_reactive_power"):
+            await self._set_number("remotecontrol_reactive_power", 0)
+        await self._set_number("remotecontrol_active_power", int(power_w))
+        await self._set_select_first_match("remotecontrol_power_control", _REMOTE_CONTROL_BATTERY)
+        await self._set_number("remotecontrol_autorepeat_duration", duration_seconds)
+        await self._press_button("remotecontrol_trigger")
+        _LOGGER.info(
+            "Solax Mode1 remote control: %dW battery target for %ds",
+            int(power_w),
+            duration_seconds,
+        )
+
+    async def _remote_control_self_use(self) -> None:
+        """Enable Mode1 self-use emulation where available."""
+        if self._entity_exists("remotecontrol_set_type"):
+            await self._set_select_first_match("remotecontrol_set_type", _REMOTE_CONTROL_SET)
+        if self._entity_exists("remotecontrol_duration"):
+            await self._set_number("remotecontrol_duration", _REMOTE_CONTROL_SLOT_SECONDS)
+        await self._set_number("remotecontrol_active_power", 0)
+        await self._set_select_first_match("remotecontrol_power_control", _REMOTE_CONTROL_SELF_USE)
+        await self._set_number("remotecontrol_autorepeat_duration", 0)
+        await self._press_button("remotecontrol_trigger")
+
+    async def _remote_control_stop(self) -> None:
+        """Stop Mode1 autorepeat and let the inverter return to its normal mode."""
+        if self._entity_exists("remotecontrol_set_type"):
+            await self._set_select_first_match("remotecontrol_set_type", _REMOTE_CONTROL_SET)
+        if self._entity_exists("remotecontrol_duration"):
+            await self._set_number("remotecontrol_duration", _REMOTE_CONTROL_SLOT_SECONDS)
+        if self._entity_exists("remotecontrol_active_power"):
+            await self._set_number("remotecontrol_active_power", 0)
+        if self._entity_exists("remotecontrol_power_control"):
+            await self._set_select_first_match("remotecontrol_power_control", _REMOTE_CONTROL_DISABLED)
+        await self._set_number("remotecontrol_autorepeat_duration", 0)
+        await self._press_button("remotecontrol_trigger")
 
     async def _force_time_charge(self, duration_minutes: int, amps: float) -> None:
         """Use Gen2/Gen3 Force Time entities to start grid charging."""

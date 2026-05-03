@@ -1050,8 +1050,9 @@ class AutomationEngine:
             if state_value in ("unavailable", "unknown"):
                 continue
 
-            # OCPP status sensor (e.g., sensor.evse_status, sensor.*_charger_status)
-            if re.match(r"sensor\.\w*(ocpp|evse|charger).*_status$", entity_id, re.IGNORECASE):
+            # OCPP status sensor — match both sensor.*_status and sensor.*_status_connector
+            # (lbbrhzn/ocpp uses _status_connector as the more reliably updated entity)
+            if re.match(r"sensor\.\w*(ocpp|evse|charger).*(status_connector|_status)$", entity_id, re.IGNORECASE):
                 ocpp_state["status"] = state_value.lower()
                 ocpp_state["is_connected"] = state_value.lower() not in ("unavailable", "disconnected", "")
                 _LOGGER.debug(f"OCPP status from {entity_id}: {state_value}")

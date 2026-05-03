@@ -70,6 +70,21 @@ class PowerwallLocalCoordinator(DataUpdateCoordinator[PowerwallSnapshot | None])
         # Surfaces via the app banner and a re-pair push notification.
         self._needs_repair = False
 
+        # DataUpdateCoordinator pauses its periodic schedule when it has zero
+        # listeners (HA 2023.x+ optimisation). Entity listeners attach in
+        # ``async_added_to_hass`` which races with our coordinator setup —
+        # if sensors win the race, ``_local_coordinator()`` returns None and
+        # the listener is never added, leaving the coordinator silent forever
+        # after its one-shot first refresh. Anchor a keep-alive no-op listener
+        # at construction so the schedule stays armed regardless of who else
+        # subscribes downstream.
+        self._keepalive_unsub = self.async_add_listener(self._keepalive_noop)
+
+    @staticmethod
+    def _keepalive_noop() -> None:
+        """No-op listener that exists solely to keep the periodic poll armed."""
+        return
+
     @property
     def needs_repair(self) -> bool:
         return self._needs_repair

@@ -29,7 +29,6 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from . import tedapi_combined_pb2 as combined_pb2
 from .exceptions import (
-    PowerwallAuthError,
     PowerwallLocalError,
     PowerwallSignatureError,
     PowerwallUnreachableError,
@@ -115,12 +114,11 @@ class TEDAPIv1rTransport:
         self,
         host: str,
         private_key_pem: bytes,
-        customer_password: str,
         *,
+        din: str | None = None,
         timeout: float = 8.0,
     ) -> None:
         self._host = host
-        self._customer_password = customer_password
         self._timeout = aiohttp.ClientTimeout(total=timeout)
 
         try:
@@ -135,8 +133,9 @@ class TEDAPIv1rTransport:
             format=serialization.PublicFormat.PKCS1,
         )
         self._ssl = _insecure_ssl_context()
-        self._token: str | None = None
-        self._din: str | None = None
+        # DIN is supplied by the caller from cloud pairing — no Bearer-authed
+        # /tedapi/din fetch path remains.
+        self._din: str | None = din
 
     @property
     def din(self) -> str | None:
@@ -147,52 +146,6 @@ class TEDAPIv1rTransport:
         # caller; TEDAPI polling is low rate and the handshake is cheap.
         connector = aiohttp.TCPConnector(ssl=self._ssl, limit=4)
         return aiohttp.ClientSession(connector=connector, timeout=self._timeout)
-
-    async def login(self) -> bool:
-        """Log in via ``/api/login/Basic`` to get a Bearer token for REST calls."""
-        url = f"https://{self._host}/api/login/Basic"
-        payload = {
-            "username": "customer",
-            "password": self._customer_password,
-            "email": "customer@customer.domain",
-            "clientInfo": {"timezone": "UTC"},
-        }
-        try:
-            async with await self._session() as sess:
-                async with sess.post(url, json=payload) as resp:
-                    if resp.status != 200:
-                        body = await resp.text()
-                        _LOGGER.warning(
-                            "v1r login failed (%s): %s", resp.status, body[:200]
-                        )
-                        if resp.status in (401, 403):
-                            raise PowerwallAuthError(
-                                f"Gateway rejected customer password ({resp.status})"
-                            )
-                        return False
-                    data = await resp.json()
-                    self._token = data.get("token")
-                    return self._token is not None
-        except aiohttp.ClientError as err:
-            raise PowerwallUnreachableError(
-                f"Cannot reach gateway {self._host}: {err}"
-            ) from err
-
-    async def fetch_din(self) -> str | None:
-        """Fetch the gateway DIN from ``/tedapi/din`` (Bearer-authed)."""
-        if not self._token and not await self.login():
-            return None
-        url = f"https://{self._host}/tedapi/din"
-        headers = {"Authorization": f"Bearer {self._token}"}
-        try:
-            async with await self._session() as sess:
-                async with sess.get(url, headers=headers) as resp:
-                    if resp.status != 200:
-                        return None
-                    self._din = (await resp.text()).strip()
-                    return self._din
-        except aiohttp.ClientError as err:
-            raise PowerwallUnreachableError(str(err)) from err
 
     @staticmethod
     def _tlv(tag: int, value: bytes) -> bytes:
@@ -602,62 +555,3 @@ class TEDAPIv1rTransport:
         except Exception:
             return False
 
-    async def api_get(self, path: str) -> Any | None:
-        """Authenticated REST GET against the gateway (Bearer token).
-
-        Works on PW2 and PW3 for standard endpoints: ``/api/meters/aggregates``,
-        ``/api/system_status/soe``, ``/api/system_status/grid_status``, etc.
-        """
-        if not self._token and not await self.login():
-            return None
-        url = f"https://{self._host}{path}"
-        headers = {"Authorization": f"Bearer {self._token}"}
-        try:
-            async with await self._session() as sess:
-                async with sess.get(url, headers=headers) as resp:
-                    if resp.status in (401, 403):
-                        # Token lapsed; re-login once and retry.
-                        if await self.login():
-                            headers["Authorization"] = f"Bearer {self._token}"
-                            async with sess.get(url, headers=headers) as r2:
-                                if r2.status != 200:
-                                    return None
-                                return await r2.json()
-                        return None
-                    if resp.status != 200:
-                        return None
-                    return await resp.json()
-        except aiohttp.ClientError as err:
-            raise PowerwallUnreachableError(str(err)) from err
-
-    async def api_post(self, path: str, body: dict[str, Any]) -> Any | None:
-        """Authenticated REST POST against the gateway."""
-        if not self._token and not await self.login():
-            return None
-        url = f"https://{self._host}{path}"
-        headers = {
-            "Authorization": f"Bearer {self._token}",
-            "Content-Type": "application/json",
-        }
-        try:
-            async with await self._session() as sess:
-                async with sess.post(url, json=body, headers=headers) as resp:
-                    if resp.status in (401, 403):
-                        if await self.login():
-                            headers["Authorization"] = f"Bearer {self._token}"
-                            async with sess.post(
-                                url, json=body, headers=headers
-                            ) as r2:
-                                if r2.status not in (200, 201, 204):
-                                    return None
-                                if r2.status == 204:
-                                    return {}
-                                return await r2.json()
-                        return None
-                    if resp.status not in (200, 201, 204):
-                        return None
-                    if resp.status == 204:
-                        return {}
-                    return await resp.json()
-        except aiohttp.ClientError as err:
-            raise PowerwallUnreachableError(str(err)) from err

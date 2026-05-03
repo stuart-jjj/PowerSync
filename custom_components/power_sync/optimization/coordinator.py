@@ -164,6 +164,9 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._last_export_prices: list[float] | None = None     # $/kWh values (LP-adjusted)
         self._last_display_import_prices: list[float] | None = None  # $/kWh actual tariff
         self._last_display_export_prices: list[float] | None = None  # $/kWh actual tariff
+        self._solar_nowcast_derate: float = 1.0
+        self._last_solar_nowcast_ratio: float | None = None
+        self._last_logged_solar_nowcast_derate: float | None = None
 
         # Battery specs source tracking
         self._battery_specs_source = "default"  # "default", "auto", or "manual"
@@ -191,8 +194,17 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Price monitoring
         self._is_dynamic_pricing = False
         self._price_listener_unsub: Callable | None = None
+        # Secondary listener used only for Octopus on a non-dynamic tariff:
+        # re-checks the live tariff_code on each refresh and promotes to
+        # dynamic pricing if the user moves onto AGILE/FLUX/COSY.
+        self._octopus_gate_listener_unsub: Callable | None = None
         # Deduplication key for AEMO price-update trigger — LP only fires on new dispatch files
         self._last_aemo_dispatch_file: str | None = None
+        # Rate-limit for non-AEMO price-triggered LP runs (Amber/Octopus send 2 updates per
+        # 5-min window — usage price + spot price — which would otherwise fire two consecutive
+        # LP solves and let the 2-consecutive-CHARGE hysteresis clear in a single interval,
+        # causing force_charge↔restore_normal oscillation that can trip battery BMS protections).
+        self._last_price_triggered_optimization: datetime | None = None
 
         # Track last executed action for IDLE→non-IDLE transition
         self._last_executed_action: str | None = None
@@ -315,10 +327,21 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self._load_estimator:
             self._load_estimator.invalidate_cache()
         _LOGGER.info("Profit Maximisation mode %s", "ENABLED" if enabled else "DISABLED")
+        if self.hass and self.entry_id:
+            from homeassistant.helpers.dispatcher import async_dispatcher_send
+
+            from ..const import DOMAIN
+
+            async_dispatcher_send(
+                self.hass,
+                f"{DOMAIN}_{self.entry_id}_profit_max_mode",
+                enabled,
+            )
         if self._entry:
-            from ..const import CONF_PROFIT_MAX_ENABLED
+            from ..const import CONF_PROFIT_MAX_ENABLED, DOMAIN
             new_options = dict(self._entry.options)
             new_options[CONF_PROFIT_MAX_ENABLED] = enabled
+            self.hass.data.setdefault(DOMAIN, {}).setdefault(self.entry_id, {})["_skip_reload"] = True
             self.hass.config_entries.async_update_entry(self._entry, options=new_options)
 
     def _summarise_load_forecast(self) -> dict | None:
@@ -476,7 +499,10 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         if self._entry:
             from ..const import CONF_PROFIT_MAX_ENABLED
-            profit_max = self._entry.options.get(CONF_PROFIT_MAX_ENABLED, False) or self._entry.data.get(CONF_PROFIT_MAX_ENABLED, False)
+            profit_max = self._entry.options.get(
+                CONF_PROFIT_MAX_ENABLED,
+                self._entry.data.get(CONF_PROFIT_MAX_ENABLED, False),
+            )
             self._config.profit_max_enabled = bool(profit_max)
             if self._optimizer:
                 self._optimizer.terminal_weight = 0.3 if profit_max else 1.0
@@ -530,6 +556,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             price_getter=self._get_price_data_for_ev,
             battery_schedule_getter=self._get_battery_schedule_for_ev,
             solar_forecast_getter=self._get_solar_forecast,
+            config_entry=self._entry,
         )
         _LOGGER.debug("EV coordinator initialized")
 
@@ -593,18 +620,42 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         _LOGGER.warning("No home load sensor found — load forecast will use defaults")
         return None
 
+    def _is_octopus_dynamic_tariff(self) -> bool:
+        """Return True when the active Octopus tariff is genuinely half-hourly.
+
+        Checks both product_code and the live tariff_code. The tariff_code is
+        authoritative when data is sourced from BottlecapDave (the configured
+        product_code may not match what the user is actually billed on).
+        """
+        if not self.price_coordinator:
+            return False
+        product = (getattr(self.price_coordinator, "product_code", "") or "").upper()
+        tariff = (getattr(self.price_coordinator, "tariff_code", "") or "").upper()
+        for token in ("AGILE", "FLUX", "COSY"):
+            if token in product or token in tariff:
+                return True
+        return False
+
     async def _setup_price_listener(self) -> None:
         """Set up price-triggered optimization for dynamic pricing providers."""
         if not self.price_coordinator:
             return
 
+        if self._prefers_static_tou_pricing():
+            if self._price_listener_unsub:
+                self._price_listener_unsub()
+                self._price_listener_unsub = None
+            if self._octopus_gate_listener_unsub:
+                self._octopus_gate_listener_unsub()
+                self._octopus_gate_listener_unsub = None
+            self._is_dynamic_pricing = False
+            return
+
         coordinator_name = type(self.price_coordinator).__name__
         dynamic_providers = ["AmberPriceCoordinator", "AEMOPriceCoordinator"]
 
-        if coordinator_name == "OctopusPriceCoordinator":
-            product_code = getattr(self.price_coordinator, "product_code", "")
-            if "AGILE" in product_code.upper() or "FLUX" in product_code.upper():
-                dynamic_providers.append("OctopusPriceCoordinator")
+        if coordinator_name == "OctopusPriceCoordinator" and self._is_octopus_dynamic_tariff():
+            dynamic_providers.append("OctopusPriceCoordinator")
 
         self._is_dynamic_pricing = coordinator_name in dynamic_providers
 
@@ -619,6 +670,102 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "Dynamic pricing detected (%s) - re-optimizing on price changes",
                 coordinator_name,
             )
+        elif coordinator_name == "OctopusPriceCoordinator":
+            # Octopus on a non-dynamic tariff today might roll onto an AGILE
+            # variant tomorrow (BottlecapDave reports the live agreement).
+            # Listen once so we can re-evaluate when fresh data arrives.
+            if not self._octopus_gate_listener_unsub:
+                self._octopus_gate_listener_unsub = (
+                    self.price_coordinator.async_add_listener(
+                        self._reevaluate_octopus_gate
+                    )
+                )
+
+    def _reevaluate_octopus_gate(self) -> None:
+        """Promote Octopus to dynamic pricing if the live tariff turns out to be AGILE/FLUX."""
+        if self._is_dynamic_pricing or not self.price_coordinator:
+            return
+        if type(self.price_coordinator).__name__ != "OctopusPriceCoordinator":
+            return
+        if not self._is_octopus_dynamic_tariff():
+            return
+        # Promote: drop the gate listener, attach the real one.
+        if self._octopus_gate_listener_unsub:
+            self._octopus_gate_listener_unsub()
+            self._octopus_gate_listener_unsub = None
+        self._is_dynamic_pricing = True
+        if self._price_listener_unsub:
+            self._price_listener_unsub()
+        self._price_listener_unsub = self.price_coordinator.async_add_listener(
+            self._on_price_update
+        )
+        _LOGGER.info(
+            "Octopus tariff %s detected as dynamic — enabling price-triggered LP",
+            getattr(self.price_coordinator, "tariff_code", "?"),
+        )
+
+    def _electricity_provider(self) -> str:
+        """Return the configured electricity provider for this entry."""
+        if not self._entry:
+            return ""
+        from ..const import CONF_ELECTRICITY_PROVIDER
+
+        return self._entry.options.get(
+            CONF_ELECTRICITY_PROVIDER,
+            self._entry.data.get(CONF_ELECTRICITY_PROVIDER, ""),
+        )
+
+    def _prefers_static_tou_pricing(self) -> bool:
+        """Return True for providers whose optimizer source is the TOU schedule.
+
+        Values match CONF_ELECTRICITY_PROVIDER. New Zealand retailers (Octopus
+        NZ, Electric Kiwi, Contact, etc.) all set the provider to "nz"; the
+        retailer choice itself lives in CONF_NZ_RETAILER and is not checked
+        here. tou_only is set internally by __init__.py:14540 for Tesla-only
+        TOU users without a retailer integration.
+        """
+        return self._electricity_provider() in (
+            "globird",
+            "aemo_vpp",
+            "other",
+            "tou_only",
+            "nz",
+        )
+
+    def _get_tou_tariff_schedule(self) -> dict | None:
+        """Get the cached TOU tariff schedule, falling back to hass.data."""
+        tariff = self._tariff_schedule
+        if tariff:
+            return tariff
+
+        from ..const import DOMAIN
+
+        tariff = (
+            self.hass.data.get(DOMAIN, {})
+            .get(self.entry_id, {})
+            .get("tariff_schedule")
+        )
+        if tariff:
+            _LOGGER.info("Using tariff_schedule from hass.data (not constructor)")
+            self._tariff_schedule = tariff
+        return tariff
+
+    def _get_tou_price_forecast_if_available(
+        self,
+    ) -> tuple[list[float], list[float]] | None:
+        """Generate a TOU price forecast when a tariff schedule is available."""
+        tariff = self._get_tou_tariff_schedule()
+        if tariff and tariff.get("tou_periods"):
+            periods = tariff["tou_periods"]
+            _LOGGER.info(
+                "TOU tariff available: %s, periods=%s, buy_rates=%s, sell_rates=%s",
+                tariff.get("plan_name", "unknown"),
+                list(periods.keys()),
+                {k: f"{v*100:.0f}c" for k, v in tariff.get("buy_rates", {}).items()},
+                {k: f"{v*100:.0f}c" for k, v in tariff.get("sell_rates", {}).items()},
+            )
+            return self._generate_tou_price_forecast(tariff)
+        return None
 
     def _on_price_update(self) -> None:
         """Callback when price coordinator updates."""
@@ -636,6 +783,22 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if current_file is not None and current_file == self._last_aemo_dispatch_file:
                 return
             self._last_aemo_dispatch_file = current_file
+
+        # Rate-limit: Amber/Octopus fire two coordinator updates per 5-min window (usage
+        # price + spot price). Without this guard both updates trigger an LP run, letting
+        # two consecutive CHARGE decisions satisfy the holdoff counter within seconds and
+        # causing force_charge↔restore_normal oscillation that can trip battery BMS protections.
+        now = dt_util.utcnow()
+        min_interval_seconds = (self._config.interval_minutes if self._config else 5) * 60
+        if self._last_price_triggered_optimization is not None:
+            elapsed = (now - self._last_price_triggered_optimization).total_seconds()
+            if elapsed < min_interval_seconds:
+                _LOGGER.debug(
+                    "Price update: skipping LP (last ran %.0fs ago, interval %ds)",
+                    elapsed, min_interval_seconds,
+                )
+                return
+        self._last_price_triggered_optimization = now
 
         # Re-optimize with new prices and update dashboard sensors
         self.hass.async_create_background_task(
@@ -863,6 +1026,10 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._price_listener_unsub()
             self._price_listener_unsub = None
 
+        if self._octopus_gate_listener_unsub:
+            self._octopus_gate_listener_unsub()
+            self._octopus_gate_listener_unsub = None
+
         if self._executor:
             await self._executor.stop()
 
@@ -928,6 +1095,9 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Convert forecasts from Watts (forecaster output) to kW (LP input)
             solar_forecast = [v / 1000.0 for v in solar] if solar else []
             load_forecast = [v / 1000.0 for v in load] if load else []
+
+            if solar_forecast:
+                solar_forecast = self._apply_solar_nowcast_derate(solar_forecast, soc)
 
             # Curtailment-aware solar: cap forecast during predicted curtailment periods
             if solar_forecast and load_forecast and export_prices and self._entry:
@@ -1016,6 +1186,32 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
             else:
                 self._optimizer.suppress_reserve_warning = False
+
+            # Pre-window SOC floor: in profit_max mode, force the battery to be
+            # filled before the next high-value export window (today's Flow
+            # Power Happy Hour). Without this, the LP's 48 h horizon places
+            # the planned grid-charge slots at the globally cheapest PEA
+            # periods, which often misses today's HH and leaves the user
+            # at ~80% SOC at 17:30.
+            #
+            # Safety buffer: pull the deadline 15 min earlier so charging
+            # completes with slack instead of racing the HH start. The LP
+            # otherwise plans charge to end at the exact HH boundary, which
+            # leaves no headroom for Modbus/UDP write latency, BMS current
+            # taper above ~90% SOC, AEMO predispatch jitter, or a dropped
+            # control packet — any of which can leave SOC below target at
+            # window start. Cost: typically ~$0.02/day from using slightly
+            # more expensive earlier slots; aligned with profit_max's
+            # existing trade of economic-optimal for reliable export.
+            _SAFETY_BUFFER_SLOTS = 3  # 15 min @ 5-min intervals
+            _hh_slot = self._next_export_window_slot()
+            if _hh_slot is not None and _hh_slot > _SAFETY_BUFFER_SLOTS:
+                self._optimizer.pre_window_slot = _hh_slot - _SAFETY_BUFFER_SLOTS
+            else:
+                self._optimizer.pre_window_slot = _hh_slot
+            self._optimizer.pre_window_soc_target = (
+                1.0 if self._optimizer.pre_window_slot is not None else 0.0
+            )
 
             # Run LP in executor thread to avoid blocking event loop
             result: OptimizerResult = await self.hass.async_add_executor_job(
@@ -1495,20 +1691,6 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                                 "(confirmed after 3 cycles)",
                             )
 
-            # User restore cooldown: if the user manually restored normal operation,
-            # suppress force charge/discharge for 30 minutes to respect their intent.
-            if effective_action in ("charge", "discharge", "export"):
-                from ..const import DOMAIN
-                entry_data = self.hass.data.get(DOMAIN, {}).get(self.entry_id, {})
-                cooldown_until = entry_data.get("restore_cooldown_until")
-                if cooldown_until and dt_util.utcnow() < cooldown_until:
-                    remaining = (cooldown_until - dt_util.utcnow()).total_seconds() / 60
-                    _LOGGER.info(
-                        "Optimizer: Suppressing %s — user restore cooldown active (%.0fmin remaining)",
-                        effective_action, remaining,
-                    )
-                    effective_action = "self_consumption"
-
             # CHARGE hysteresis: require 2 consecutive CHARGE decisions
             # before executing force_charge. This prevents oscillation at
             # decision boundaries (e.g. LP flipping CHARGE↔SC every cycle
@@ -1583,8 +1765,21 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # backup_reserve=0%, so if the LP planned discharge based on
                 # stale/forecast data but SOC has already dropped past the
                 # reserve, the battery would drain to 0%.
+                #
+                # Modbus batteries (Sigenergy/Sungrow/FoxESS/GoodWe/AlphaESS/
+                # ESY/Solax/SAJ) respect the inverter's own minimum SOC (set
+                # via set_backup_reserve / DOD register), so force_discharge
+                # is bounded by the BMS regardless of the LP's planned floor.
+                # Applying this guard to them caused exports to stop in the
+                # last ~30 min of Flow Power Happy Hour: as SOC tapered toward
+                # the 20% reserve, the executor flipped to self_consumption,
+                # cancelling the optimizer's force_discharge and letting the
+                # battery drift to load-following only — losing the tail of
+                # HH revenue. Tesla still needs the guard because its
+                # force_discharge actively zeros the soft reserve.
+                _tesla_only_guard = self.battery_system == "tesla"
                 soc_now, _ = await self._get_battery_state()
-                if soc_now <= self._config.backup_reserve + 0.05:
+                if _tesla_only_guard and soc_now <= self._config.backup_reserve + 0.05:
                     _LOGGER.warning(
                         "Optimizer: Skipping %s — SOC %.1f%% at/below backup "
                         "reserve %.0f%%, switching to self_consumption",
@@ -2131,6 +2326,55 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         return result
 
+    def _next_export_window_slot(self) -> int | None:
+        """Slot index of the next high-value export window in the LP horizon.
+
+        Used to enforce a pre-window SOC floor when profit_max mode is on.
+        Returns None when the floor should not be applied (profit_max off,
+        unsupported provider, or no upcoming window in horizon).
+
+        Currently only Flow Power (Happy Hour 17:30-19:30) is supported; other
+        tariffs with deterministic high-export windows can be added here.
+        """
+        if not self._entry:
+            return None
+        if not self._config.profit_max_enabled:
+            return None
+
+        from ..const import CONF_ELECTRICITY_PROVIDER, CONF_FLOW_POWER_STATE
+        provider = self._entry.options.get(
+            CONF_ELECTRICITY_PROVIDER,
+            self._entry.data.get(CONF_ELECTRICITY_PROVIDER, ""),
+        )
+        if provider != "flow_power":
+            return None
+        state = self._entry.options.get(
+            CONF_FLOW_POWER_STATE,
+            self._entry.data.get(CONF_FLOW_POWER_STATE, ""),
+        )
+        if not state:
+            return None
+
+        happy_start_min = 17 * 60 + 30  # 17:30
+        interval = self._config.interval_minutes
+        n_steps = int(self._config.horizon_hours * 60) // interval
+        raw_now = dt_util.now()
+        now = raw_now.replace(
+            minute=(raw_now.minute // interval) * interval,
+            second=0, microsecond=0,
+        )
+        for t in range(n_steps):
+            slot = now + timedelta(minutes=t * interval)
+            slot_min = slot.hour * 60 + slot.minute
+            if slot_min == happy_start_min:
+                # Skip t=0: HH starts right now, no pre-window slots to charge in.
+                # The next HH match will be tomorrow (288 slots ahead) which the
+                # loop continues to find.
+                if t == 0:
+                    continue
+                return t
+        return None
+
     def _apply_flow_power_export(
         self, export_prices: list[float]
     ) -> list[float]:
@@ -2641,6 +2885,84 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         return (decayed_import, decayed_export)
 
+    def _apply_solar_nowcast_derate(
+        self,
+        solar_forecast: list[float],
+        soc: float,
+        fade_hours: float = 6.0,
+    ) -> list[float]:
+        """Reduce near-term solar forecast when live production is under forecast.
+
+        The LP is deterministic: if the solar forecast says energy is coming, it
+        will rationally wait for that energy instead of grid-charging earlier.
+        Prices can be treated as firm over the near horizon, but solar needs a
+        live reality check. When current production is materially below the
+        first forecast slots, derate the next few hours and fade back to the raw
+        Solcast forecast.
+        """
+        if not solar_forecast:
+            return solar_forecast
+        if soc >= 0.98:
+            # Near-full batteries and curtailment can make measured solar lower
+            # than potential production. Don't learn a false cloud signal there.
+            return solar_forecast
+        if not self.energy_coordinator or not self.energy_coordinator.data:
+            return solar_forecast
+
+        data = self.energy_coordinator.data
+        try:
+            actual_kw = max(0.0, float(data.get("solar_power", 0) or 0))
+        except (TypeError, ValueError):
+            return solar_forecast
+
+        window = [max(0.0, v) for v in solar_forecast[:3] if v is not None]
+        if not window:
+            return solar_forecast
+        forecast_now_kw = sum(window) / len(window)
+        if forecast_now_kw < 0.5:
+            # Dawn/dusk and very low production are too noisy to learn from.
+            return solar_forecast
+
+        ratio = actual_kw / forecast_now_kw if forecast_now_kw > 0 else 1.0
+        ratio = max(0.0, min(1.5, ratio))
+        self._last_solar_nowcast_ratio = ratio
+
+        if ratio < 0.75:
+            target = max(0.35, min(1.0, ratio + 0.10))
+            self._solar_nowcast_derate = min(
+                self._solar_nowcast_derate,
+                (self._solar_nowcast_derate * 0.35) + (target * 0.65),
+            )
+        elif ratio >= 0.9:
+            self._solar_nowcast_derate = min(1.0, self._solar_nowcast_derate + 0.08)
+
+        if self._solar_nowcast_derate >= 0.98:
+            return solar_forecast
+
+        interval = self._config.interval_minutes
+        adjusted: list[float] = []
+        for t, value in enumerate(solar_forecast):
+            hours_ahead = (t * interval) / 60.0
+            weight = max(0.0, 1.0 - (hours_ahead / fade_hours))
+            factor = 1.0 - ((1.0 - self._solar_nowcast_derate) * weight)
+            adjusted.append(value * factor)
+
+        if (
+            self._last_logged_solar_nowcast_derate is None
+            or abs(self._last_logged_solar_nowcast_derate - self._solar_nowcast_derate) >= 0.05
+        ):
+            _LOGGER.info(
+                "Solar forecast nowcast derate: live %.1fkW vs forecast %.1fkW "
+                "(%.0f%%), applying %.0f%% factor now fading to 100%% over %.0fh",
+                actual_kw,
+                forecast_now_kw,
+                ratio * 100,
+                self._solar_nowcast_derate * 100,
+                fade_hours,
+            )
+            self._last_logged_solar_nowcast_derate = self._solar_nowcast_derate
+        return adjusted
+
     @staticmethod
     def _get_entry_start_time(e: dict) -> str:
         """Get the start time of a price entry across all provider formats.
@@ -2669,12 +2991,78 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         return ""
 
+    @staticmethod
+    def _get_entry_end_time(e: dict) -> str:
+        """Get the end time of a price entry across all provider formats.
+
+        Octopus entries have valid_to. Amber/AEMO entries have nemTime
+        which is itself the interval END.
+
+        Returns:
+            ISO format end time string, or "" if indeterminate
+        """
+        vt = e.get("valid_to")
+        if vt:
+            return vt
+        nem = e.get("nemTime")
+        if nem:
+            return nem
+        return ""
+
+    @classmethod
+    def _entry_remaining_minutes(
+        cls,
+        e: dict,
+        current_window: datetime,
+        fallback_dur: int,
+    ) -> int:
+        """Minutes of this entry that lie at or after current_window.
+
+        Used for first-slot expansion: the active 30-min interval may have
+        only N minutes of validity remaining after current_window. Returns
+        fallback_dur if start/end can't be parsed.
+        """
+        start_str = cls._get_entry_start_time(e)
+        end_str = cls._get_entry_end_time(e)
+        if not start_str or not end_str:
+            return max(0, int(fallback_dur))
+        try:
+            start_dt = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
+            end_dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return max(0, int(fallback_dur))
+        effective_start = max(start_dt, current_window)
+        remaining = int((end_dt - effective_start).total_seconds() // 60)
+        return max(0, remaining)
+
     async def _get_price_forecast(self) -> tuple[list[float], list[float]] | None:
         """Get price forecasts for optimizer.
 
         For dynamic providers (Amber, Flow Power): reads from price_coordinator.
         For static TOU providers (GloBird, etc.): generates from tariff_schedule.
         """
+        if self._prefers_static_tou_pricing():
+            tou_prices = self._get_tou_price_forecast_if_available()
+            if tou_prices is not None:
+                if self.price_coordinator and self.price_coordinator.data:
+                    _LOGGER.debug(
+                        "Using TOU tariff prices for static provider %s; ignoring %s data",
+                        self._electricity_provider(),
+                        type(self.price_coordinator).__name__,
+                    )
+                return tou_prices
+
+            # No tariff schedule cached yet — never fall through to the
+            # dynamic-pricing path for static-TOU providers. A leftover
+            # AEMOPriceCoordinator (e.g. set up before a provider switch)
+            # could still hold stale data and silently feed it to the LP.
+            _LOGGER.debug(
+                "Static-TOU provider %s but tariff_schedule not yet cached; "
+                "skipping dynamic-pricing fallback",
+                self._electricity_provider(),
+            )
+            return None
+
         # Dynamic pricing (Amber, Flow Power, etc.)
         if self.price_coordinator and self.price_coordinator.data:
             data = self.price_coordinator.data
@@ -2693,9 +3081,13 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     for lst in (general, feed_in):
                         lst.sort(key=lambda e: self._get_entry_start_time(e))
 
-                    # Filter out past entries — providers return
-                    # historical entries, but the LP needs prices
-                    # starting from the current interval.
+                    # Filter out fully-past entries — providers return
+                    # historical entries, but the LP needs prices starting
+                    # from the current interval. Use END time so an
+                    # interval that started before current_window but is
+                    # still active (e.g. 30-min Octopus slot at minute 20)
+                    # is preserved; its remaining-minutes are computed
+                    # during expansion.
                     now = dt_util.now()
                     current_window = now.replace(
                         minute=(now.minute // 5) * 5,
@@ -2705,13 +3097,13 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         original_len = len(lst)
                         filtered = []
                         for e in lst:
-                            st = self._get_entry_start_time(e)
-                            if st:
+                            end_str = self._get_entry_end_time(e)
+                            if end_str:
                                 try:
-                                    entry_time = datetime.fromisoformat(
-                                        st.replace("Z", "+00:00")
+                                    entry_end = datetime.fromisoformat(
+                                        end_str.replace("Z", "+00:00")
                                     )
-                                    if entry_time < current_window:
+                                    if entry_end <= current_window:
                                         continue
                                 except (ValueError, TypeError):
                                     pass
@@ -2719,7 +3111,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         lst[:] = filtered
                         if len(lst) < original_len:
                             _LOGGER.debug(
-                                "Filtered %d past price entries (before %s), "
+                                "Filtered %d past price entries (ended <= %s), "
                                 "%d remaining",
                                 original_len - len(lst),
                                 current_window.isoformat(),
@@ -2767,10 +3159,23 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
                     import_prices = []
                     entry_positions = []  # start index for each general entry
+                    entry_expands_general = []  # parallel: actual expand count per entry
                     for e in general:
                         entry_positions.append(len(import_prices))
                         dur = e.get("duration", 30)
-                        entry_expand = max(1, dur // interval)
+                        # Clip the first surviving entry to its remaining minutes
+                        # so a 30-min interval that's already 20 min in only
+                        # contributes its last 10 min to the LP horizon.
+                        effective_min = self._entry_remaining_minutes(
+                            e, current_window, dur,
+                        )
+                        if effective_min <= 0:
+                            entry_expand = 0
+                        else:
+                            entry_expand = max(1, effective_min // interval)
+                        entry_expands_general.append(entry_expand)
+                        if entry_expand == 0:
+                            continue
                         if is_flow_power:
                             if fp_custom_pea is not None:
                                 price_dollar = max(
@@ -2802,14 +3207,24 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         import_prices.extend([price_dollar] * entry_expand)
 
                     export_prices = []
+                    display_export_raw: list[float] = []
                     for e in feed_in:
                         dur = e.get("duration", 30)
-                        entry_expand = max(1, dur // interval)
+                        effective_min = self._entry_remaining_minutes(
+                            e, current_window, dur,
+                        )
+                        if effective_min <= 0:
+                            continue
+                        entry_expand = max(1, effective_min // interval)
                         # feedIn perKwh: negative = you get paid, positive = you pay to export.
-                        # Negate so optimizer sees positive = revenue.  Clamp to 0 so
-                        # genuinely negative export prices (you pay) don't look profitable.
-                        price_dollar = max(0, -(e.get("perKwh", 0))) / 100
-                        export_prices.extend([price_dollar] * entry_expand)
+                        # display_price keeps the signed value so the UI chart can show
+                        # negative dips during oversupply (when you'd pay to export).
+                        # lp_price clamps to 0 so the LP doesn't see paying-to-export
+                        # as profitable revenue.
+                        display_price = -(e.get("perKwh", 0)) / 100
+                        lp_price = max(0.0, display_price)
+                        export_prices.extend([lp_price] * entry_expand)
+                        display_export_raw.extend([display_price] * entry_expand)
 
                     # Track actual forecast length before padding
                     actual_price_intervals = len(import_prices)
@@ -2826,6 +3241,14 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             last = export_prices[-1] if export_prices else 0.08
                             export_prices.extend([last] * (n_steps - len(export_prices)))
                         export_prices = export_prices[:n_steps]
+
+                    if display_export_raw:
+                        if len(display_export_raw) < n_steps:
+                            last = display_export_raw[-1]
+                            display_export_raw.extend(
+                                [last] * (n_steps - len(display_export_raw))
+                            )
+                        display_export_raw = display_export_raw[:n_steps]
 
                     # Spike protection: cap buy prices during Amber spike periods
                     # so the LP optimizer won't choose to charge at extreme prices
@@ -2845,8 +3268,13 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                                 spike_status = e.get("spikeStatus", "none")
                                 if spike_status in ("spike", "potential"):
                                     base_idx = entry_positions[idx]
-                                    dur = e.get("duration", 30)
-                                    entry_expand = max(1, dur // interval)
+                                    entry_expand = (
+                                        entry_expands_general[idx]
+                                        if idx < len(entry_expands_general)
+                                        else max(1, e.get("duration", 30) // interval)
+                                    )
+                                    if entry_expand == 0:
+                                        continue
                                     original_price = e.get("perKwh", 0)
                                     capped_count = 0
                                     for j in range(entry_expand):
@@ -2863,14 +3291,23 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                                         )
 
                     if import_prices:
-                        # Apply Flow Power export schedule before display storage
+                        # Apply Flow Power export schedule before display storage.
+                        # For Flow Power, the synthetic Happy Hour schedule IS the
+                        # contractual truth, so it overrides the Amber-derived
+                        # signed values for both the LP and the display chart.
+                        # For other providers this is a no-op.
                         export_prices = self._apply_flow_power_export(export_prices)
+                        if is_flow_power:
+                            display_export_raw = list(export_prices)
 
                         # Store prices for UI display BEFORE LP adjustments.
                         # Clip to actual forecast length so the app chart doesn't
                         # show flat-line padding where the forecast ran out.
+                        # display_export_raw keeps the signed export rate so the
+                        # chart shows negative dips when wholesale is oversupplied
+                        # (Amber feedIn perKwh > 0 → you pay to export).
                         self._last_display_import_prices = list(import_prices[:actual_price_intervals])
-                        self._last_display_export_prices = list(export_prices[:actual_price_intervals])
+                        self._last_display_export_prices = list(display_export_raw[:actual_price_intervals])
 
                         # Apply export boost, saving session overlay, and chip mode to LP prices
                         export_prices = self._apply_export_boost(export_prices, import_prices)
@@ -2908,37 +3345,17 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         )
                         return (import_prices, export_prices)
 
-        # Static TOU pricing (GloBird, custom tariff, etc.)
-        # Generate 576-point price forecast from tariff schedule
-        tariff = self._tariff_schedule
-        if not tariff:
-            # Try reading from hass.data (updated by fetch_tesla_tariff_schedule)
-            from ..const import DOMAIN
-            tariff = (
-                self.hass.data.get(DOMAIN, {})
-                .get(self.entry_id, {})
-                .get("tariff_schedule")
-            )
-            if tariff:
-                _LOGGER.info("Using tariff_schedule from hass.data (not constructor)")
-                self._tariff_schedule = tariff  # Cache for next time
-
-        if tariff and tariff.get("tou_periods"):
-            periods = tariff["tou_periods"]
-            _LOGGER.info(
-                "TOU tariff available: %s, periods=%s, buy_rates=%s, sell_rates=%s",
-                tariff.get("plan_name", "unknown"),
-                list(periods.keys()),
-                {k: f"{v*100:.0f}c" for k, v in tariff.get("buy_rates", {}).items()},
-                {k: f"{v*100:.0f}c" for k, v in tariff.get("sell_rates", {}).items()},
-            )
-            return self._generate_tou_price_forecast(tariff)
+        # Static TOU pricing fallback (GloBird, custom tariff, etc.)
+        # Generate 576-point price forecast from tariff schedule.
+        tou_prices = self._get_tou_price_forecast_if_available()
+        if tou_prices is not None:
+            return tou_prices
 
         _LOGGER.warning(
             "No price data available! price_coordinator=%s, tariff=%s. "
             "Optimizer will use default flat rates.",
             self.price_coordinator is not None,
-            tariff is not None,
+            self._get_tou_tariff_schedule() is not None,
         )
         return None
 
@@ -3865,7 +4282,10 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         data: dict[str, Any] = {
             "available": self._last_solar_forecast is not None,
+            "solar_nowcast_derate": round(self._solar_nowcast_derate, 3),
         }
+        if self._last_solar_nowcast_ratio is not None:
+            data["solar_nowcast_ratio"] = round(self._last_solar_nowcast_ratio, 3)
         dt_h = self._config.interval_minutes / 60
 
         if self._last_solar_forecast:
@@ -3925,6 +4345,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Get current action info
         current_action = "idle"
         current_power_w = self._get_actual_battery_power_w()
+        current_action_end_time = None  # When the current scheduled action segment ends
         next_action = "idle"
         next_action_time = None
         next_action_power_w = 0
@@ -3934,8 +4355,18 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if ca:
                 current_action = ca.action
 
-            # Find next different action
             now = dt_util.now()
+
+            # First future action of any type tells us when the current segment ends.
+            # That's a separate concern from "next different action" — the existing
+            # next_action field skips ahead past long self_consumption stretches,
+            # which is useful but reads as misleading without an "until" timestamp.
+            for a in self._current_schedule.actions:
+                if a.timestamp > now:
+                    current_action_end_time = a.timestamp.isoformat()
+                    break
+
+            # Find next different action (used by the Next Scheduled Change sensor)
             for a in self._current_schedule.actions:
                 if a.timestamp > now and a.action != current_action:
                     next_action = a.action
@@ -3974,6 +4405,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "optimization_status": "active" if optimizer_available else "not_available",
             "current_action": current_action,
             "current_power_w": current_power_w,
+            "current_action_end_time": current_action_end_time,
             "next_action": next_action,
             "next_action_time": next_action_time,
             "next_action_power_w": next_action_power_w,

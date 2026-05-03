@@ -137,7 +137,7 @@ set_backup_reserve:
 
 set_operation_mode:
   name: Set Operation Mode
-  description: Set Powerwall operation mode (Time-Based Control or Self-Consumption)
+  description: Set Powerwall operation mode (Time-Based Control, Self-Consumption, or Backup-Only)
   fields:
     mode:
       name: Mode
@@ -151,6 +151,8 @@ set_operation_mode:
               value: "autonomous"
             - label: "Self-Consumption"
               value: "self_consumption"
+            - label: "Backup-Only"
+              value: "backup"
 
 set_grid_export:
   name: Set Grid Export
@@ -232,7 +234,7 @@ set_vpp_enrollment:
 
 get_calendar_history:
   name: Get Calendar History
-  description: Fetch energy history from Tesla API for mobile app energy summaries
+  description: Fetch energy history from the configured battery system for mobile app energy summaries
   fields:
     period:
       name: Period
@@ -330,4 +332,33 @@ powerwall_reconnect_grid:
     Reconnect the Tesla Powerwall to the grid after an intentional islanding.
     Works on paired Powerwall 2 (REST) and Powerwall 3 (TEDAPI v1r). Safe to
     call while already on-grid — the gateway will no-op.
+  fields: {}
+
+schedule_max_backup:
+  name: Schedule Max Backup
+  description: >-
+    Charge the Powerwall to 100% for a fixed window then restore the previous
+    backup reserve. Use ahead of forecast outages or storms. Calling again while
+    a window is active replaces the schedule and preserves the original reserve.
+  fields:
+    duration_minutes:
+      name: Duration (minutes)
+      description: How long to hold the reserve at 100% before restoring (1-1440).
+      required: true
+      example: 120
+      selector:
+        number:
+          min: 1
+          max: 1440
+          step: 1
+          unit_of_measurement: min
+          mode: box
+
+refresh_calibration:
+  name: Refresh Calibration
+  description: >-
+    Clear PowerSync's calibration_suspected flag. Use after a Powerwall
+    calibration cycle completes if the optimiser hasn't auto-cleared the flag,
+    or to retry mode toggles immediately. Doesn't touch the Powerwall — purely
+    resets the integration's local guard.
   fields: {}

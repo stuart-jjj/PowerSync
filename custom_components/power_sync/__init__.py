@@ -9,6 +9,8 @@ import pathlib
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
+from homeassistant.util import dt as dt_util
+
 # Module-level state for alert cooldowns (keyed by entry_id)
 _last_discrepancy_alert: dict[str, datetime] = {}
 _discrepancy_alert_count: dict[str, int] = {}
@@ -49,6 +51,59 @@ def _battery_health_payload_is_newer(candidate_ts: Any, current_ts: Any) -> bool
         return False
     return candidate >= current
 
+
+def _resolve_non_nem_timezone(hass, electricity_provider: str) -> str | None:
+    """Pick an IANA timezone for non-NEM (non-Australian) providers.
+
+    Sigenergy/FoxESS cloud sync converters fall back to Australia/Sydney when
+    no NEM region is supplied. For Octopus UK and other non-NEM providers,
+    that bucketing is ~10 hours off real local time. Returns None for
+    Australian providers so the existing NEM-region path keeps running.
+    """
+    if electricity_provider == "octopus":
+        return "Europe/London"
+    # For any other non-AU provider, fall back to HA's configured timezone.
+    if electricity_provider in ("nz", "epex", "other"):
+        return getattr(hass.config, "time_zone", None)
+    return None
+
+
+# Valid NEM region codes. Used to validate user-supplied region values before
+# we hand them to AEMOPriceCoordinator.
+_NEM_REGIONS = ("NSW1", "VIC1", "QLD1", "SA1", "TAS1")
+
+# IANA timezone → NEM region. Tesla site_info.installation_time_zone gives us
+# this for free for Tesla Powerwall users; mapping it lets us spawn an
+# AEMO-dispatch trigger for users on Amber / Localvolts / Flow Power non-AEMO
+# without asking them to pick a region in the config flow.
+# WA (Australia/Perth) and NT (Australia/Darwin) are intentionally absent —
+# neither is on the National Electricity Market.
+_TZ_TO_NEM_REGION: dict[str, str] = {
+    "Australia/Sydney": "NSW1",
+    "Australia/ACT": "NSW1",
+    "Australia/Canberra": "NSW1",
+    "Australia/NSW": "NSW1",
+    "Australia/Broken_Hill": "NSW1",
+    "Australia/Lord_Howe": "NSW1",
+    "Australia/Melbourne": "VIC1",
+    "Australia/Victoria": "VIC1",
+    "Australia/Brisbane": "QLD1",
+    "Australia/Lindeman": "QLD1",
+    "Australia/Queensland": "QLD1",
+    "Australia/Adelaide": "SA1",
+    "Australia/South": "SA1",
+    "Australia/Hobart": "TAS1",
+    "Australia/Currie": "TAS1",
+    "Australia/Tasmania": "TAS1",
+}
+
+
+def _nem_region_from_iana_tz(tz_name: str | None) -> str | None:
+    """Map an IANA timezone (e.g. Australia/Sydney) to a NEM region code."""
+    if not tz_name:
+        return None
+    return _TZ_TO_NEM_REGION.get(tz_name)
+
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 import homeassistant.helpers.config_validation as cv
 from homeassistant.const import Platform, CONF_ACCESS_TOKEN, CONF_TOKEN
@@ -59,7 +114,7 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import async_track_utc_time_change, async_track_point_in_utc_time
 from homeassistant.helpers.storage import Store
-from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.dispatcher import async_dispatcher_send, async_dispatcher_connect
 from homeassistant.components.http import HomeAssistantView
 from aiohttp import web
 
@@ -85,6 +140,7 @@ from .const import (
     CONF_MONTHLY_SUPPLY_CHARGE,
     CONF_BATTERY_CURTAILMENT_ENABLED,
     CONF_SIGENERGY_DC_CURTAILMENT_ENABLED,
+    CONF_POWERWALL_OFFGRID_AS_CURTAILMENT,
     CONF_TESLA_API_PROVIDER,
     CONF_FLEET_API_ACCESS_TOKEN,
     TESLA_PROVIDER_TESLEMETRY,
@@ -107,6 +163,7 @@ from .const import (
     DEFAULT_DISCHARGE_DURATION,
     TESLEMETRY_API_BASE_URL,
     FLEET_API_BASE_URL,
+    CONF_FLEET_API_BASE_URL,
     POWERSYNC_API_BASE_URL,
     TESLA_PROVIDER_POWERSYNC,
     get_tesla_api_base_url,
@@ -174,8 +231,6 @@ from .const import (
     DEFAULT_CHIP_MODE_THRESHOLD,
     # Spike protection configuration
     CONF_SPIKE_PROTECTION_ENABLED,
-    # Settled prices only mode
-    CONF_SETTLED_PRICES_ONLY,
     # Forecast discrepancy alert configuration
     CONF_FORECAST_DISCREPANCY_ALERT,
     CONF_FORECAST_DISCREPANCY_THRESHOLD,
@@ -253,6 +308,8 @@ from .const import (
     DEFAULT_SAJ_BATTERY_CAPACITY_KWH,
     DEFAULT_VOLTX_PORT,
     DEFAULT_VOLTX_SLAVE_ID,
+    CONF_SAJ_INVERTER_RATED_KW,
+    DEFAULT_SAJ_INVERTER_RATED_KW,
     # Battery system selection
     CONF_BATTERY_SYSTEM,
     BATTERY_SYSTEM_SUNGROW,
@@ -373,7 +430,19 @@ from .const import (
     CONF_OPTIMIZATION_COST_FUNCTION,
     CONF_OPTIMIZATION_INTERVAL,
     CONF_OPTIMIZATION_BACKUP_RESERVE,
+    CONF_HARDWARE_BACKUP_RESERVE,
+    CONF_OPTIMIZATION_BATTERY_CAPACITY_WH,
+    CONF_OPTIMIZATION_MAX_CHARGE_W,
+    CONF_OPTIMIZATION_MAX_DISCHARGE_W,
     DEFAULT_OPTIMIZATION_BACKUP_RESERVE,
+    BATTERY_CAPACITY_DEFAULTS,
+    BATTERY_POWER_DEFAULTS,
+)
+from .currency import (
+    DEFAULT_CURRENCY,
+    currency_for_entry,
+    currency_metadata,
+    normalize_currency,
 )
 from .inverters import get_inverter_controller
 from .optimization.coordinator import OptimizationCoordinator
@@ -470,6 +539,110 @@ def _resolve_teslemetry_bt_prefix(hass) -> str | None:
     return None
 
 
+def _wall_connector_records(raw: Any) -> list[dict]:
+    """Coerce Tesla coordinator Wall Connector payloads into dict records."""
+    if isinstance(raw, list):
+        return [item for item in raw if isinstance(item, dict)]
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            try:
+                import ast
+                parsed = ast.literal_eval(raw)
+            except Exception:
+                return []
+        if isinstance(parsed, list):
+            return [item for item in parsed if isinstance(item, dict)]
+    return []
+
+
+def _kw_from_ev_power(value: Any, unit: Any = None) -> float:
+    try:
+        power = float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+    unit_key = str(unit or "").strip().lower()
+    if unit_key in ("w", "watt", "watts"):
+        return power / 1000
+    if unit_key in ("kw", "kilowatt", "kilowatts"):
+        return power
+    return power / 1000 if abs(power) > 100 else power
+
+
+def _kw_from_power_state(state: Any) -> float:
+    if not state or state.state in ("unknown", "unavailable"):
+        return 0.0
+    return _kw_from_ev_power(
+        state.state,
+        (getattr(state, "attributes", None) or {}).get("unit_of_measurement"),
+    )
+
+
+def _kw_from_wall_connector_power(value: Any) -> float:
+    return _kw_from_ev_power(value)
+
+
+def _apply_wall_connector_observation(
+    vehicles: list[dict],
+    wc_power_kw: float,
+    wc_connected: bool,
+    wc_charging: bool,
+    wc_vin: Any = None,
+) -> bool:
+    """Attach Wall Connector telemetry only when it can be matched safely."""
+    if not (wc_connected or wc_charging or wc_power_kw > 0.05):
+        return False
+
+    def update_vehicle(vehicle: dict) -> None:
+        if wc_power_kw > (vehicle.get("ev_power_kw") or 0):
+            vehicle["ev_power_kw"] = wc_power_kw
+        vehicle["is_connected"] = True
+        vehicle["is_charging"] = (
+            bool(vehicle.get("is_charging"))
+            or wc_charging
+            or wc_power_kw > 0.05
+        )
+
+    wc_vin_key = str(wc_vin or "").strip().lower()
+    if wc_vin_key:
+        for vehicle in vehicles:
+            vehicle_id = (
+                str(vehicle.get("vehicle_id") or vehicle.get("vin") or "")
+                .strip()
+                .lower()
+            )
+            if vehicle_id and (
+                vehicle_id == wc_vin_key
+                or vehicle_id in wc_vin_key
+                or wc_vin_key in vehicle_id
+            ):
+                update_vehicle(vehicle)
+                return True
+
+    charging_vehicles = [
+        vehicle for vehicle in vehicles
+        if bool(vehicle.get("is_charging")) or (vehicle.get("ev_power_kw") or 0) > 0.05
+    ]
+    connected_vehicles = [
+        vehicle for vehicle in vehicles
+        if bool(vehicle.get("is_connected"))
+    ]
+
+    if (wc_charging or wc_power_kw > 0.05) and len(charging_vehicles) == 1:
+        update_vehicle(charging_vehicles[0])
+        return True
+    if not charging_vehicles and wc_connected and len(connected_vehicles) == 1:
+        update_vehicle(connected_vehicles[0])
+        return True
+    if len(vehicles) == 1 and not charging_vehicles and not connected_vehicles:
+        update_vehicle(vehicles[0])
+        return True
+
+    return False
+
+
 def _get_ev_vehicle_status(hass, entry) -> dict:
     """Get EV charging status from Tesla vehicle sensors (Fleet API + BLE).
 
@@ -511,12 +684,9 @@ def _get_ev_vehicle_status(hass, entry) -> dict:
         ble_power_entity = TESLA_BLE_SENSOR_CHARGE_POWER.format(prefix=prefix)
         ble_state = hass.states.get(ble_power_entity)
         if is_ble_charging and ble_state and ble_state.state not in ("unknown", "unavailable"):
-            try:
-                val = float(ble_state.state)
-                if val > 0:
-                    ev_power_kw = max(ev_power_kw, val)
-            except (ValueError, TypeError):
-                pass
+            val = _kw_from_power_state(ble_state)
+            if val > 0:
+                ev_power_kw = max(ev_power_kw, val)
 
     # Check Teslemetry Bluetooth sensors
     tbt_prefix = _resolve_teslemetry_bt_prefix(hass)
@@ -524,12 +694,9 @@ def _get_ev_vehicle_status(hass, entry) -> dict:
         tbt_power_entity = TESLEMETRY_BT_SENSOR_CHARGER_POWER.format(prefix=tbt_prefix)
         tbt_state = hass.states.get(tbt_power_entity)
         if tbt_state and tbt_state.state not in ("unknown", "unavailable"):
-            try:
-                val = float(tbt_state.state)
-                if val > 0:
-                    ev_power_kw = max(ev_power_kw, val)
-            except (ValueError, TypeError):
-                pass
+            val = _kw_from_power_state(tbt_state)
+            if val > 0:
+                ev_power_kw = max(ev_power_kw, val)
 
         tbt_soc_entity = TESLEMETRY_BT_SENSOR_BATTERY_LEVEL.format(prefix=tbt_prefix)
         tbt_soc_state = hass.states.get(tbt_soc_entity)
@@ -593,12 +760,9 @@ def _get_ev_vehicle_status(hass, entry) -> dict:
                 continue
 
             if is_fleet_charging and ("charger_power" in eid or "charging_power" in eid or "charge_power" in eid):
-                try:
-                    val = float(state.state)
-                    if val > 0:
-                        ev_power_kw = max(ev_power_kw, val)
-                except (ValueError, TypeError):
-                    pass
+                val = _kw_from_power_state(state)
+                if val > 0:
+                    ev_power_kw = max(ev_power_kw, val)
 
             # Read battery level (e.g. sensor.tessy_battery_level)
             if ev_soc is None and "battery" in eid and "range" not in eid and "heater" not in eid:
@@ -624,11 +788,13 @@ def _get_ev_vehicles_status(hass, entry) -> list:
 
     for device in device_registry.devices.values():
         is_tesla_vehicle = False
+        vehicle_id = None
         for identifier in device.identifiers:
             if identifier[0] in TESLA_INTEGRATIONS:
                 potential_vin = str(identifier[1])
                 if len(potential_vin) == 17 and not potential_vin.isdigit():
                     is_tesla_vehicle = True
+                    vehicle_id = potential_vin
                 break
         if not is_tesla_vehicle:
             continue
@@ -662,12 +828,9 @@ def _get_ev_vehicles_status(hass, entry) -> list:
                 continue
 
             if "charger_power" in eid or "charging_power" in eid or "charge_power" in eid:
-                try:
-                    val = float(state.state)
-                    if val > 0:
-                        ev_power_kw = max(ev_power_kw, val)
-                except (ValueError, TypeError):
-                    pass
+                val = _kw_from_power_state(state)
+                if val > 0:
+                    ev_power_kw = max(ev_power_kw, val)
 
             if ev_soc is None and "battery" in eid and "range" not in eid and "heater" not in eid:
                 try:
@@ -682,6 +845,7 @@ def _get_ev_vehicles_status(hass, entry) -> list:
             is_connected = True
 
         vehicles.append({
+            "vehicle_id": vehicle_id,
             "vehicle_name": device.name or "Tesla EV",
             "ev_power_kw": ev_power_kw,
             "ev_soc": ev_soc,
@@ -690,52 +854,76 @@ def _get_ev_vehicles_status(hass, entry) -> list:
         })
 
     # Supplement with Wall Connector sensors for better detection.
-    # WC sensors stay awake even when the car is asleep, providing
-    # reliable power and connected status.
-    wc_power = 0.0
-    wc_connected = False
-    for state_obj in hass.states.async_all("sensor"):
-        eid = state_obj.entity_id.lower()
-        if "wall_connector" not in eid:
-            continue
-        if state_obj.state in ("unknown", "unavailable"):
-            continue
-        # Wall Connector vehicle sensor: "disconnected", "charging", "connected", etc.
-        if "vehicle" in eid and "power" not in eid:
-            if state_obj.state.lower() not in ("disconnected", "unknown", "unavailable", ""):
-                wc_connected = True
-        # Wall Connector power sensor
-        if "power" in eid:
-            try:
-                val = float(state_obj.state)
+    # WC sensors stay awake even when the car is asleep, providing reliable
+    # power and connected status, but they are site/loadpoint telemetry. In
+    # multi-vehicle accounts we must not attach that power to an arbitrary car.
+    wc_observations = []
+    entry_data = getattr(hass, "data", {}).get(DOMAIN, {}).get(entry.entry_id, {})
+    tesla_coordinator = entry_data.get("tesla_coordinator")
+    if tesla_coordinator and tesla_coordinator.data:
+        raw_wc = (
+            tesla_coordinator.data.get("wall_connectors_raw")
+            or tesla_coordinator.data.get("wall_connectors")
+        )
+        for wc in _wall_connector_records(raw_wc):
+            wc_state = wc.get("wall_connector_state", 0)
+            wc_power_kw = _kw_from_wall_connector_power(
+                wc.get("wall_connector_power", wc.get("power"))
+            )
+            wc_connected = wc_state in (2, 4, 6, 7, 11) or wc_power_kw > 0.05
+            wc_charging = wc_power_kw > 0.05 or wc_state == 2
+            wc_observations.append((
+                wc_power_kw,
+                wc_connected,
+                wc_charging,
+                wc.get("vin") or wc.get("vehicle_vin"),
+            ))
+
+        if not wc_observations:
+            wc_power_kw = _kw_from_wall_connector_power(
+                tesla_coordinator.data.get("ev_power", 0)
+            )
+            if wc_power_kw > 0.05:
+                wc_observations.append((wc_power_kw, True, True, None))
+
+    if not wc_observations:
+        wc_power = 0.0
+        wc_connected = False
+        for state_obj in hass.states.async_all("sensor"):
+            eid = state_obj.entity_id.lower()
+            if "wall_connector" not in eid:
+                continue
+            if state_obj.state in ("unknown", "unavailable"):
+                continue
+            # Wall Connector vehicle sensor: "disconnected", "charging", "connected", etc.
+            if "vehicle" in eid and "power" not in eid:
+                if state_obj.state.lower() not in ("disconnected", "unknown", "unavailable", ""):
+                    wc_connected = True
+            # Wall Connector power sensor
+            if "power" in eid:
+                val = _kw_from_power_state(state_obj)
                 if val > 0:
                     wc_power = max(wc_power, val)
-            except (ValueError, TypeError):
-                pass
+        if wc_connected or wc_power > 0.05:
+            wc_observations.append((wc_power, wc_connected, wc_power > 0.05, None))
 
-    # Apply WC data to vehicles (improve detection when car sensors are stale)
-    if wc_connected or wc_power > 0.05:
-        if vehicles:
-            # Update first vehicle with WC data
-            v = vehicles[0]
-            if wc_power > v["ev_power_kw"]:
-                v["ev_power_kw"] = wc_power
-            v["is_connected"] = True
-            v["is_charging"] = wc_power > 0.05
-        else:
-            # No vehicle found but WC shows connected — add a WC-based entry
+    for wc_power, wc_connected, wc_charging, wc_vin in wc_observations:
+        matched = _apply_wall_connector_observation(
+            vehicles,
+            wc_power,
+            wc_connected,
+            wc_charging,
+            wc_vin,
+        )
+        if not matched:
             vehicles.append({
+                "vehicle_id": "wall_connector",
                 "vehicle_name": "Wall Connector",
                 "ev_power_kw": wc_power,
                 "ev_soc": None,
                 "is_connected": True,
-                "is_charging": wc_power > 0.05,
+                "is_charging": wc_charging or wc_power > 0.05,
             })
-    elif vehicles:
-        # WC says disconnected — override stale vehicle sensor data
-        for v in vehicles:
-            if not v["is_charging"]:
-                v["is_connected"] = False
 
     return vehicles
 
@@ -969,6 +1157,7 @@ PLATFORMS: list[Platform] = [
     Platform.SELECT,
     Platform.NUMBER,
     Platform.BINARY_SENSOR,
+    Platform.BUTTON,
     Platform.UPDATE,
 ]
 
@@ -1034,21 +1223,16 @@ class SyncCoordinator:
     - Reliability: Multiple fallback checks if WebSocket fails
     """
 
-    # Price difference threshold (in cents) to trigger re-sync
-    PRICE_DIFF_THRESHOLD = 0.5  # Re-sync if price differs by more than 0.5c/kWh
-
     def __init__(self):
         self._websocket_event = asyncio.Event()
         self._websocket_data = None
         self._current_period = None  # Track which 5-min period we're in
         self._lock = asyncio.Lock()
         self._initial_sync_done = False  # Has initial forecast sync happened this period?
-        self._last_synced_prices = {}  # {'general': price, 'feedIn': price}
         self._websocket_received = False  # Has WebSocket delivered this period?
 
     def _get_current_period(self):
         """Get the current 5-minute period timestamp."""
-        from homeassistant.util import dt as dt_util
         now = dt_util.utcnow()
         current_period = now.replace(second=0, microsecond=0)
         return current_period.replace(minute=current_period.minute - (current_period.minute % 5))
@@ -1061,7 +1245,6 @@ class SyncCoordinator:
             self._current_period = current_period
             self._initial_sync_done = False
             self._websocket_received = False
-            self._last_synced_prices = {}
             self._websocket_event.clear()
             self._websocket_data = None
             return True
@@ -1104,58 +1287,6 @@ class SyncCoordinator:
         async with self._lock:
             await self._reset_if_new_period()
             return self._websocket_received
-
-    def record_synced_price(self, general_price, feedin_price):
-        """
-        Record the price that was synced.
-
-        Args:
-            general_price: The general (buy) price in c/kWh
-            feedin_price: The feedIn (sell) price in c/kWh
-        """
-        self._last_synced_prices = {
-            'general': general_price,
-            'feedIn': feedin_price
-        }
-        _LOGGER.debug(f"Recorded synced price: general={general_price}c, feedIn={feedin_price}c")
-
-    def should_resync_for_price(self, new_general_price, new_feedin_price):
-        """
-        Check if we should re-sync because the price has changed significantly.
-
-        Args:
-            new_general_price: The new general price from WebSocket/REST
-            new_feedin_price: The new feedIn price from WebSocket/REST
-
-        Returns:
-            bool: True if price difference exceeds threshold
-        """
-        last_prices = self._last_synced_prices
-
-        if not last_prices:
-            # No previous sync - should sync
-            _LOGGER.info("No previous price recorded, will sync")
-            return True
-
-        last_general = last_prices.get('general')
-        last_feedin = last_prices.get('feedIn')
-
-        # Check general price difference
-        if last_general is not None and new_general_price is not None:
-            general_diff = abs(new_general_price - last_general)
-            if general_diff > self.PRICE_DIFF_THRESHOLD:
-                _LOGGER.info(f"General price changed by {general_diff:.2f}c ({last_general:.2f}c → {new_general_price:.2f}c) - will re-sync")
-                return True
-
-        # Check feedIn price difference
-        if last_feedin is not None and new_feedin_price is not None:
-            feedin_diff = abs(new_feedin_price - last_feedin)
-            if feedin_diff > self.PRICE_DIFF_THRESHOLD:
-                _LOGGER.info(f"FeedIn price changed by {feedin_diff:.2f}c ({last_feedin:.2f}c → {new_feedin_price:.2f}c) - will re-sync")
-                return True
-
-        _LOGGER.debug(f"Price unchanged (general={new_general_price}c, feedIn={new_feedin_price}c) - skipping re-sync")
-        return False
 
     # Legacy methods for backwards compatibility
     async def wait_for_websocket_or_timeout(self, timeout_seconds=15):
@@ -1279,7 +1410,6 @@ class AEMOSpikeManager:
 
     async def check_and_handle_spike(self) -> None:
         """Check AEMO prices and handle spike mode transitions."""
-        from homeassistant.util import dt as dt_util
 
         self._last_check = dt_util.utcnow()
 
@@ -1313,7 +1443,6 @@ class AEMOSpikeManager:
 
     async def _enter_spike_mode(self, current_price: float) -> None:
         """Enter spike mode: save tariff, switch to autonomous, upload spike tariff."""
-        from homeassistant.util import dt as dt_util
 
         _LOGGER.warning(
             "SPIKE DETECTED: $%.2f/MWh >= $%.0f/MWh threshold - entering spike mode",
@@ -1332,7 +1461,7 @@ class AEMOSpikeManager:
                 "Authorization": f"Bearer {current_token}",
                 "Content-Type": "application/json",
             }
-            api_base = get_tesla_api_base_url(current_provider)
+            api_base = get_tesla_api_base_url(current_provider, self.entry.data.get(CONF_FLEET_API_BASE_URL))
 
             # Step 1: Save current tariff
             _LOGGER.info("Saving current tariff before spike mode...")
@@ -1398,6 +1527,7 @@ class AEMOSpikeManager:
                 spike_tariff,
                 current_token,
                 current_provider,
+                fleet_base_url=self.entry.data.get(CONF_FLEET_API_BASE_URL),
             )
 
             if success:
@@ -1432,7 +1562,7 @@ class AEMOSpikeManager:
                 "Authorization": f"Bearer {current_token}",
                 "Content-Type": "application/json",
             }
-            api_base = get_tesla_api_base_url(current_provider)
+            api_base = get_tesla_api_base_url(current_provider, self.entry.data.get(CONF_FLEET_API_BASE_URL))
 
             # Step 1: Switch to self_consumption mode first (helps tariff apply)
             _LOGGER.info("Switching to self_consumption mode before tariff restore...")
@@ -1454,6 +1584,7 @@ class AEMOSpikeManager:
                     self._saved_tariff,
                     current_token,
                     current_provider,
+                    fleet_base_url=self.entry.data.get(CONF_FLEET_API_BASE_URL),
                 )
                 if success:
                     _LOGGER.info("Restored saved tariff successfully")
@@ -1491,7 +1622,6 @@ class AEMOSpikeManager:
 
         Uses very high sell rates to encourage Powerwall to export all energy.
         """
-        from homeassistant.util import dt as dt_util
 
         # Convert $/MWh to $/kWh (divide by 1000) and apply 3x markup
         # This creates a HUGE sell incentive that Powerwall will respond to
@@ -1659,7 +1789,6 @@ class GenericAEMOSpikeManager:
 
     async def check_and_handle_spike(self) -> None:
         """Check AEMO prices and handle spike mode transitions."""
-        from homeassistant.util import dt as dt_util
 
         self._last_check = dt_util.utcnow()
 
@@ -1694,7 +1823,6 @@ class GenericAEMOSpikeManager:
 
     async def _enter_spike_mode(self, current_price: float) -> None:
         """Enter spike mode: force discharge via service call and notify user."""
-        from homeassistant.util import dt as dt_util
 
         _LOGGER.warning(
             "%s SPIKE DETECTED: $%.2f/MWh >= $%.0f/MWh threshold - starting force discharge",
@@ -1733,7 +1861,6 @@ class GenericAEMOSpikeManager:
 
     async def _exit_spike_mode(self, current_price: float) -> None:
         """Exit spike mode: restore normal operation via service call and notify user."""
-        from homeassistant.util import dt as dt_util
 
         _LOGGER.info(
             "%s: Price normalized: $%.2f/MWh < $%.0f/MWh threshold - restoring normal operation",
@@ -1872,7 +1999,6 @@ class SavingSessionTariffManager:
 
     async def _enter_session_mode(self, session) -> None:
         """Save tariff, create session tariff, upload to Tesla."""
-        from homeassistant.util import dt as dt_util
 
         _LOGGER.warning(
             "SAVING SESSION STARTING: %s (%s - %s, %d octopoints/kWh) - entering session mode",
@@ -1889,7 +2015,7 @@ class SavingSessionTariffManager:
                 "Authorization": f"Bearer {current_token}",
                 "Content-Type": "application/json",
             }
-            api_base = get_tesla_api_base_url(current_provider)
+            api_base = get_tesla_api_base_url(current_provider, self.entry.data.get(CONF_FLEET_API_BASE_URL))
 
             # Step 1: Save current tariff
             _LOGGER.info("Saving current tariff before session mode...")
@@ -1945,6 +2071,7 @@ class SavingSessionTariffManager:
                 session_tariff,
                 current_token,
                 current_provider,
+                fleet_base_url=self.entry.data.get(CONF_FLEET_API_BASE_URL),
             )
 
             if success:
@@ -2031,7 +2158,7 @@ class SavingSessionTariffManager:
                 "Authorization": f"Bearer {current_token}",
                 "Content-Type": "application/json",
             }
-            api_base = get_tesla_api_base_url(current_provider)
+            api_base = get_tesla_api_base_url(current_provider, self.entry.data.get(CONF_FLEET_API_BASE_URL))
 
             # Step 1: Switch to self_consumption mode first
             _LOGGER.info("Switching to self_consumption before tariff restore...")
@@ -2053,6 +2180,7 @@ class SavingSessionTariffManager:
                     self._saved_tariff,
                     current_token,
                     current_provider,
+                    fleet_base_url=self.entry.data.get(CONF_FLEET_API_BASE_URL),
                 )
                 if success:
                     _LOGGER.info("Restored saved tariff successfully")
@@ -2158,7 +2286,6 @@ class GenericSavingSessionManager:
 
     async def _enter_session_mode(self, session) -> None:
         """Force discharge battery during saving session."""
-        from homeassistant.util import dt as dt_util
 
         _LOGGER.warning(
             "%s SAVING SESSION STARTING: %s (%d octopoints/kWh) - force discharging",
@@ -2347,17 +2474,19 @@ async def send_tariff_to_tesla(
     api_provider: str = TESLA_PROVIDER_TESLEMETRY,
     max_retries: int = 3,
     timeout_seconds: int = 60,
+    fleet_base_url: str | None = None,
 ) -> bool:
-    """Send tariff data to Tesla via Teslemetry or Fleet API with retry logic.
+    """Send tariff data to Tesla via the configured provider with retry logic.
 
     Args:
         hass: HomeAssistant instance
         site_id: Tesla energy site ID
         tariff_data: Tariff data to send
-        api_token: API token (Teslemetry or Fleet API)
-        api_provider: API provider (teslemetry or fleet_api)
+        api_token: API token (Teslemetry, Fleet API, or PowerSync proxy)
+        api_provider: API provider (teslemetry, fleet_api, or powersync)
         max_retries: Maximum number of retry attempts (default: 3)
         timeout_seconds: Request timeout in seconds (default: 60)
+        fleet_base_url: Regional Fleet API base URL override for EU/AP users.
 
     Returns:
         True if successful, False otherwise
@@ -2415,7 +2544,7 @@ async def send_tariff_to_tesla(
         _LOGGER.debug("Error logging payload details: %s", err)
 
     # Use correct API base URL based on provider
-    api_base = get_tesla_api_base_url(api_provider)
+    api_base = get_tesla_api_base_url(api_provider, fleet_base_url)
     url = f"{api_base}/api/1/energy_sites/{site_id}/time_of_use_settings"
     _LOGGER.debug("Sending TOU schedule via %s API", api_provider)
     last_error = None
@@ -2436,7 +2565,8 @@ async def send_tariff_to_tesla(
                 await asyncio.sleep(wait_time)
 
             _LOGGER.debug(
-                "Sending TOU schedule to Teslemetry API for site %s (attempt %d/%d)",
+                "Sending TOU schedule to Tesla via %s for site %s (attempt %d/%d)",
+                api_provider,
                 site_id,
                 attempt + 1,
                 max_retries
@@ -2500,7 +2630,8 @@ async def send_tariff_to_tesla(
 
         except aiohttp.ClientError as err:
             _LOGGER.warning(
-                "Error communicating with Teslemetry API (attempt %d/%d): %s",
+                "Error communicating with Tesla via %s (attempt %d/%d): %s",
+                api_provider,
                 attempt + 1,
                 max_retries,
                 err
@@ -2510,7 +2641,8 @@ async def send_tariff_to_tesla(
 
         except asyncio.TimeoutError:
             _LOGGER.warning(
-                "Teslemetry API timeout after %ds (attempt %d/%d)",
+                "Tesla API timeout via %s after %ds (attempt %d/%d)",
+                api_provider,
                 timeout_seconds,
                 attempt + 1,
                 max_retries
@@ -2778,34 +2910,12 @@ def _match_tou_period(tou_periods: dict, hour: int, tesla_dow: int) -> str:
     Supports custom period names like PEAK_1, PEAK_2, OFF_PEAK_AUTO.
     SUPER_OFF_PEAK checked first, OFF_PEAK last as catch-all.
     """
-    sorted_priority = sorted(
-        tou_periods.keys(),
-        key=lambda n: (
-            2 if n.startswith("OFF_PEAK") else
-            0 if n.startswith("SUPER_OFF_PEAK") else 1
-        ),
-    )
-    for period_name in sorted_priority:
-        period_data = tou_periods[period_name]
-        if isinstance(period_data, dict) and "periods" in period_data:
-            periods_list = period_data["periods"]
-        elif isinstance(period_data, list):
-            periods_list = period_data
-        else:
-            continue
-        for p in periods_list:
-            from_dow = p.get("fromDayOfWeek", 0)
-            to_dow = p.get("toDayOfWeek", 6)
-            from_hour = p.get("fromHour", 0)
-            to_hour = p.get("toHour", 24)
-            if from_dow <= tesla_dow <= to_dow:
-                if from_hour <= to_hour:
-                    if from_hour <= hour < to_hour:
-                        return period_name
-                else:
-                    if hour >= from_hour or hour < to_hour:
-                        return period_name
-    return "OFF_PEAK"
+    from datetime import datetime, timedelta
+    from .tariff_time import find_matching_tou_period
+
+    # 2024-01-07 was a Sunday, matching Tesla day 0.
+    when = datetime(2024, 1, 7, hour) + timedelta(days=tesla_dow % 7)
+    return find_matching_tou_period(tou_periods, when, default="OFF_PEAK")
 
 
 def _weighted_avg_rates(tou_periods: dict, buy_rates: dict, sell_rates: dict) -> tuple[float, float]:
@@ -2861,7 +2971,6 @@ async def _calculate_cost_from_statistics(
     (e.g. new installation, sensors not yet recorded).
     """
     from datetime import datetime as dt, timedelta
-    from homeassistant.util import dt as dt_util
 
     try:
         now = dt_util.now()
@@ -2975,6 +3084,107 @@ async def _calculate_cost_from_statistics(
         return None
 
 
+_CALENDAR_ENERGY_SUMMARY_COORDINATORS = (
+    ("sigenergy_coordinator", "Sigenergy"),
+    ("sungrow_coordinator", "Sungrow"),
+    ("foxess_coordinator", "FoxESS"),
+    ("goodwe_coordinator", "GoodWe"),
+    ("alphaess_coordinator", "AlphaESS"),
+    ("esy_sunhome_coordinator", "ESY Sunhome"),
+    ("solax_coordinator", "Solax"),
+    ("saj_h2_coordinator", "SAJ H2"),
+)
+
+
+def _find_calendar_energy_summary_source(
+    hass: HomeAssistant, preferred_entry_id: str | None = None
+) -> tuple[str | None, Any | None]:
+    """Return the first non-Tesla coordinator that exposes daily energy totals."""
+    domain_data = hass.data.get(DOMAIN, {})
+    ordered_entry_data: list[dict[str, Any]] = []
+
+    if preferred_entry_id:
+        preferred_data = domain_data.get(preferred_entry_id)
+        if isinstance(preferred_data, dict):
+            ordered_entry_data.append(preferred_data)
+
+    for entry_id, data in domain_data.items():
+        if entry_id == preferred_entry_id:
+            continue
+        if isinstance(data, dict):
+            ordered_entry_data.append(data)
+
+    for data in ordered_entry_data:
+        for coordinator_key, system_name in _CALENDAR_ENERGY_SUMMARY_COORDINATORS:
+            coordinator = data.get(coordinator_key)
+            coordinator_data = getattr(coordinator, "data", None)
+            if (
+                coordinator is not None
+                and isinstance(coordinator_data, dict)
+                and "energy_summary" in coordinator_data
+            ):
+                return system_name, coordinator
+
+    return None, None
+
+
+def _energy_summary_wh(energy_data: dict[str, Any], key: str) -> float:
+    """Read a kWh value from energy_summary and convert it to Wh."""
+    try:
+        return float(energy_data.get(key) or 0) * 1000
+    except (TypeError, ValueError):
+        return 0
+
+
+def _calendar_time_series_from_energy_summary(coordinator: Any) -> list[dict[str, Any]]:
+    """Build a mobile-compatible one-point history from coordinator totals."""
+    energy_data = {}
+    if coordinator and getattr(coordinator, "data", None):
+        energy_data = coordinator.data.get("energy_summary", {}) or {}
+
+    return [{
+        "timestamp": dt_util.utcnow().isoformat(),
+        "solar_generation": _energy_summary_wh(energy_data, "pv_today_kwh"),
+        "battery_discharge": _energy_summary_wh(energy_data, "discharge_today_kwh"),
+        "battery_charge": _energy_summary_wh(energy_data, "charge_today_kwh"),
+        "grid_import": _energy_summary_wh(energy_data, "grid_import_today_kwh"),
+        "grid_export": _energy_summary_wh(energy_data, "grid_export_today_kwh"),
+        "home_consumption": _energy_summary_wh(energy_data, "load_today_kwh"),
+    }]
+
+
+async def _calendar_result_from_energy_summary(
+    hass: HomeAssistant,
+    period: str,
+    end_date: str | None,
+    coordinator: Any,
+    tariff_schedule: dict | None = None,
+) -> dict[str, Any]:
+    """Return calendar-history response data for energy-summary based systems."""
+    time_series = _calendar_time_series_from_energy_summary(coordinator)
+    result = {
+        "success": True,
+        "period": period,
+        "time_series": time_series,
+        "serial_number": None,
+        "installation_date": None,
+    }
+
+    cost_summary = await _calculate_cost_from_statistics(hass, period, end_date)
+    if not cost_summary and tariff_schedule:
+        cost_summary = _calculate_cost_from_tariff(tariff_schedule, time_series)
+    if cost_summary:
+        load_kwh = sum(e.get("home_consumption", 0) for e in time_series) / 1000
+        if load_kwh > 0:
+            cost_summary["avg_cost_per_kwh"] = round(
+                ((cost_summary.get("import_cost") or 0) - (cost_summary.get("export_earnings") or 0)) / load_kwh,
+                4,
+            )
+        result["cost_summary"] = cost_summary
+
+    return result
+
+
 class CalendarHistoryView(HomeAssistantView):
     """HTTP view to get calendar history for mobile app."""
 
@@ -3006,41 +3216,12 @@ class CalendarHistoryView(HomeAssistantView):
         # Find the power_sync entry and coordinator
         # Check ALL entries, not just the first one (important during reload)
         tesla_coordinator = None
-        is_sigenergy = False
-        is_sungrow = False
-        is_foxess = False
-        is_goodwe = False
-        foxess_coordinator = None
-        goodwe_coordinator = None
-        for entry_id, data in self._hass.data.get(DOMAIN, {}).items():
+        for _entry_id, data in self._hass.data.get(DOMAIN, {}).items():
             if isinstance(data, dict):
-                # Check battery system types
-                if data.get("is_sigenergy", False):
-                    is_sigenergy = True
-                if data.get("is_sungrow", False):
-                    is_sungrow = True
-                if data.get("foxess_coordinator") is not None:
-                    is_foxess = True
-                    foxess_coordinator = data["foxess_coordinator"]
-                if data.get("goodwe_coordinator") is not None:
-                    is_goodwe = True
-                    goodwe_coordinator = data["goodwe_coordinator"]
                 # Look for Tesla coordinator (this is the main data source for calendar history)
                 if "tesla_coordinator" in data and data["tesla_coordinator"] is not None:
                     tesla_coordinator = data["tesla_coordinator"]
                     break  # Found it, no need to continue
-
-        # Check if this is a Sigenergy setup - calendar history not available
-        if is_sigenergy:
-            _LOGGER.info("Calendar history not available for Sigenergy battery systems")
-            return web.json_response(
-                {
-                    "success": False,
-                    "error": "Calendar history is not available for Sigenergy battery systems",
-                    "reason": "sigenergy_not_supported"
-                },
-                status=200  # Return 200 with error in body so mobile app handles gracefully
-            )
 
         # Look up tariff schedule for cost calculation (shared across all battery types)
         tariff_schedule = None
@@ -3051,117 +3232,19 @@ class CalendarHistoryView(HomeAssistantView):
                     tariff_schedule = ts
                     break
 
-        if is_sungrow and not tesla_coordinator:
-            # Sungrow: return accumulated daily energy from coordinator
-            from homeassistant.util import dt as dt_util
-
-            sungrow_coordinator = None
-            for _eid, _data in self._hass.data.get(DOMAIN, {}).items():
-                if isinstance(_data, dict) and _data.get("sungrow_coordinator") is not None:
-                    sungrow_coordinator = _data["sungrow_coordinator"]
-                    break
-
-            energy_data = {}
-            if sungrow_coordinator and sungrow_coordinator.data:
-                energy_data = sungrow_coordinator.data.get("energy_summary", {})
-
-            time_series = [{
-                "timestamp": dt_util.utcnow().isoformat(),
-                "solar_generation": energy_data.get("pv_today_kwh", 0) * 1000,
-                "battery_discharge": energy_data.get("discharge_today_kwh", 0) * 1000,
-                "battery_charge": energy_data.get("charge_today_kwh", 0) * 1000,
-                "grid_import": energy_data.get("grid_import_today_kwh", 0) * 1000,
-                "grid_export": energy_data.get("grid_export_today_kwh", 0) * 1000,
-                "home_consumption": energy_data.get("load_today_kwh", 0) * 1000,
-            }]
-
-            result = {
-                "success": True,
-                "period": period,
-                "time_series": time_series,
-                "serial_number": None,
-                "installation_date": None,
-            }
-            cost_summary = await _calculate_cost_from_statistics(self._hass, period, end_date)
-            if not cost_summary and tariff_schedule:
-                cost_summary = _calculate_cost_from_tariff(tariff_schedule, time_series)
-            if cost_summary:
-                load_kwh = sum(e.get("home_consumption", 0) for e in time_series) / 1000
-                if load_kwh > 0:
-                    cost_summary["avg_cost_per_kwh"] = round(
-                        ((cost_summary.get("import_cost") or 0) - (cost_summary.get("export_earnings") or 0)) / load_kwh, 4
-                    )
-                result["cost_summary"] = cost_summary
-            return web.json_response(result)
-
-        if is_foxess and foxess_coordinator:
-            # FoxESS: return daily energy from Modbus registers
-            from homeassistant.util import dt as dt_util
-
-            energy_data = {}
-            if foxess_coordinator.data:
-                energy_data = foxess_coordinator.data.get("energy_summary", {})
-
-            time_series = [{
-                "timestamp": dt_util.utcnow().isoformat(),
-                "solar_generation": energy_data.get("pv_today_kwh", 0) * 1000,
-                "battery_discharge": energy_data.get("discharge_today_kwh", 0) * 1000,
-                "battery_charge": energy_data.get("charge_today_kwh", 0) * 1000,
-                "grid_import": energy_data.get("grid_import_today_kwh", 0) * 1000,
-                "grid_export": energy_data.get("grid_export_today_kwh", 0) * 1000,
-                "home_consumption": energy_data.get("load_today_kwh", 0) * 1000,
-            }]
-
-            result = {
-                "success": True,
-                "period": period,
-                "time_series": time_series,
-                "serial_number": None,
-                "installation_date": None,
-            }
-            cost_summary = await _calculate_cost_from_statistics(self._hass, period, end_date)
-            if not cost_summary and tariff_schedule:
-                cost_summary = _calculate_cost_from_tariff(tariff_schedule, time_series)
-            if cost_summary:
-                load_kwh = sum(e.get("home_consumption", 0) for e in time_series) / 1000
-                if load_kwh > 0:
-                    cost_summary["avg_cost_per_kwh"] = round(
-                        ((cost_summary.get("import_cost") or 0) - (cost_summary.get("export_earnings") or 0)) / load_kwh, 4
-                    )
-                result["cost_summary"] = cost_summary
-            return web.json_response(result)
-
-        if is_goodwe and goodwe_coordinator:
-            # GoodWe: return current snapshot (no historical registers available)
-            from homeassistant.util import dt as dt_util
-
-            time_series = [{
-                "timestamp": dt_util.utcnow().isoformat(),
-                "solar_generation": 0,
-                "battery_discharge": 0,
-                "battery_charge": 0,
-                "grid_import": 0,
-                "grid_export": 0,
-                "home_consumption": 0,
-            }]
-
-            result = {
-                "success": True,
-                "period": period,
-                "time_series": time_series,
-                "serial_number": None,
-                "installation_date": None,
-            }
-            cost_summary = await _calculate_cost_from_statistics(self._hass, period, end_date)
-            if not cost_summary and tariff_schedule:
-                cost_summary = _calculate_cost_from_tariff(tariff_schedule, time_series)
-            if cost_summary:
-                load_kwh = sum(e.get("home_consumption", 0) for e in time_series) / 1000
-                if load_kwh > 0:
-                    cost_summary["avg_cost_per_kwh"] = round(
-                        ((cost_summary.get("import_cost") or 0) - (cost_summary.get("export_earnings") or 0)) / load_kwh, 4
-                    )
-                result["cost_summary"] = cost_summary
+        summary_system, summary_coordinator = _find_calendar_energy_summary_source(self._hass)
+        if summary_coordinator and not tesla_coordinator:
+            _LOGGER.info(
+                "Calendar history using %s daily energy summary",
+                summary_system,
+            )
+            result = await _calendar_result_from_energy_summary(
+                self._hass,
+                period,
+                end_date,
+                summary_coordinator,
+                tariff_schedule,
+            )
             return web.json_response(result)
 
         if not tesla_coordinator:
@@ -3372,7 +3455,7 @@ class PowerwallSettingsView(HomeAssistantView):
                 "Authorization": f"Bearer {current_token}",
                 "Content-Type": "application/json",
             }
-            api_base = get_tesla_api_base_url(provider)
+            api_base = get_tesla_api_base_url(provider, entry.data.get(CONF_FLEET_API_BASE_URL))
 
             # Fetch site info
             async with session.get(
@@ -3513,7 +3596,7 @@ class PowerwallTypeView(HomeAssistantView):
                 "Authorization": f"Bearer {current_token}",
                 "Content-Type": "application/json",
             }
-            api_base = get_tesla_api_base_url(provider)
+            api_base = get_tesla_api_base_url(provider, entry.data.get(CONF_FLEET_API_BASE_URL))
 
             # Fetch site info
             async with session.get(
@@ -3791,7 +3874,7 @@ class BatteryHealthView(HomeAssistantView):
                 else None
             ),
             "battery_count": payload.get("battery_count", 1),
-            "scanned_at": payload.get("last_scan", datetime.now().isoformat()),
+            "scanned_at": payload.get("last_scan", dt_util.now().isoformat()),
             "source": payload.get("source", "ha_local_tedapi"),
         }
 
@@ -4112,31 +4195,78 @@ class BatteryHealthView(HomeAssistantView):
                 n_followers, inferred_full_wh,
             )
 
-        # Ghost expansion pack filter: Tesla Fleet API sometimes returns BMS entries for
-        # expansion pack slots that are registered but not physically installed. These show
-        # plausible-looking full-capacity values (~13.5–14.5 kWh) but near-zero remaining energy
-        # (< 500 Wh). Cross-validate: if the system-level nominalFullPackEnergyWh (current_wh)
-        # matches just the non-expansion packs within 10%, the expansion entries are stale phantom
-        # data and should be dropped before battery_count / rated_capacity are calculated.
-        if individual and current_wh > 0 and any(p.get("isExpansion") for p in individual):
-            non_exp = [p for p in individual if not p.get("isExpansion")]
-            non_exp_full_wh = sum(p["nominalFullPackEnergyWh"] for p in non_exp)
-            if non_exp_full_wh > 0 and abs(current_wh - non_exp_full_wh) / current_wh < 0.10:
-                ghost_count = sum(1 for p in individual if p.get("isExpansion"))
-                _LOGGER.warning(
-                    "fleet_api_bms: Dropping %d ghost expansion pack(s) — system %.0f Wh matches "
-                    "non-expansion sum %.0f Wh (ratio %.3f); expansion slots registered but not installed",
-                    ghost_count, current_wh, non_exp_full_wh, non_exp_full_wh / current_wh,
+        # Ghost expansion pack filter. Phantom packs (registered slots not physically
+        # installed) report:
+        #   1. plausible full-capacity values (~13.5–14.5 kWh)
+        #   2. NO serialNumber from MSA components
+        #   3. near-zero remaining energy regardless of system SOC
+        #
+        # Real BMS modules satisfy AT LEAST ONE of: have a serialNumber, or report
+        # remaining energy that tracks system SOC. The previous filter keyed off
+        # (!serialNumber) alone, which mis-dropped real expansion packs whose firmware
+        # doesn't populate serialNumber in the MSA components surface (observed on
+        # PW3 + 1 expansion sites — current_wh reported only the leader's energy, so
+        # the cross-validation kept-sum check passed despite the real expansion being
+        # kept). Require BOTH the missing-serial signal AND a near-zero remaining-
+        # energy signature before flagging as ghost; cross-validate as before.
+        if individual and current_wh > 0:
+            GHOST_REMAINING_ABS_WH = 500
+            GHOST_REMAINING_FRACTION = 0.05
+            ghost_candidates = [
+                p for p in individual
+                if p.get("isExpansion")
+                and not p.get("serialNumber")
+                and (
+                    p["nominalEnergyRemainingWh"] < GHOST_REMAINING_ABS_WH
+                    or (
+                        p["nominalFullPackEnergyWh"] > 0
+                        and p["nominalEnergyRemainingWh"] / p["nominalFullPackEnergyWh"]
+                        < GHOST_REMAINING_FRACTION
+                    )
                 )
-                individual = non_exp
-                bms_module_count -= ghost_count
+            ]
+            if ghost_candidates:
+                kept = [p for p in individual if p not in ghost_candidates]
+                kept_full_wh = sum(p["nominalFullPackEnergyWh"] for p in kept)
+                if kept_full_wh > 0 and abs(current_wh - kept_full_wh) / current_wh < 0.10:
+                    ghost_count = len(ghost_candidates)
+                    _LOGGER.warning(
+                        "fleet_api_bms: Dropping %d ghost expansion pack(s) (no serial + near-empty) — "
+                        "system %.0f Wh matches real-pack sum %.0f Wh (ratio %.3f); "
+                        "expansion slots registered but not physically installed",
+                        ghost_count, current_wh, kept_full_wh, kept_full_wh / current_wh,
+                    )
+                    individual = kept
+                    bms_module_count -= ghost_count
 
         # Module count: BMS signal presence is the most accurate count (includes follower packs
         # that report the signal key but have None values). batteryBlocks counts inverter units
         # (one per PW3 stack), not individual battery modules — use it only as a floor.
         batt_count = max(bms_module_count, bb_count) if bms_module_count else bb_count
 
-        # Rated capacity: 13.5 kWh per battery module.
+        # Cross-validate against Tesla's own site_info battery_count. PW3 units each expose
+        # two BMS sub-modules in the msa components list, so bms_module_count can be 2× the
+        # actual physical Powerwall count. site_info.battery_count is Tesla's authoritative
+        # count of physical units — prefer it when the BMS count exceeds it.
+        try:
+            _coord = (self._hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+                      .get("tesla_coordinator"))
+            _site_batt_count = (
+                (_coord._site_info_cache or {}).get("battery_count")
+                if _coord and hasattr(_coord, "_site_info_cache")
+                else None
+            )
+            if _site_batt_count and batt_count > _site_batt_count:
+                _LOGGER.info(
+                    "fleet_api_bms: BMS module count (%d) exceeds site battery_count (%d) — "
+                    "using site battery_count for rated capacity (PW3 has 2 BMS sub-modules per unit)",
+                    batt_count, _site_batt_count,
+                )
+                batt_count = _site_batt_count
+        except Exception:
+            pass
+
+        # Rated capacity: 13.5 kWh per physical Powerwall unit.
         original_wh = 13500 * batt_count
         health_percent = round((current_wh / original_wh) * 100, 1) if original_wh > 0 else 0
 
@@ -4145,7 +4275,6 @@ class BatteryHealthView(HomeAssistantView):
         if original_wh: bms["rated_capacity_kwh"] = round(original_wh / 1000, 2)
         if current_wh: bms["current_capacity_kwh"] = round(current_wh / 1000, 2)
 
-        from datetime import datetime as _dt
         response: dict = {
             "success": True,
             "available": True,
@@ -4157,7 +4286,7 @@ class BatteryHealthView(HomeAssistantView):
             "original_capacity_kwh": round(original_wh / 1000, 2),
             "current_capacity_kwh": round(current_wh / 1000, 2),
             "battery_count": batt_count,
-            "last_scan": _dt.now().isoformat(),
+            "last_scan": dt_util.now().isoformat(),
             "site": {
                 "gateway_din": din,
                 "energy_site_id": fleet_site_id or entry.data.get(CONF_POWERWALL_LOCAL_ENERGY_SITE_ID),
@@ -4274,7 +4403,7 @@ class BatteryHealthView(HomeAssistantView):
             current_capacity_wh = data.get("current_capacity_wh")
             degradation_percent = data.get("degradation_percent")
             battery_count = data.get("battery_count", 1)
-            scanned_at = data.get("scanned_at", datetime.now().isoformat())
+            scanned_at = data.get("scanned_at", dt_util.now().isoformat())
             individual_batteries = data.get("individual_batteries")
             # Extended fields (cloud RSA path provides richer metadata)
             source = data.get("source") or "mobile_app"
@@ -4508,9 +4637,8 @@ class InverterStatusView(HomeAssistantView):
                 if sun_state:
                     is_night = sun_state.state == "below_horizon"
                 else:
-                    # Fallback to hour-based check (6pm-6am)
-                    from datetime import datetime
-                    local_hour = datetime.now().hour
+                    # Fallback to hour-based check (6pm-6am) — use HA tz, not container UTC
+                    local_hour = dt_util.now().hour
                     is_night = local_hour >= 18 or local_hour < 6
             except Exception:
                 pass
@@ -4547,9 +4675,8 @@ class InverterStatusView(HomeAssistantView):
                 if sun_state:
                     is_night = sun_state.state == "below_horizon"
                 else:
-                    # Fallback to hour-based check (6pm-6am)
-                    from datetime import datetime
-                    local_hour = datetime.now().hour
+                    # Fallback to hour-based check (6pm-6am) — use HA tz, not container UTC
+                    local_hour = dt_util.now().hour
                     is_night = local_hour >= 18 or local_hour < 6
             except Exception:
                 pass
@@ -6069,10 +6196,6 @@ class ProviderConfigView(HomeAssistantView):
                         CONF_SPIKE_PROTECTION_ENABLED,
                         entry.data.get(CONF_SPIKE_PROTECTION_ENABLED, False)
                     ),
-                    "settled_prices_only": entry.options.get(
-                        CONF_SETTLED_PRICES_ONLY,
-                        entry.data.get(CONF_SETTLED_PRICES_ONLY, False)
-                    ),
                     # Forecast Discrepancy Alert settings
                     "forecast_discrepancy_alert": entry.options.get(
                         CONF_FORECAST_DISCREPANCY_ALERT,
@@ -6251,8 +6374,8 @@ class ProviderConfigView(HomeAssistantView):
                     ),
                 }
 
-            elif electricity_provider in ("globird", "aemo_vpp"):
-                # Globird / AEMO VPP settings
+            elif electricity_provider in ("globird", "aemo_vpp", "other", "tou_only"):
+                # Custom TOU / AEMO-style settings
                 config = {
                     "aemo_region": entry.options.get(
                         CONF_AEMO_REGION,
@@ -6401,7 +6524,6 @@ class ProviderConfigView(HomeAssistantView):
                 # Amber
                 "forecast_type": CONF_AMBER_FORECAST_TYPE,
                 "spike_protection_enabled": CONF_SPIKE_PROTECTION_ENABLED,
-                "settled_prices_only": CONF_SETTLED_PRICES_ONLY,
                 "forecast_discrepancy_alert": CONF_FORECAST_DISCREPANCY_ALERT,
                 "forecast_discrepancy_threshold": CONF_FORECAST_DISCREPANCY_THRESHOLD,
                 "price_spike_alert": CONF_PRICE_SPIKE_ALERT,
@@ -6721,12 +6843,10 @@ class TariffPriceView(HomeAssistantView):
           - Sell rates at saved_tariff["sell_tariff"]["energy_charges"][season]["rates"][period]
         """
         try:
-            from datetime import datetime as dt
+            from .tariff_time import find_matching_tou_period
 
-            now = dt.now()
-            current_hour = now.hour
+            now = dt_util.now()  # HA tz; container UTC would mis-classify season/period
             current_month = now.month
-            current_dow = now.weekday()  # 0=Monday, 6=Sunday
 
             utility = saved_tariff.get("utility", "")
             plan_name = saved_tariff.get("name", "")
@@ -6763,44 +6883,7 @@ class TariffPriceView(HomeAssistantView):
 
             # TOU periods are inside seasons[current_season]["tou_periods"]
             tou_periods = seasons.get(current_season, {}).get("tou_periods", {})
-
-            # Find current TOU period - check in priority order
-            # Tesla DOW: 0=Sunday, Python weekday(): 0=Monday, 6=Sunday
-            tesla_dow = (current_dow + 1) % 7
-
-            # Check all defined periods — supports custom names like PEAK_1, PEAK_2.
-            sorted_priority = sorted(
-                tou_periods.keys(),
-                key=lambda n: (
-                    2 if n.startswith("OFF_PEAK") else
-                    0 if n.startswith("SUPER_OFF_PEAK") else 1
-                ),
-            )
-            current_period = None
-            for period_name in sorted_priority:
-                period_data = tou_periods[period_name]
-                periods_list = period_data.get("periods", []) if isinstance(period_data, dict) else []
-                for p in periods_list:
-                    from_dow = p.get("fromDayOfWeek", 0)
-                    to_dow = p.get("toDayOfWeek", 6)
-                    from_hour = p.get("fromHour", 0)
-                    to_hour = p.get("toHour", 24)
-
-                    if from_dow <= tesla_dow <= to_dow:
-                        # Handle overnight periods (e.g., 23:00 to 11:00)
-                        if from_hour <= to_hour:
-                            if from_hour <= current_hour < to_hour:
-                                current_period = period_name
-                                break
-                        else:
-                            if current_hour >= from_hour or current_hour < to_hour:
-                                current_period = period_name
-                                break
-                if current_period:
-                    break
-
-            if not current_period:
-                current_period = "OFF_PEAK"
+            current_period = find_matching_tou_period(tou_periods, now, default="OFF_PEAK")
 
             # Buy rates: energy_charges[current_season]["rates"][period]
             energy_charges = saved_tariff.get("energy_charges", {})
@@ -6875,7 +6958,7 @@ async def fetch_tesla_tariff_schedule(hass: HomeAssistant, entry: ConfigEntry) -
             "Authorization": f"Bearer {current_token}",
             "Content-Type": "application/json",
         }
-        api_base = get_tesla_api_base_url(provider)
+        api_base = get_tesla_api_base_url(provider, entry.data.get(CONF_FLEET_API_BASE_URL))
 
         # Fetch site_info which contains tariff_content
         async with session.get(
@@ -6918,11 +7001,9 @@ async def fetch_tesla_tariff_schedule(hass: HomeAssistant, entry: ConfigEntry) -
         tz_name = site_info.get("installation_time_zone", "UTC")
         try:
             tz = ZoneInfo(tz_name)
-        except:
+        except Exception:
             tz = ZoneInfo("UTC")
         now = dt.now(tz)
-        current_hour = now.hour
-        current_dow = now.weekday()  # 0=Monday, 6=Sunday
 
         # Find current season
         seasons = tariff.get("seasons", {})
@@ -6937,61 +7018,11 @@ async def fetch_tesla_tariff_schedule(hass: HomeAssistant, entry: ConfigEntry) -
         if not current_season:
             current_season = "Summer" if "Summer" in seasons else next(iter(seasons.keys()), None)
 
-        _LOGGER.debug(f"Current season: {current_season}, hour: {current_hour}, dow: {current_dow}")
+        _LOGGER.debug("Current season: %s, local_time: %s", current_season, now.isoformat())
 
-        # Find current TOU period
-        # Check periods in priority order to handle overlaps correctly
-        # SUPER_OFF_PEAK must be checked before OFF_PEAK since OFF_PEAK may include hours
-        # that overlap with SUPER_OFF_PEAK (e.g., OFF_PEAK 21:00-24:00 overlaps with SUPER_OFF_PEAK 23:00-07:00)
         tou_periods = seasons.get(current_season, {}).get("tou_periods", {})
-        # Include all common TOU period names in priority order (most specific first)
-        # Check all defined periods — supports custom names like PEAK_1, PEAK_2.
-        # Priority: SUPER_OFF_PEAK > PEAK_N (specific) > PEAK (base) > SHOULDER > OFF_PEAK
-        sorted_priority = sorted(
-            tou_periods.keys(),
-            key=lambda n: (
-                0 if n.startswith("SUPER_OFF_PEAK") else
-                1 if n.startswith("PEAK_") else
-                2 if n == "PEAK" else
-                3 if n.startswith("SHOULDER") else 4
-            ),
-        )
-        current_period = None
-        for period_name in sorted_priority:
-            period_data = tou_periods[period_name]
-            # Handle both list format and object format
-            # Handle both custom format (list) and Tesla tariff_content format ({"periods": [...]})
-            if isinstance(period_data, dict) and "periods" in period_data:
-                periods_list = period_data["periods"]
-            elif isinstance(period_data, list):
-                periods_list = period_data
-            else:
-                periods_list = []
-            for period in periods_list:
-                from_dow = period.get("fromDayOfWeek", 0)
-                to_dow = period.get("toDayOfWeek", 6)
-                from_hour = period.get("fromHour", 0)
-                to_hour = period.get("toHour", 24)
-
-                # Check day of week (Tesla uses 0=Sunday, Python uses 0=Monday)
-                tesla_dow = (current_dow + 1) % 7  # Convert Python dow to Tesla dow
-                if from_dow <= tesla_dow <= to_dow:
-                    # Check time - handle overnight periods (e.g., 21:00 to 10:00)
-                    if from_hour <= to_hour:
-                        # Normal period (e.g., 10:00 to 14:00)
-                        if from_hour <= current_hour < to_hour:
-                            current_period = period_name
-                            break
-                    else:
-                        # Overnight period (e.g., 21:00 to 10:00)
-                        if current_hour >= from_hour or current_hour < to_hour:
-                            current_period = period_name
-                            break
-            if current_period:
-                break
-
-        if not current_period:
-            current_period = "ALL"
+        from .tariff_time import find_matching_tou_period
+        current_period = find_matching_tou_period(tou_periods, now, default="ALL")
         _LOGGER.info(f"Tesla TOU period: {current_period}")
 
         # Get energy charges for current season
@@ -7050,6 +7081,7 @@ async def fetch_tesla_tariff_schedule(hass: HomeAssistant, entry: ConfigEntry) -
             "seasons": seasons,  # Include season definitions
             "utility": tariff.get("utility", "Unknown"),
             "plan_name": tariff.get("name", "Unknown"),
+            **currency_metadata(tariff.get("currency") or currency_for_entry(entry, hass)),
             "last_sync": now.strftime("%Y-%m-%d %H:%M:%S"),
         }
 
@@ -7065,7 +7097,10 @@ async def fetch_tesla_tariff_schedule(hass: HomeAssistant, entry: ConfigEntry) -
         return None
 
 
-def convert_custom_tariff_to_schedule(custom_tariff: dict) -> dict:
+def convert_custom_tariff_to_schedule(
+    custom_tariff: dict,
+    currency: str | None = None,
+) -> dict:
     """Convert custom_tariff format to tariff_schedule format.
 
     This converts the user-configured custom tariff (Tesla tariff_content format)
@@ -7073,19 +7108,21 @@ def convert_custom_tariff_to_schedule(custom_tariff: dict) -> dict:
 
     Args:
         custom_tariff: Custom tariff configuration from automation_store
+        currency: Optional ISO 4217 currency override for legacy saved tariffs
 
     Returns:
         tariff_schedule dict with: current_period, current_season, buy_price, sell_price,
         buy_rates, sell_rates, tou_periods, seasons, utility, plan_name, last_sync
     """
-    from datetime import datetime as dt
-    from zoneinfo import ZoneInfo
+    from .tariff_time import find_matching_tou_period
 
     try:
-        # Get current time for determining current period
-        now = dt.now()
-        current_hour = now.hour
-        current_dow = now.weekday()  # 0=Monday, 6=Sunday
+        tariff_currency = normalize_currency(
+            currency or custom_tariff.get("currency"),
+            DEFAULT_CURRENCY,
+        )
+        # Get current time for determining current period — HA tz, not container UTC
+        now = dt_util.now()
 
         # Extract seasons from custom tariff
         seasons = custom_tariff.get("seasons", {})
@@ -7109,61 +7146,11 @@ def convert_custom_tariff_to_schedule(custom_tariff: dict) -> dict:
             # Default to first season or "All Year"
             current_season = "All Year" if "All Year" in seasons else next(iter(seasons.keys()), "All Year")
 
-        _LOGGER.debug(f"Custom tariff - Current season: {current_season}, hour: {current_hour}, dow: {current_dow}")
+        _LOGGER.debug("Custom tariff - current season=%s, local_time=%s", current_season, now.isoformat())
 
         # Get TOU periods for current season
         tou_periods = seasons.get(current_season, {}).get("tou_periods", {})
-
-        # Find current TOU period
-        # Check periods in priority order to handle overlaps correctly
-        # SUPER_OFF_PEAK must be checked before OFF_PEAK since OFF_PEAK may include hours
-        # that overlap with SUPER_OFF_PEAK
-        # Check all defined periods — supports custom names like PEAK_1, PEAK_2.
-        # Priority: SUPER_OFF_PEAK > PEAK_N (specific) > PEAK (base) > SHOULDER > OFF_PEAK
-        sorted_priority = sorted(
-            tou_periods.keys(),
-            key=lambda n: (
-                0 if n.startswith("SUPER_OFF_PEAK") else
-                1 if n.startswith("PEAK_") else
-                2 if n == "PEAK" else
-                3 if n.startswith("SHOULDER") else 4
-            ),
-        )
-        current_period = None
-        for period_name in sorted_priority:
-            period_data = tou_periods[period_name]
-            # Handle both custom format (list) and Tesla tariff_content format ({"periods": [...]})
-            if isinstance(period_data, dict) and "periods" in period_data:
-                periods_list = period_data["periods"]
-            elif isinstance(period_data, list):
-                periods_list = period_data
-            else:
-                periods_list = []
-            for period in periods_list:
-                from_dow = period.get("fromDayOfWeek", 0)
-                to_dow = period.get("toDayOfWeek", 6)
-                from_hour = period.get("fromHour", 0)
-                to_hour = period.get("toHour", 24)
-
-                # Check day of week (Tesla format: 0=Sunday, Python: 0=Monday)
-                tesla_dow = (current_dow + 1) % 7
-                if from_dow <= tesla_dow <= to_dow:
-                    # Handle overnight periods (e.g., 21:00 to 07:00)
-                    if from_hour <= to_hour:
-                        # Normal period
-                        if from_hour <= current_hour < to_hour:
-                            current_period = period_name
-                            break
-                    else:
-                        # Overnight period
-                        if current_hour >= from_hour or current_hour < to_hour:
-                            current_period = period_name
-                            break
-            if current_period:
-                break
-
-        if not current_period:
-            current_period = "OFF_PEAK"  # Default to off-peak
+        current_period = find_matching_tou_period(tou_periods, now, default="OFF_PEAK")
 
         _LOGGER.debug(f"Custom tariff - Current TOU period: {current_period}")
 
@@ -7215,7 +7202,9 @@ def convert_custom_tariff_to_schedule(custom_tariff: dict) -> dict:
             "seasons": seasons,
             "utility": custom_tariff.get("utility", "Custom"),
             "plan_name": custom_tariff.get("name", "Custom Tariff"),
-            "last_sync": dt.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "currency": tariff_currency,
+            **currency_metadata(tariff_currency),
+            "last_sync": dt_util.now().strftime("%Y-%m-%d %H:%M:%S"),
             "is_custom": True,  # Flag to indicate this is a custom tariff
         }
 
@@ -7236,12 +7225,11 @@ def get_current_price_from_tariff_schedule(tariff_schedule: dict) -> tuple[float
     Returns:
         Tuple of (buy_price_cents, sell_price_cents, current_period)
     """
-    from datetime import datetime as dt
+    from .tariff_time import find_matching_tou_period
 
     try:
-        now = dt.now()
+        now = dt_util.now()  # HA-configured timezone — naive datetime.now() returns UTC in containers
         current_hour = now.hour
-        current_dow = now.weekday()  # Python: 0=Monday, 6=Sunday
 
         # Get TOU periods and rates
         tou_periods = tariff_schedule.get("tou_periods", {})
@@ -7269,56 +7257,7 @@ def get_current_price_from_tariff_schedule(tariff_schedule: dict) -> tuple[float
                 tariff_schedule.get("current_period", "UNKNOWN")
             )
 
-        # Find current TOU period
-        # Check periods in priority order to handle overlaps correctly
-        # SUPER_OFF_PEAK must be checked before OFF_PEAK since OFF_PEAK may include hours
-        # that overlap with SUPER_OFF_PEAK (e.g., OFF_PEAK 21:00-24:00 overlaps with SUPER_OFF_PEAK 23:00-07:00)
-        # Check all defined periods — supports custom names like PEAK_1, PEAK_2.
-        # Priority: SUPER_OFF_PEAK > PEAK_N (specific) > PEAK (base) > SHOULDER > OFF_PEAK
-        sorted_priority = sorted(
-            tou_periods.keys(),
-            key=lambda n: (
-                0 if n.startswith("SUPER_OFF_PEAK") else
-                1 if n.startswith("PEAK_") else
-                2 if n == "PEAK" else
-                3 if n.startswith("SHOULDER") else 4
-            ),
-        )
-        current_period = None
-        for period_name in sorted_priority:
-            period_data = tou_periods[period_name]
-            # Handle both custom format (list) and Tesla tariff_content format ({"periods": [...]})
-            if isinstance(period_data, dict) and "periods" in period_data:
-                periods_list = period_data["periods"]
-            elif isinstance(period_data, list):
-                periods_list = period_data
-            else:
-                periods_list = []
-            for period in periods_list:
-                from_dow = period.get("fromDayOfWeek", 0)
-                to_dow = period.get("toDayOfWeek", 6)
-                from_hour = period.get("fromHour", 0)
-                to_hour = period.get("toHour", 24)
-
-                # Check day of week (Tesla format: 0=Sunday, Python: 0=Monday)
-                tesla_dow = (current_dow + 1) % 7
-                if from_dow <= tesla_dow <= to_dow:
-                    # Handle overnight periods (e.g., 21:00 to 07:00)
-                    if from_hour <= to_hour:
-                        # Normal period
-                        if from_hour <= current_hour < to_hour:
-                            current_period = period_name
-                            break
-                    else:
-                        # Overnight period
-                        if current_hour >= from_hour or current_hour < to_hour:
-                            current_period = period_name
-                            break
-            if current_period:
-                break
-
-        if not current_period:
-            current_period = "OFF_PEAK"  # Default to off-peak
+        current_period = find_matching_tou_period(tou_periods, now, default="OFF_PEAK")
 
         # Get prices for current period (rates are in $/kWh, convert to cents)
         # Note: buy_rates may already be in cents if from custom tariff, or $/kWh if from Tesla
@@ -7745,12 +7684,19 @@ class CustomTariffView(HomeAssistantView):
 
     def _get_store(self):
         """Get the automation store from hass.data."""
+        entry_data = self._get_entry_data()
+        if entry_data:
+            return entry_data["automation_store"]
+        return None
+
+    def _get_entry_data(self):
+        """Get the first PowerSync entry data with an automation store."""
         if DOMAIN not in self._hass.data:
             return None
         # Find any config entry to get the automation store
         for entry_id, entry_data in self._hass.data.get(DOMAIN, {}).items():
             if isinstance(entry_data, dict) and "automation_store" in entry_data:
-                return entry_data["automation_store"]
+                return entry_data
         return None
 
     async def get(self, request: web.Request) -> web.Response:
@@ -7805,11 +7751,22 @@ class CustomTariffView(HomeAssistantView):
                     status=400
                 )
 
+            entry_data = self._get_entry_data()
+            entry = entry_data.get("entry") if entry_data else None
+            tariff_currency = normalize_currency(
+                data.get("currency"),
+                currency_for_entry(entry, self._hass),
+            )
+            data["currency"] = tariff_currency
+
             store.set_custom_tariff(data)
             await store.async_save()
 
             # Also update the tariff_schedule in hass.data for immediate use
-            tariff_schedule = convert_custom_tariff_to_schedule(data)
+            tariff_schedule = convert_custom_tariff_to_schedule(
+                data,
+                currency=tariff_currency,
+            )
             for entry_id, entry_data in self._hass.data.get(DOMAIN, {}).items():
                 if isinstance(entry_data, dict) and "automation_store" in entry_data:
                     entry_data["tariff_schedule"] = tariff_schedule
@@ -7932,7 +7889,7 @@ class PushTokenRegisterView(HomeAssistantView):
                 "token": push_token,
                 "platform": platform,
                 "device_name": device_name,
-                "registered_at": datetime.now().isoformat(),
+                "registered_at": dt_util.now().isoformat(),
             }
 
             # Also persist to AutomationStore for survival across restarts
@@ -8005,7 +7962,7 @@ class PushTestView(HomeAssistantView):
             await _send_expo_push(
                 self._hass,
                 "PowerSync Test",
-                f"Test notification sent at {datetime.now().strftime('%H:%M:%S')}"
+                f"Test notification sent at {dt_util.now().strftime('%H:%M:%S')}"
             )
 
             return web.json_response({
@@ -8693,7 +8650,6 @@ class EVVehiclesView(HomeAssistantView):
         # Cache definitive BLE readings so they survive BLE disconnects.
         # When BLE loses connection, charge_flap goes "unavailable" — we use
         # the cached value (max 2h) to avoid falling back to stale Fleet API data.
-        from homeassistant.util import dt as dt_util
         now_utc = dt_util.utcnow()
         ble_plug_cache_key = f"ev_ble_plug_cache_{prefix}"
         if plugged_in_definitive:
@@ -8751,7 +8707,7 @@ class EVVehiclesView(HomeAssistantView):
             "plugged_in_definitive": plugged_in_definitive,
             "charger_power": charger_power,
             "is_online": is_online,
-            "data_updated_at": data_updated_at.isoformat() if data_updated_at else datetime.now().isoformat(),
+            "data_updated_at": data_updated_at.isoformat() if data_updated_at else dt_util.now().isoformat(),
             "source": "tesla_ble",
             "brand": "tesla",
         }
@@ -8850,7 +8806,7 @@ class EVVehiclesView(HomeAssistantView):
                 "charger_power": None,
                 "time_to_full_charge": time_to_full,
                 "is_online": is_online,
-                "data_updated_at": datetime.now().isoformat(),
+                "data_updated_at": dt_util.now().isoformat(),
                 "source": "byd_cloud",
                 "brand": "byd",
             })
@@ -8989,7 +8945,7 @@ class EVVehiclesView(HomeAssistantView):
                     if charging_state and charging_state.lower() != "charging":
                         charger_power = None
 
-                    fleet_updated_at = latest_entity_update.isoformat() if latest_entity_update else datetime.now().isoformat()
+                    fleet_updated_at = latest_entity_update.isoformat() if latest_entity_update else dt_util.now().isoformat()
                     vehicles.append({
                         "id": vin or str(device.id),
                         "vehicle_id": vin or str(device.id),
@@ -9118,7 +9074,7 @@ class EVVehiclesView(HomeAssistantView):
                     "is_plugged_in": is_plugged_in,
                     "charger_power": None,
                     "is_online": True,
-                    "data_updated_at": datetime.now().isoformat(),
+                    "data_updated_at": dt_util.now().isoformat(),
                     "source": "generic_charger",
                     "brand": "generic",
                 })
@@ -9261,6 +9217,12 @@ class EVVehicleCommandView(HomeAssistantView):
         Also accepts BLE identifiers (ble_*) and VINs (17-char) directly,
         returning them as-is for robustness.
         """
+        # Accept pseudo-VINs for non-Tesla chargers directly
+        if vehicle_id in ("generic_ev", "zaptec_standalone") or (
+            vehicle_id and vehicle_id.startswith("ocpp_")
+        ):
+            return vehicle_id
+
         # Accept BLE identifiers directly (e.g. "ble_joanna_model_3_local")
         if vehicle_id and vehicle_id.startswith("ble_"):
             _LOGGER.debug(f"Vehicle ID {vehicle_id} is already a BLE identifier")
@@ -9488,7 +9450,6 @@ class EVVehicleCommandView(HomeAssistantView):
             ble_plug_cache_key = f"ev_ble_plug_cache_{ble_prefix}"
             cached = self._hass.data.get(DOMAIN, {}).get("_ev_cache", {}).get(ble_plug_cache_key)
             if cached:
-                from homeassistant.util import dt as dt_util
                 if (dt_util.utcnow() - cached["cached_at"]).total_seconds() < 7200:
                     return cached["is_plugged_in"]
             _LOGGER.debug(f"BLE vehicle {ble_prefix}: cannot determine plug state")
@@ -9553,318 +9514,234 @@ class EVVehicleCommandView(HomeAssistantView):
                     return client, charger_id, cached_state
         return None
 
+    def _get_powersync_entry(self) -> ConfigEntry | None:
+        """Return the integration config entry used for EV action dispatch."""
+        entries = self._hass.config_entries.async_entries(DOMAIN)
+        return entries[0] if entries else None
+
+    def _manual_session_identity(self, vehicle_vin: str | None) -> tuple[str | None, dict]:
+        """Return the loadpoint id and charger params for manual command ownership."""
+        if vehicle_vin in (None, "zaptec_standalone") and self._get_zaptec_standalone():
+            return "zaptec_standalone", {"charger_type": "zaptec"}
+
+        if vehicle_vin and vehicle_vin.startswith("ocpp_"):
+            charger_id = self._ocpp_charger_id_from_loadpoint(vehicle_vin)
+            return vehicle_vin, {
+                "charger_type": "ocpp",
+                "ocpp_charger_id": charger_id,
+            }
+
+        if vehicle_vin == "generic_ev":
+            from .const import (
+                CONF_GENERIC_CHARGER_AMPS_ENTITY,
+                CONF_GENERIC_CHARGER_ENABLED,
+                CONF_GENERIC_CHARGER_STATUS_ENTITY,
+                CONF_GENERIC_CHARGER_SWITCH_ENTITY,
+            )
+
+            for entry in self._hass.config_entries.async_entries(DOMAIN):
+                opts = {**entry.data, **entry.options}
+                if opts.get(CONF_GENERIC_CHARGER_ENABLED):
+                    return "generic_ev", {
+                        "charger_type": "generic",
+                        "charger_switch_entity": opts.get(CONF_GENERIC_CHARGER_SWITCH_ENTITY, ""),
+                        "charger_amps_entity": opts.get(CONF_GENERIC_CHARGER_AMPS_ENTITY, ""),
+                        "charger_status_entity": opts.get(CONF_GENERIC_CHARGER_STATUS_ENTITY, ""),
+                    }
+
+        return vehicle_vin, {"charger_type": "tesla"}
+
+    def _ocpp_charger_id_from_loadpoint(self, loadpoint_id: str) -> str:
+        """Resolve an OCPP loadpoint id to the raw HA charger prefix."""
+        candidates = [loadpoint_id]
+        if loadpoint_id.startswith("ocpp_"):
+            candidates.append(loadpoint_id[5:])
+
+        for candidate in candidates:
+            if self._hass.states.get(f"switch.{candidate}_charge_control"):
+                return candidate
+
+        if loadpoint_id != "ocpp_charger" and loadpoint_id.startswith("ocpp_"):
+            return loadpoint_id[5:]
+        return loadpoint_id
+
+    def _manual_action_params(self, vehicle_vin: str | None) -> dict:
+        """Build shared action parameters for mobile/manual EV commands."""
+        manual_vehicle_id, manual_params = self._manual_session_identity(vehicle_vin)
+        params = dict(manual_params)
+        params["vehicle_id"] = manual_vehicle_id
+
+        if params.get("charger_type") == "tesla":
+            params["vehicle_vin"] = vehicle_vin
+        else:
+            params["vehicle_vin"] = None
+
+        return params
+
+    def _generic_charger_ready_for_start(self, params: dict) -> tuple[bool, str]:
+        """Return whether the configured generic charger appears connected."""
+        status_entity = params.get("charger_status_entity", "")
+        if not status_entity:
+            return True, ""
+
+        state = self._hass.states.get(status_entity)
+        if not state:
+            return True, ""
+
+        if state.state.lower() not in ("available", "disconnected"):
+            return True, ""
+
+        car_present_states = {
+            "preparing",
+            "charging",
+            "suspendedev",
+            "suspendedevse",
+            "suspended_ev",
+            "suspended_evse",
+            "finishing",
+        }
+        car_on_connector = any(
+            s.state.lower() in car_present_states
+            for s in self._hass.states.async_all()
+            if s.entity_id.startswith("sensor.")
+            and s.entity_id.endswith("_status_connector")
+            and s.state not in ("unavailable", "unknown")
+        )
+        if car_on_connector:
+            _LOGGER.debug(
+                "Generic Charger: %s = %s but connector shows car present, proceeding",
+                status_entity,
+                state.state,
+            )
+            return True, ""
+
+        _LOGGER.warning(
+            "Generic Charger: %s = %s, no connector shows car present",
+            status_entity,
+            state.state,
+        )
+        return False, "Vehicle is not plugged in"
+
+    async def _execute_manual_ev_action(
+        self,
+        action_type: str,
+        vehicle_vin: str | None,
+        params_extra: dict | None,
+        reason: str,
+    ) -> bool:
+        """Execute an EV command through the shared automation action layer."""
+        entry = self._get_powersync_entry()
+        if not entry:
+            return False
+
+        from .automations.actions import _execute_single_action
+
+        params = self._manual_action_params(vehicle_vin)
+        params.update(params_extra or {})
+        params["reason"] = reason
+        return await _execute_single_action(self._hass, entry, action_type, params)
+
     async def _start_charging(self, vehicle_vin: str | None = None) -> tuple[bool, str]:
         """Start charging. Returns (success, message)."""
-        # Zaptec standalone path — check before Tesla preconditions
-        zaptec = self._get_zaptec_standalone()
-        if zaptec:
-            client, charger_id, cached_state = zaptec
-            mode = cached_state.get("charger_operation_mode", "")
-            if mode == "charging":
-                return True, "Zaptec charger is already charging"
-            if mode not in ("connected_waiting", "charging") and cached_state.get("total_charge_power_w", 0) <= 50:
-                if not cached_state.get("cable_locked"):
-                    msg = "Vehicle is not plugged in (Zaptec cable not locked)"
-                    _LOGGER.warning(msg)
-                    return False, msg
-            try:
-                await client.resume_charging(charger_id)
-                _LOGGER.info("Started charging via Zaptec Cloud API")
+        params = self._manual_action_params(vehicle_vin)
+        charger_type = params.get("charger_type", "tesla")
+
+        if charger_type == "generic":
+            ready, message = self._generic_charger_ready_for_start(params)
+            if not ready:
+                return False, message
+            switch_entity = params.get("charger_switch_entity", "").strip()
+            if not switch_entity:
+                return False, "Generic Charger: no switch entity configured"
+            if "." not in switch_entity:
+                return False, f"Generic Charger: switch entity '{switch_entity}' is not a valid entity_id (missing domain, e.g. 'switch.charger_charge')"
+            if not self._hass.states.get(switch_entity):
+                return False, f"Generic Charger: switch entity '{switch_entity}' not found in Home Assistant"
+
+        if charger_type == "tesla":
+            if not await self._is_vehicle_at_home(vehicle_vin):
+                msg = "Vehicle is not at home"
+                _LOGGER.warning(msg)
+                return False, msg
+
+            if not await self._is_vehicle_plugged_in(vehicle_vin):
+                msg = "Vehicle is not plugged in"
+                _LOGGER.warning(msg)
+                return False, msg
+
+        success = await self._execute_manual_ev_action(
+            "start_ev_charging",
+            vehicle_vin,
+            None,
+            "Manual start from mobile",
+        )
+        if success:
+            if charger_type == "zaptec":
                 return True, "Charging started via Zaptec"
-            except Exception as e:
-                _LOGGER.error(f"Zaptec start charging failed: {e}")
-                return False, f"Failed to start Zaptec charging: {e}"
+            return True, "Charging started"
 
-        # Check preconditions (Tesla path)
-        if not await self._is_vehicle_at_home(vehicle_vin):
-            msg = "Vehicle is not at home"
-            _LOGGER.warning(msg)
-            return False, msg
-
-        if not await self._is_vehicle_plugged_in(vehicle_vin):
-            msg = "Vehicle is not plugged in"
-            _LOGGER.warning(msg)
-            return False, msg
-
-        charging_state = await self._get_vehicle_charging_state(vehicle_vin)
-        if charging_state == "charging":
-            msg = "Vehicle is already charging"
-            _LOGGER.info(msg)
-            return True, msg  # Return success since desired state is achieved
-
-        config = self._get_powersync_config()
-        ev_provider = config.get(CONF_EV_PROVIDER, EV_PROVIDER_FLEET_API)
-        ble_prefix = _ble_prefix_for_vehicle(self._hass, config, vehicle_vin)
-
-        # Try Teslemetry Bluetooth first
-        if ev_provider in (EV_PROVIDER_TESLEMETRY_BT, EV_PROVIDER_BOTH):
-            tbt_prefix = _resolve_teslemetry_bt_prefix(self._hass)
-            if tbt_prefix:
-                tbt_entity = TESLEMETRY_BT_SWITCH_CHARGE.format(prefix=tbt_prefix)
-                if self._hass.states.get(tbt_entity):
-                    try:
-                        await self._hass.services.async_call(
-                            "switch", "turn_on",
-                            {"entity_id": tbt_entity},
-                            blocking=True,
-                        )
-                        _LOGGER.info(f"Started charging via Teslemetry BT: {tbt_entity}")
-                        return True, "Charging started"
-                    except Exception as e:
-                        _LOGGER.warning(f"Teslemetry BT start charging failed: {e}")
-
-        # Try ESPHome BLE
-        if ev_provider in (EV_PROVIDER_TESLA_BLE, EV_PROVIDER_BOTH):
-            charger_entity = TESLA_BLE_SWITCH_CHARGER.format(prefix=ble_prefix)
-            if self._hass.states.get(charger_entity):
-                try:
-                    await self._hass.services.async_call(
-                        "switch", "turn_on",
-                        {"entity_id": charger_entity},
-                        blocking=True,
-                    )
-                    _LOGGER.info(f"Started charging via BLE: {charger_entity}")
-                    return True, "Charging started"
-                except Exception as e:
-                    _LOGGER.warning(f"BLE start charging failed: {e}")
-
-        # Try Fleet API
-        if ev_provider in (EV_PROVIDER_FLEET_API, EV_PROVIDER_BOTH):
-            await self._wake_vehicle(vehicle_vin)
-            # Tesla Fleet uses switch.X_charge, not button.X_charge_start
-            charge_switch_entity = await self._get_tesla_ev_entity(r"switch\..*_charge$", vehicle_vin)
-            if charge_switch_entity:
-                try:
-                    # Use timeout to prevent hanging on slow Tesla API responses
-                    await asyncio.wait_for(
-                        self._hass.services.async_call(
-                            "switch", "turn_on",
-                            {"entity_id": charge_switch_entity},
-                            blocking=True,
-                        ),
-                        timeout=30.0
-                    )
-                    _LOGGER.info(f"Started charging via Fleet API: {charge_switch_entity}")
-                    return True, "Charging started"
-                except asyncio.TimeoutError:
-                    _LOGGER.warning(f"Start charging command timed out (30s) - command may still be processing")
-                    return True, "Charging command sent (response timed out)"
-                except Exception as e:
-                    _LOGGER.error(f"Fleet API start charging failed: {e}")
-                    return False, f"Failed to start charging: {e}"
-            else:
-                _LOGGER.error("Could not find charge switch entity for Tesla vehicle")
-
-        msg = f"Start charging failed - no suitable entity found (provider: {ev_provider})"
-        _LOGGER.warning(msg)
-        return False, msg
+        return False, "Failed to start charging"
 
     async def _stop_charging(self, vehicle_vin: str | None = None) -> tuple[bool, str]:
         """Stop charging. Returns (success, message)."""
-        # Zaptec standalone path — check before Tesla preconditions
-        zaptec = self._get_zaptec_standalone()
-        if zaptec:
-            client, charger_id, cached_state = zaptec
-            mode = cached_state.get("charger_operation_mode", "")
-            power_w = cached_state.get("total_charge_power_w", 0)
-            if mode != "charging" and power_w <= 50:
-                msg = f"Zaptec charger is not charging (state: {mode})"
-                _LOGGER.info(msg)
-                return True, msg
-            try:
-                await client.stop_charging(charger_id)
-                _LOGGER.info("Stopped charging via Zaptec Cloud API")
+        charger_type = self._manual_action_params(vehicle_vin).get("charger_type", "tesla")
+        success = await self._execute_manual_ev_action(
+            "stop_ev_charging",
+            vehicle_vin,
+            None,
+            "Manual stop from mobile",
+        )
+        if success:
+            if charger_type == "zaptec":
                 return True, "Charging stopped via Zaptec"
-            except Exception as e:
-                _LOGGER.error(f"Zaptec stop charging failed: {e}")
-                return False, f"Failed to stop Zaptec charging: {e}"
+            return True, "Charging stopped"
 
-        # Check if actually charging (Tesla path)
-        charging_state = await self._get_vehicle_charging_state(vehicle_vin)
-        if charging_state and charging_state != "charging":
-            msg = f"Vehicle is not charging (state: {charging_state})"
-            _LOGGER.info(msg)
-            return True, msg  # Return success since desired state is achieved
-
-        config = self._get_powersync_config()
-        ev_provider = config.get(CONF_EV_PROVIDER, EV_PROVIDER_FLEET_API)
-        ble_prefix = _ble_prefix_for_vehicle(self._hass, config, vehicle_vin)
-
-        # Try Teslemetry Bluetooth first
-        if ev_provider in (EV_PROVIDER_TESLEMETRY_BT, EV_PROVIDER_BOTH):
-            tbt_prefix = _resolve_teslemetry_bt_prefix(self._hass)
-            if tbt_prefix:
-                tbt_entity = TESLEMETRY_BT_SWITCH_CHARGE.format(prefix=tbt_prefix)
-                if self._hass.states.get(tbt_entity):
-                    try:
-                        await self._hass.services.async_call(
-                            "switch", "turn_off",
-                            {"entity_id": tbt_entity},
-                            blocking=True,
-                        )
-                        _LOGGER.info(f"Stopped charging via Teslemetry BT: {tbt_entity}")
-                        return True, "Charging stopped"
-                    except Exception as e:
-                        _LOGGER.warning(f"Teslemetry BT stop charging failed: {e}")
-
-        # Try ESPHome BLE
-        if ev_provider in (EV_PROVIDER_TESLA_BLE, EV_PROVIDER_BOTH):
-            charger_entity = TESLA_BLE_SWITCH_CHARGER.format(prefix=ble_prefix)
-            if self._hass.states.get(charger_entity):
-                try:
-                    await self._hass.services.async_call(
-                        "switch", "turn_off",
-                        {"entity_id": charger_entity},
-                        blocking=True,
-                    )
-                    _LOGGER.info(f"Stopped charging via BLE: {charger_entity}")
-                    return True, "Charging stopped"
-                except Exception as e:
-                    _LOGGER.warning(f"BLE stop charging failed: {e}")
-
-        # Try Fleet API
-        if ev_provider in (EV_PROVIDER_FLEET_API, EV_PROVIDER_BOTH):
-            await self._wake_vehicle(vehicle_vin)
-            # Tesla Fleet uses switch.X_charge, not button.X_charge_stop
-            charge_switch_entity = await self._get_tesla_ev_entity(r"switch\..*_charge$", vehicle_vin)
-            if charge_switch_entity:
-                try:
-                    # Use timeout to prevent hanging on slow Tesla API responses
-                    await asyncio.wait_for(
-                        self._hass.services.async_call(
-                            "switch", "turn_off",
-                            {"entity_id": charge_switch_entity},
-                            blocking=True,
-                        ),
-                        timeout=30.0
-                    )
-                    _LOGGER.info(f"Stopped charging via Fleet API: {charge_switch_entity}")
-                    return True, "Charging stopped"
-                except asyncio.TimeoutError:
-                    _LOGGER.warning(f"Stop charging command timed out (30s) - command may still be processing")
-                    return True, "Stop command sent (response timed out)"
-                except Exception as e:
-                    _LOGGER.error(f"Fleet API stop charging failed: {e}")
-                    return False, f"Failed to stop charging: {e}"
-
-        return False, "No suitable entity found to stop charging"
+        return False, "Failed to stop charging"
 
     async def _set_charge_limit(self, percent: int, vehicle_vin: str | None = None) -> tuple[bool, str]:
         """Set charge limit percentage. Returns (success, message)."""
         # Clamp to valid range (50-100%)
         percent = max(50, min(100, int(percent)))
 
-        config = self._get_powersync_config()
-        ev_provider = config.get(CONF_EV_PROVIDER, EV_PROVIDER_FLEET_API)
-        ble_prefix = _ble_prefix_for_vehicle(self._hass, config, vehicle_vin)
+        charger_type = self._manual_action_params(vehicle_vin).get("charger_type", "tesla")
+        success = await self._execute_manual_ev_action(
+            "set_ev_charge_limit",
+            vehicle_vin,
+            {"percent": percent},
+            "Manual charge limit from mobile",
+        )
+        if success:
+            if charger_type in ("generic", "ocpp", "zaptec"):
+                return True, "Charge limit is not supported for this charger"
+            return True, f"Charge limit set to {percent}%"
 
-        # Teslemetry BT doesn't support charge limit — skip to Fleet API
-        # Try ESPHome BLE first
-        if ev_provider in (EV_PROVIDER_TESLA_BLE, EV_PROVIDER_BOTH):
-            limit_entity = TESLA_BLE_NUMBER_CHARGING_LIMIT.format(prefix=ble_prefix)
-            if self._hass.states.get(limit_entity):
-                try:
-                    await self._hass.services.async_call(
-                        "number", "set_value",
-                        {"entity_id": limit_entity, "value": percent},
-                        blocking=True,
-                    )
-                    _LOGGER.info(f"Set charge limit to {percent}% via BLE: {limit_entity}")
-                    return True, f"Charge limit set to {percent}%"
-                except Exception as e:
-                    _LOGGER.warning(f"BLE set charge limit failed: {e}")
-
-        # Try Fleet API (also used as fallback for Teslemetry BT which lacks charge limit)
-        if ev_provider in (EV_PROVIDER_FLEET_API, EV_PROVIDER_TESLEMETRY_BT, EV_PROVIDER_BOTH):
-            await self._wake_vehicle(vehicle_vin)
-            limit_entity = await self._get_tesla_ev_entity(r"number\..*charge_limit$", vehicle_vin)
-            if limit_entity:
-                try:
-                    await self._hass.services.async_call(
-                        "number", "set_value",
-                        {"entity_id": limit_entity, "value": percent},
-                        blocking=True,
-                    )
-                    _LOGGER.info(f"Set charge limit to {percent}% via Fleet API: {limit_entity}")
-                    return True, f"Charge limit set to {percent}%"
-                except Exception as e:
-                    _LOGGER.error(f"Fleet API set charge limit failed: {e}")
-                    return False, f"Failed to set charge limit: {e}"
-
-        return False, "No suitable entity found to set charge limit"
+        return False, "Failed to set charge limit"
 
     async def _set_charging_amps(self, amps: int, vehicle_vin: str | None = None) -> tuple[bool, str]:
         """Set charging amperage. Returns (success, message)."""
         # Clamp to valid range (1-48A for most, up to 80A for some)
         amps = max(1, min(80, int(amps)))
 
-        # Check if plugged in - can only set amps when connected
-        if not await self._is_vehicle_plugged_in(vehicle_vin):
+        params = self._manual_action_params(vehicle_vin)
+        charger_type = params.get("charger_type", "tesla")
+
+        # Tesla vehicles can only set amps when connected. Charger-native
+        # integrations validate this through their own status/action handlers.
+        if charger_type == "tesla" and not await self._is_vehicle_plugged_in(vehicle_vin):
             msg = "Vehicle is not plugged in - cannot set charging amps"
             _LOGGER.warning(msg)
             return False, msg
 
-        config = self._get_powersync_config()
-        ev_provider = config.get(CONF_EV_PROVIDER, EV_PROVIDER_FLEET_API)
-        ble_prefix = _ble_prefix_for_vehicle(self._hass, config, vehicle_vin)
+        success = await self._execute_manual_ev_action(
+            "set_ev_charging_amps",
+            vehicle_vin,
+            {"amps": amps},
+            "Manual charging amps from mobile",
+        )
+        if success:
+            return True, f"Charging amps set to {amps}A"
 
-        # Try Teslemetry Bluetooth first
-        if ev_provider in (EV_PROVIDER_TESLEMETRY_BT, EV_PROVIDER_BOTH):
-            tbt_prefix = _resolve_teslemetry_bt_prefix(self._hass)
-            if tbt_prefix:
-                tbt_amps_entity = TESLEMETRY_BT_NUMBER_CHARGE_AMPS.format(prefix=tbt_prefix)
-                tbt_state = self._hass.states.get(tbt_amps_entity)
-                if tbt_state:
-                    min_val = float(tbt_state.attributes.get("min", 0))
-                    max_val = float(tbt_state.attributes.get("max", 32))
-                    capped = max(int(min_val), min(amps, int(max_val)))
-                    try:
-                        await self._hass.services.async_call(
-                            "number", "set_value",
-                            {"entity_id": tbt_amps_entity, "value": capped},
-                            blocking=True,
-                        )
-                        _LOGGER.info(f"Set charging amps to {capped}A via Teslemetry BT: {tbt_amps_entity}")
-                        return True, f"Charging amps set to {capped}A"
-                    except Exception as e:
-                        _LOGGER.warning(f"Teslemetry BT set charging amps failed: {e}")
-
-        # Try ESPHome BLE (BLE supports same 5-32A range as cloud API)
-        if ev_provider in (EV_PROVIDER_TESLA_BLE, EV_PROVIDER_BOTH):
-            amps_entity = TESLA_BLE_NUMBER_CHARGING_AMPS.format(prefix=ble_prefix)
-            if self._hass.states.get(amps_entity):
-                # Tesla vehicles refuse charging below 5A
-                ble_amps = max(5, min(32, amps))
-                try:
-                    await self._hass.services.async_call(
-                        "number", "set_value",
-                        {"entity_id": amps_entity, "value": ble_amps},
-                        blocking=True,
-                    )
-                    _LOGGER.info(f"Set charging amps to {ble_amps}A via BLE: {amps_entity}")
-                    return True, f"Charging amps set to {ble_amps}A"
-                except Exception as e:
-                    _LOGGER.warning(f"BLE set charging amps failed: {e}")
-
-        # Try Fleet API
-        if ev_provider in (EV_PROVIDER_FLEET_API, EV_PROVIDER_BOTH):
-            await self._wake_vehicle(vehicle_vin)
-            # Tesla Fleet uses charge_current, Teslemetry uses charging_amps
-            amps_entity = await self._get_tesla_ev_entity(r"number\..*(charging_amps|charge_current)$", vehicle_vin)
-            if amps_entity:
-                try:
-                    await self._hass.services.async_call(
-                        "number", "set_value",
-                        {"entity_id": amps_entity, "value": amps},
-                        blocking=True,
-                    )
-                    _LOGGER.info(f"Set charging amps to {amps}A via Fleet API: {amps_entity}")
-                    return True, f"Charging amps set to {amps}A"
-                except Exception as e:
-                    _LOGGER.error(f"Fleet API set charging amps failed: {e}")
-                    return False, f"Failed to set charging amps: {e}"
-
-        return False, "No suitable entity found to set charging amps"
+        return False, "Failed to set charging amps"
 
     async def post(self, request: web.Request, vehicle_id: str) -> web.Response:
         """Handle POST request to send vehicle command."""
@@ -10117,6 +9994,86 @@ class VehicleChargingConfigView(HomeAssistantView):
                 return entry_data["automation_store"]
         return None
 
+    def _dynamic_state_matches_config(self, state: dict, config: dict | None) -> bool:
+        """Return true when runtime dynamic state belongs to a removed config."""
+        if not config:
+            return False
+        params = state.get("params", {}) or {}
+        if config.get("charger_type") and params.get("charger_type") != config.get("charger_type"):
+            return False
+        for key in ("charger_switch_entity", "charger_amps_entity", "charger_status_entity", "ocpp_charger_id"):
+            if config.get(key) and params.get(key) == config.get(key):
+                return True
+        return False
+
+    async def _cleanup_vehicle_runtime_state(
+        self,
+        vehicle_ids: set[str],
+        removed_config: dict | None,
+    ) -> list[str]:
+        """Clear runtime EV state for deleted vehicle configs."""
+        changes: list[str] = []
+        runtime_ids = set(vehicle_ids)
+
+        try:
+            from .automations.actions import _dynamic_ev_state
+
+            for entry_id, vehicles in list(_dynamic_ev_state.items()):
+                for vid, state in list(vehicles.items()):
+                    if vid in vehicle_ids or self._dynamic_state_matches_config(state, removed_config):
+                        vehicles.pop(vid, None)
+                        runtime_ids.add(vid)
+                        changes.append(f"dynamic_state:{vid}")
+
+                entry_data = self._hass.data.get(DOMAIN, {}).get(entry_id)
+                if not isinstance(entry_data, dict):
+                    continue
+                if vehicles:
+                    entry_data["dynamic_ev_state"] = vehicles
+                else:
+                    _dynamic_ev_state.pop(entry_id, None)
+                    entry_data.pop("dynamic_ev_state", None)
+        except Exception as err:
+            _LOGGER.debug("Deleted vehicle dynamic-state cleanup failed: %s", err)
+
+        try:
+            from .automations.ev_charging_session import get_session_manager
+
+            session_manager = get_session_manager()
+            if session_manager:
+                for vid in runtime_ids:
+                    if vid in session_manager.active_sessions:
+                        await session_manager.end_session(vid, "vehicle_deleted")
+                        changes.append(f"session:{vid}")
+        except Exception as err:
+            _LOGGER.debug("Deleted vehicle session cleanup failed: %s", err)
+
+        try:
+            from .automations.ev_charging_planner import (
+                get_auto_schedule_executor,
+                get_price_level_executor,
+            )
+
+            auto_executor = get_auto_schedule_executor()
+            if auto_executor:
+                for vid in runtime_ids:
+                    if auto_executor._settings.pop(vid, None) is not None:
+                        changes.append(f"auto_settings:{vid}")
+                    if auto_executor._state.pop(vid, None) is not None:
+                        changes.append(f"auto_state:{vid}")
+                    auto_executor._cached_soc.pop(vid, None)
+                    auto_executor._current_charge_amps.pop(vid, None)
+
+            price_level = get_price_level_executor()
+            if price_level:
+                for vid in runtime_ids:
+                    if price_level._vehicle_states.pop(vid, None) is not None:
+                        changes.append(f"price_level_state:{vid}")
+        except Exception as err:
+            _LOGGER.debug("Deleted vehicle executor cleanup failed: %s", err)
+
+        return changes
+
     async def get(self, request: web.Request) -> web.Response:
         """Handle GET request - get all vehicle charging configs."""
         try:
@@ -10183,6 +10140,7 @@ class VehicleChargingConfigView(HomeAssistantView):
                     "charger_type": data.get("charger_type", "tesla"),
                     "charger_switch_entity": data.get("charger_switch_entity"),
                     "charger_amps_entity": data.get("charger_amps_entity"),
+                    "charger_status_entity": data.get("charger_status_entity"),
                     "ocpp_charger_id": data.get("ocpp_charger_id"),
                     "min_amps": data.get("min_amps", 5),
                     "max_amps": data.get("max_amps", 32),
@@ -10211,16 +10169,27 @@ class VehicleChargingConfigView(HomeAssistantView):
                     )
                     if saved_config and vehicle_id in executor._settings:
                         settings = executor._settings[vehicle_id]
-                        if "max_amps" in saved_config:
-                            settings.max_charge_amps = saved_config["max_amps"]
-                        if "min_amps" in saved_config:
-                            settings.min_charge_amps = saved_config["min_amps"]
-                        if "voltage" in saved_config:
-                            settings.voltage = saved_config["voltage"]
-                        if "phases" in saved_config:
-                            settings.phases = saved_config["phases"]
-                        if "charger_type" in saved_config:
-                            settings.charger_type = saved_config["charger_type"]
+                        if hasattr(settings, "apply_charger_config"):
+                            settings.apply_charger_config(saved_config)
+                        else:
+                            if "max_amps" in saved_config:
+                                settings.max_charge_amps = saved_config["max_amps"]
+                            if "min_amps" in saved_config:
+                                settings.min_charge_amps = saved_config["min_amps"]
+                            if "voltage" in saved_config:
+                                settings.voltage = saved_config["voltage"]
+                            if "phases" in saved_config:
+                                settings.phases = saved_config["phases"]
+                            if "charger_type" in saved_config:
+                                settings.charger_type = saved_config["charger_type"]
+                            if "charger_switch_entity" in saved_config:
+                                settings.charger_switch_entity = saved_config["charger_switch_entity"]
+                            if "charger_amps_entity" in saved_config:
+                                settings.charger_amps_entity = saved_config["charger_amps_entity"]
+                            if "charger_status_entity" in saved_config:
+                                settings.charger_status_entity = saved_config["charger_status_entity"]
+                            if "ocpp_charger_id" in saved_config:
+                                settings.ocpp_charger_id = saved_config["ocpp_charger_id"]
                         _LOGGER.debug(
                             "Synced charger params to auto-schedule for %s: "
                             "max=%dA, voltage=%dV, phases=%d",
@@ -10263,6 +10232,10 @@ class VehicleChargingConfigView(HomeAssistantView):
 
             stored_data = getattr(store, '_data', {}) or {}
             vehicle_configs = stored_data.get("vehicle_charging_configs", [])
+            removed_config = next(
+                (c for c in vehicle_configs if c.get("vehicle_id") == vehicle_id),
+                None,
+            )
             updated = [c for c in vehicle_configs if c.get("vehicle_id") != vehicle_id]
 
             if len(updated) == len(vehicle_configs):
@@ -10271,11 +10244,35 @@ class VehicleChargingConfigView(HomeAssistantView):
                     "error": f"Vehicle {vehicle_id} not found"
                 }, status=404)
 
+            cleanup_ids = {vehicle_id}
+            if removed_config:
+                if removed_config.get("charger_type") == "generic":
+                    cleanup_ids.add("generic_ev")
+                if removed_config.get("ocpp_charger_id"):
+                    cleanup_ids.add(f"ocpp_{removed_config['ocpp_charger_id']}")
+
             store._data["vehicle_charging_configs"] = updated
+            for key in ("auto_schedule_settings", "cached_vehicle_soc"):
+                value = store._data.get(key)
+                if isinstance(value, dict):
+                    for cleanup_id in cleanup_ids:
+                        value.pop(cleanup_id, None)
             await store.async_save()
 
-            _LOGGER.info("Removed vehicle config: %s", vehicle_id)
-            return web.json_response({"success": True})
+            cleanup_changes = await self._cleanup_vehicle_runtime_state(
+                cleanup_ids,
+                removed_config,
+            )
+
+            _LOGGER.info(
+                "Removed vehicle config: %s (cleanup=%s)",
+                vehicle_id,
+                cleanup_changes,
+            )
+            return web.json_response({
+                "success": True,
+                "cleanup": cleanup_changes,
+            })
 
         except Exception as e:
             _LOGGER.error(f"Error deleting vehicle config: {e}", exc_info=True)
@@ -10308,18 +10305,13 @@ class SolarSurplusConfigView(HomeAssistantView):
     async def get(self, request: web.Request) -> web.Response:
         """Handle GET request - get solar surplus config."""
         try:
+            from .solar_surplus_config import (
+                DEFAULT_SOLAR_SURPLUS_CONFIG,
+                normalize_solar_surplus_config,
+            )
+
             store = self._get_store()
-            default_config = {
-                "enabled": False,
-                "household_buffer_kw": 0.5,
-                "surplus_calculation": "grid_based",
-                "sustained_surplus_minutes": 2,
-                "stop_delay_minutes": 5,
-                "dual_vehicle_strategy": "priority_first",
-                "home_battery_minimum": 80,  # Home battery must reach this % before EV surplus charging
-                "allow_parallel_charging": False,  # Charge EV while battery is charging if surplus exceeds max rate
-                "max_battery_charge_rate_kw": 5.0,  # Max battery charge rate (5=single PW, 10=dual, 15=triple)
-            }
+            default_config = dict(DEFAULT_SOLAR_SURPLUS_CONFIG)
 
             if not store:
                 return web.json_response({
@@ -10328,11 +10320,11 @@ class SolarSurplusConfigView(HomeAssistantView):
                 })
 
             stored_data = getattr(store, '_data', {}) or {}
-            config = stored_data.get("solar_surplus_config", default_config)
+            config = normalize_solar_surplus_config(stored_data.get("solar_surplus_config", {}))
 
             return web.json_response({
                 "success": True,
-                "config": {**default_config, **config}
+                "config": config
             })
 
         except Exception as e:
@@ -10345,7 +10337,11 @@ class SolarSurplusConfigView(HomeAssistantView):
     async def post(self, request: web.Request) -> web.Response:
         """Handle POST request - update solar surplus config."""
         try:
+            from .solar_surplus_config import normalize_solar_surplus_config
+
             data = await request.json()
+            if "min_battery_soc" in data and "home_battery_minimum" not in data:
+                data["home_battery_minimum"] = data["min_battery_soc"]
 
             store = self._get_store()
             if not store:
@@ -10378,6 +10374,7 @@ class SolarSurplusConfigView(HomeAssistantView):
                 updated_config["allow_parallel_charging"] = bool(updated_config["allow_parallel_charging"])
             if "max_battery_charge_rate_kw" in updated_config:
                 updated_config["max_battery_charge_rate_kw"] = max(1, min(30, float(updated_config["max_battery_charge_rate_kw"])))
+            updated_config = normalize_solar_surplus_config(updated_config)
 
             # Save updated config (update key in existing _data, don't overwrite)
             if hasattr(store, '_data') and hasattr(store, 'async_save'):
@@ -10923,14 +10920,83 @@ class ChargingBoostView(HomeAssistantView):
                     status=400
                 )
             target_soc = data.get("target_soc")
+            target_soc_value = None
+            if target_soc is not None:
+                try:
+                    target_soc_value = int(target_soc)
+                    if not (0 <= target_soc_value <= 100):
+                        return web.json_response(
+                            {"success": False, "error": "target_soc must be 0-100"},
+                            status=400,
+                        )
+                except (ValueError, TypeError):
+                    return web.json_response(
+                        {"success": False, "error": "Invalid target_soc value"},
+                        status=400,
+                    )
 
             from .automations.actions import execute_actions
 
             # Execute start_ev_charging action with max amps
+            boost_vehicle_id = vehicle_id if vehicle_id and vehicle_id != "_default" else "_default"
+            action_vehicle_vin = None if boost_vehicle_id == "_default" else boost_vehicle_id
+            action_params = {
+                "vehicle_vin": action_vehicle_vin,
+                "skip_ownership": True,
+            }
+            warnings: list[str] = []
+
+            opts = {**self._config_entry.data, **self._config_entry.options}
+            if boost_vehicle_id == "generic_ev":
+                from .const import (
+                    CONF_GENERIC_CHARGER_AMPS_ENTITY,
+                    CONF_GENERIC_CHARGER_STATUS_ENTITY,
+                    CONF_GENERIC_CHARGER_SWITCH_ENTITY,
+                )
+
+                action_vehicle_vin = None
+                action_params.update({
+                    "charger_type": "generic",
+                    "vehicle_id": "generic_ev",
+                    "vehicle_vin": None,
+                    "charger_switch_entity": opts.get(CONF_GENERIC_CHARGER_SWITCH_ENTITY, ""),
+                    "charger_amps_entity": opts.get(CONF_GENERIC_CHARGER_AMPS_ENTITY, ""),
+                    "charger_status_entity": opts.get(CONF_GENERIC_CHARGER_STATUS_ENTITY, ""),
+                })
+            elif (
+                boost_vehicle_id == "zaptec_standalone"
+                or (
+                    boost_vehicle_id == "_default"
+                    and opts.get(CONF_ZAPTEC_STANDALONE_ENABLED)
+                    and opts.get(CONF_ZAPTEC_USERNAME)
+                )
+            ):
+                boost_vehicle_id = "zaptec_standalone"
+                action_vehicle_vin = None
+                action_params.update({
+                    "charger_type": "zaptec",
+                    "vehicle_id": "zaptec_standalone",
+                    "vehicle_vin": None,
+                })
+
+            if target_soc_value is not None and target_soc_value >= 50:
+                limit_success = await execute_actions(self._hass, self._config_entry, [{
+                    "action_type": "set_ev_charge_limit",
+                    "parameters": {
+                        **action_params,
+                        "percent": target_soc_value,
+                    }
+                }])
+                if not limit_success:
+                    warnings.append("Could not set EV charge limit before boost")
+            elif target_soc_value is not None:
+                warnings.append("EV charge limit not set because target SoC is below 50%")
+
             actions = [{
                 "action_type": "start_ev_charging",
                 "parameters": {
-                    "vehicle_vin": vehicle_id if vehicle_id != "_default" else None,
+                    **action_params,
+                    "amps": 32,
                 }
             }]
 
@@ -10941,16 +11007,100 @@ class ChargingBoostView(HomeAssistantView):
                 amps_actions = [{
                     "action_type": "set_ev_charging_amps",
                     "parameters": {
+                        **action_params,
                         "amps": 32,  # Max standard amps
-                        "vehicle_vin": vehicle_id if vehicle_id != "_default" else None,
                     }
                 }]
-                await execute_actions(self._hass, self._config_entry, amps_actions)
+                amps_success = await execute_actions(self._hass, self._config_entry, amps_actions)
+                if not amps_success:
+                    warnings.append("Could not set EV charging amps before boost")
+
+                from .automations.ev_ownership import (
+                    claim_ev_ownership,
+                    get_active_ev_owner_mode,
+                    owner_family,
+                    record_ev_command,
+                    release_ev_ownership,
+                )
+
+                entry_data = self._hass.data.setdefault(DOMAIN, {}).setdefault(
+                    self._config_entry.entry_id,
+                    {},
+                )
+                if cancel_boost := entry_data.get("ev_boost_cancel"):
+                    cancel_boost()
+                    entry_data["ev_boost_cancel"] = None
+
+                claim_ev_ownership(
+                    self._hass,
+                    self._config_entry,
+                    boost_vehicle_id,
+                    owner_mode="boost",
+                    command="start_boost",
+                    reason=f"Boost charge for {duration_minutes} minutes",
+                    extra={
+                        "duration_minutes": duration_minutes,
+                        "target_soc": target_soc_value,
+                    },
+                )
+
+                async def _stop_boost_when_elapsed(_now) -> None:
+                    entry_data = self._hass.data.get(DOMAIN, {}).get(
+                        self._config_entry.entry_id,
+                        {},
+                    )
+                    entry_data.pop("ev_boost_cancel", None)
+                    active_mode = get_active_ev_owner_mode(
+                        self._hass,
+                        self._config_entry,
+                        boost_vehicle_id,
+                    )
+                    if owner_family(active_mode) != "boost":
+                        _LOGGER.info(
+                            "Boost stop skipped for %s because ownership is now %s",
+                            boost_vehicle_id,
+                            active_mode or "unowned",
+                        )
+                        return
+
+                    stop_success = await execute_actions(self._hass, self._config_entry, [{
+                        "action_type": "stop_ev_charging",
+                        "parameters": {
+                            **action_params,
+                        },
+                    }])
+                    if stop_success:
+                        release_ev_ownership(
+                            self._hass,
+                            self._config_entry,
+                            boost_vehicle_id,
+                            command="stop_boost",
+                            reason="Boost duration elapsed",
+                        )
+                    else:
+                        record_ev_command(
+                            self._hass,
+                            self._config_entry,
+                            boost_vehicle_id,
+                            command="stop_boost",
+                            success=False,
+                            reason="Boost duration elapsed but stop command failed",
+                        )
+
+                stops_at = dt_util.utcnow() + timedelta(minutes=duration_minutes)
+                entry_data["ev_boost_cancel"] = async_track_point_in_utc_time(
+                    self._hass,
+                    _stop_boost_when_elapsed,
+                    stops_at,
+                )
 
             return web.json_response({
                 "success": success,
                 "message": "Boost charge started" if success else "Failed to start boost charge",
                 "duration_minutes": duration_minutes,
+                "target_soc": target_soc_value,
+                "stops_at": stops_at.isoformat() if success else None,
+                "warnings": warnings,
             })
 
         except Exception as e:
@@ -10976,6 +11126,12 @@ class OCPPChargersView(HomeAssistantView):
         """Get OCPP charger list and status."""
         import re
         from homeassistant.helpers import entity_registry as er
+        from .automations.ocpp_status import (
+            is_ocpp_charging,
+            is_ocpp_hardware_online,
+            is_ocpp_vehicle_present,
+            normalize_ocpp_status,
+        )
 
         entity_reg = er.async_get(self._hass)
 
@@ -10984,7 +11140,7 @@ class OCPPChargersView(HomeAssistantView):
         # the matched suffix — e.g. switch.evse001_charge_control → prefix "evse001",
         # not "evse001_charge" (which rsplit("_",1) would incorrectly produce).
         suffix_pattern = re.compile(
-            r"^(sensor|switch|number)\.(\w+?)_(status|availability|charge_control|current_power|energy_meter)$",
+            r"^(sensor|switch|number)\.(\w+?)_(status_connector|status|availability|charge_control|current_power|energy_meter)$",
             re.IGNORECASE,
         )
         charger_ids = set()
@@ -11011,14 +11167,26 @@ class OCPPChargersView(HomeAssistantView):
         # Build charger list from detected entities
         for idx, cid in enumerate(sorted(charger_ids)):
             status_entity = f"sensor.{cid}_status"
+            # lbbrhzn/ocpp exposes sensor.*_status (charge-point level) and
+            # sensor.*_status_connector (connector level).  The charge-point sensor
+            # often stays "unknown" while the connector sensor is reliably updated,
+            # so fall back to it when the primary status is unknown/unavailable.
+            status_connector_entity = f"sensor.{cid}_status_connector"
             power_entity = f"sensor.{cid}_current_power"
             energy_entity = f"sensor.{cid}_energy_meter"
 
             status_state = self._hass.states.get(status_entity)
+            status_connector_state = self._hass.states.get(status_connector_entity)
             power_state = self._hass.states.get(power_entity)
             energy_state = self._hass.states.get(energy_entity)
 
-            status = status_state.state if status_state and status_state.state not in ("unavailable", "unknown") else "Unavailable"
+            effective_status = None
+            if status_state and status_state.state not in ("unavailable", "unknown"):
+                effective_status = status_state.state
+            elif status_connector_state and status_connector_state.state not in ("unavailable", "unknown"):
+                effective_status = status_connector_state.state
+            status = effective_status if effective_status else "Unavailable"
+
             power_kw = 0.0
             energy_kwh = 0.0
 
@@ -11034,8 +11202,10 @@ class OCPPChargersView(HomeAssistantView):
                 except (ValueError, TypeError):
                     pass
 
-            is_connected = status.lower() not in ("unavailable", "disconnected", "")
-            is_charging = status.lower() in ("charging",)
+            normalized_status = normalize_ocpp_status(status)
+            is_connected = is_ocpp_hardware_online(status)
+            is_vehicle_connected = is_ocpp_vehicle_present(status, power_kw * 1000)
+            is_charging = is_ocpp_charging(status, power_kw * 1000)
 
             chargers.append({
                 "id": idx + 1,
@@ -11046,7 +11216,10 @@ class OCPPChargersView(HomeAssistantView):
                 "serial_number": "",
                 "firmware_version": "",
                 "is_connected": is_connected,
+                "is_vehicle_connected": is_vehicle_connected,
+                "is_charging": is_charging,
                 "status": status,
+                "normalized_status": normalized_status,
                 "current_power_kw": round(power_kw, 2),
                 "energy_kwh": round(energy_kwh, 2),
             })
@@ -11107,14 +11280,29 @@ class OCPPChargerStartView(HomeAssistantView):
                     status=404,
                 )
 
-            await self._hass.services.async_call(
-                "switch",
-                "turn_on",
-                {"entity_id": entity_id},
-                blocking=True,
-            )
+            from .automations.actions import _execute_single_action
 
-            _LOGGER.info("OCPP charger %s: start charging via %s", charger_id, entity_id)
+            success = await _execute_single_action(
+                self._hass,
+                self._entry,
+                "start_ev_charging",
+                {
+                    "charger_type": "ocpp",
+                    "ocpp_charger_id": charger_id,
+                    "vehicle_id": f"ocpp_{charger_id}",
+                    "reason": "Manual OCPP start from mobile",
+                },
+            )
+            if not success:
+                return web.json_response(
+                    {"success": False, "error": f"Failed to start charging on {charger_id}"},
+                    status=500,
+                )
+
+            _LOGGER.info(
+                "OCPP charger %s: start charging via shared action layer",
+                charger_id,
+            )
             return web.json_response({
                 "success": True,
                 "message": f"Charging started on {charger_id}",
@@ -11162,14 +11350,26 @@ class OCPPChargerStopView(HomeAssistantView):
                     status=404,
                 )
 
-            await self._hass.services.async_call(
-                "switch",
-                "turn_off",
-                {"entity_id": entity_id},
-                blocking=True,
-            )
+            from .automations.actions import _execute_single_action
 
-            _LOGGER.info("OCPP charger %s: stop charging via %s", charger_id, entity_id)
+            success = await _execute_single_action(
+                self._hass,
+                self._entry,
+                "stop_ev_charging",
+                {
+                    "charger_type": "ocpp",
+                    "ocpp_charger_id": charger_id,
+                    "vehicle_id": f"ocpp_{charger_id}",
+                    "reason": "Manual OCPP stop from mobile",
+                },
+            )
+            if not success:
+                return web.json_response(
+                    {"success": False, "error": f"Failed to stop charging on {charger_id}"},
+                    status=500,
+                )
+
+            _LOGGER.info("OCPP charger %s: stop charging via shared action layer", charger_id)
             return web.json_response({
                 "success": True,
                 "message": f"Charging stopped on {charger_id}",
@@ -11200,7 +11400,11 @@ class EVWidgetDataView(HomeAssistantView):
     async def get(self, request):
         """Get widget data for EV charging status."""
         try:
-            from .automations.actions import _dynamic_ev_state, _calculate_solar_surplus
+            from .automations.actions import (
+                DEFAULT_VEHICLE_ID,
+                _dynamic_ev_state,
+                _calculate_solar_surplus,
+            )
 
             entry_id = self._config_entry.entry_id
             entry_data = self._hass.data.get(DOMAIN, {}).get(entry_id, {})
@@ -11266,7 +11470,9 @@ class EVWidgetDataView(HomeAssistantView):
             # actually charging (e.g. not plugged in, or charge command didn't take effect)
             actual_ev_power_kw = None  # None = no Tesla data available
             if tesla_coordinator and tesla_coordinator.data:
-                actual_ev_power_kw = tesla_coordinator.data.get("ev_power", 0)
+                actual_ev_power_kw = _kw_from_wall_connector_power(
+                    tesla_coordinator.data.get("ev_power", 0)
+                )
 
             # Get dynamic EV state
             vehicles = _dynamic_ev_state.get(entry_id, {})
@@ -11277,6 +11483,18 @@ class EVWidgetDataView(HomeAssistantView):
                     continue
 
                 params = state.get("params", {})
+
+                # Skip the legacy "_default" placeholder when no display name
+                # is set. It is internal bookkeeping (single-vehicle/manual
+                # paths) and would otherwise render as "_DEFAULT" in the
+                # mobile app alongside the real vehicle, which is added later
+                # via the tesla_vehicles / BYD discovery paths.
+                if (
+                    vehicle_id == DEFAULT_VEHICLE_ID
+                    and not (params.get("vehicle_name") or state.get("vehicle_name"))
+                ):
+                    continue
+
                 current_amps = state.get("current_amps", 0)
                 voltage = params.get("voltage", 240)
                 phases = params.get("phases", 1)
@@ -11287,7 +11505,7 @@ class EVWidgetDataView(HomeAssistantView):
                 if actual_ev_power_kw is not None:
                     # Tesla: use Wall Connector API as ground truth
                     if actual_ev_power_kw > 0.05:
-                        current_power_kw = commanded_power_kw
+                        current_power_kw = actual_ev_power_kw
                         actually_charging = True
                     elif commanded_power_kw > 0:
                         # Commands sent but car isn't drawing power (not plugged in)
@@ -11430,6 +11648,12 @@ class EVWidgetDataView(HomeAssistantView):
             # Looks for sensor.*_status, sensor.*_current_power from the ocpp platform
             try:
                 from homeassistant.helpers import entity_registry as er
+                from .automations.ocpp_status import (
+                    extract_hacs_ocpp_prefix,
+                    is_ocpp_charging,
+                    is_ocpp_vehicle_present,
+                    normalize_ocpp_status,
+                )
                 ent_reg = er.async_get(self._hass)
                 ocpp_chargers_found = {}
                 for entity in ent_reg.entities.values():
@@ -11439,25 +11663,25 @@ class EVWidgetDataView(HomeAssistantView):
                     state = self._hass.states.get(entity.entity_id)
                     if not state or state.state in ("unknown", "unavailable"):
                         continue
-                    # Extract charger prefix (e.g. "my_charger" from "sensor.my_charger_status")
-                    prefix = None
-                    for suffix in ("_status", "_availability", "_current_power", "_charge_control"):
-                        if eid.endswith(suffix):
-                            prefix = eid.split(".", 1)[1].replace(suffix, "")
-                            break
+                    # Extract charger prefix (e.g. "my_charger" from
+                    # "sensor.my_charger_status_connector").
+                    prefix = extract_hacs_ocpp_prefix(eid)
                     if not prefix:
                         continue
                     if prefix not in ocpp_chargers_found:
                         ocpp_chargers_found[prefix] = {"name": prefix, "status": None, "power_kw": 0, "connected": False, "charging": False}
                     charger = ocpp_chargers_found[prefix]
-                    if eid.endswith("_status"):
-                        charger["status"] = state.state.lower()
-                        charger["connected"] = state.state.lower() in ("preparing", "charging", "suspendedevse", "suspendedev", "finishing")
-                        charger["charging"] = state.state.lower() == "charging"
+                    if eid.endswith("_status") or eid.endswith("_status_connector"):
+                        charger["status"] = normalize_ocpp_status(state.state)
+                        charger["connected"] = is_ocpp_vehicle_present(state.state)
+                        charger["charging"] = is_ocpp_charging(state.state)
                     elif eid.endswith("_current_power"):
                         try:
                             pwr = float(state.state)
                             charger["power_kw"] = pwr / 1000 if pwr > 100 else pwr  # W or kW
+                            power_w = pwr if pwr > 100 else pwr * 1000
+                            charger["charging"] = charger["charging"] or power_w > 50
+                            charger["connected"] = charger["connected"] or power_w > 50
                         except (ValueError, TypeError):
                             pass
 
@@ -11589,46 +11813,52 @@ class EVWidgetDataView(HomeAssistantView):
             # Supplement from Wall Connector data (Tesla live_status)
             # WC state 4 = connected/ready, state 2 = charging
             if tesla_coordinator and tesla_coordinator.data:
-                wc_data = tesla_coordinator.data.get("wall_connectors")
-                wc_power = tesla_coordinator.data.get("ev_power", 0)
-                if wc_data and isinstance(wc_data, str):
-                    try:
-                        import ast
-                        wc_list = ast.literal_eval(wc_data)
-                        for wc in wc_list:
-                            wc_state = wc.get("wall_connector_state", 0)
-                            wc_pwr = wc.get("wall_connector_power", 0) / 1000 if wc.get("wall_connector_power") else 0
-                            wc_vin = wc.get("vin", "")
-                            # State 2=charging, 4=connected/ready, 6=ready, 1=disconnected
-                            wc_connected = wc_state in (2, 4, 6)
-                            wc_charging = wc_pwr > 0.05 or wc_state == 2
+                wc_data = (
+                    tesla_coordinator.data.get("wall_connectors_raw")
+                    or tesla_coordinator.data.get("wall_connectors")
+                )
+                for wc in _wall_connector_records(wc_data):
+                    wc_state = wc.get("wall_connector_state", 0)
+                    wc_pwr = _kw_from_wall_connector_power(
+                        wc.get("wall_connector_power", wc.get("power"))
+                    )
+                    wc_vin = wc.get("vin") or wc.get("vehicle_vin")
+                    # State 2=charging, 4=connected/ready, 6=ready, 1=disconnected
+                    wc_connected = wc_state in (2, 4, 6, 7, 11) or wc_pwr > 0.05
+                    wc_charging = wc_pwr > 0.05 or wc_state == 2
 
-                            if wc_connected:
-                                # Find matching vehicle by VIN or update first unconnected
-                                matched = False
-                                for tv in tesla_vehicles:
-                                    if not tv["is_connected"]:
-                                        tv["is_connected"] = True
-                                        tv["is_charging"] = tv["is_charging"] or wc_charging
-                                        if wc_pwr > tv["ev_power_kw"]:
-                                            tv["ev_power_kw"] = wc_pwr
-                                        _LOGGER.debug("EV widget: %s connected via Wall Connector (state=%d, power=%.1fkW)", tv["vehicle_name"], wc_state, wc_pwr)
-                                        matched = True
-                                        break
-                                if not matched and not any(tv["is_connected"] for tv in tesla_vehicles):
-                                    tesla_vehicles.append({
-                                        "vehicle_name": "Tesla EV",
-                                        "ev_power_kw": wc_pwr,
-                                        "ev_soc": None,
-                                        "is_connected": True,
-                                        "is_charging": wc_charging,
-                                    })
-                    except Exception as wc_err:
-                        _LOGGER.debug("Error parsing Wall Connector data: %s", wc_err)
+                    if wc_connected:
+                        matched = _apply_wall_connector_observation(
+                            tesla_vehicles,
+                            wc_pwr,
+                            wc_connected,
+                            wc_charging,
+                            wc_vin,
+                        )
+                        if matched:
+                            _LOGGER.debug(
+                                "EV widget: Wall Connector matched vehicle (state=%d, power=%.1fkW, vin=%s)",
+                                wc_state,
+                                wc_pwr,
+                                "present" if wc_vin else "unknown",
+                            )
+                        elif not tesla_vehicles:
+                            tesla_vehicles.append({
+                                "vehicle_id": "wall_connector",
+                                "vehicle_name": "Tesla EV",
+                                "ev_power_kw": wc_pwr,
+                                "ev_soc": None,
+                                "is_connected": True,
+                                "is_charging": wc_charging,
+                            })
 
                 # Legacy fallback: ev_power sensor only
+                wc_power = _kw_from_wall_connector_power(
+                    tesla_coordinator.data.get("ev_power", 0)
+                )
                 if not tesla_vehicles and wc_power > 0.05:
                     tesla_vehicles = [{
+                        "vehicle_id": "wall_connector",
                         "vehicle_name": "Tesla EV",
                         "ev_power_kw": wc_power,
                         "ev_soc": None,
@@ -11737,6 +11967,262 @@ class EVWidgetDataView(HomeAssistantView):
             }, status=500)
 
 
+class EVLoadpointStatusView(HomeAssistantView):
+    """API endpoint for normalized EV/loadpoint status.
+
+    GET /api/power_sync/ev/loadpoints/status
+    Returns PowerSync-owned sessions plus observed charger telemetry.
+    """
+    url = "/api/power_sync/ev/loadpoints/status"
+    name = "api:power_sync:ev:loadpoints:status"
+    requires_auth = True
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+        self._hass = hass
+        self._config_entry = entry
+
+    def _site_snapshot(self) -> dict:
+        """Get current site power data from the preferred coordinator."""
+        entry_id = self._config_entry.entry_id
+        entry_data = self._hass.data.get(DOMAIN, {}).get(entry_id, {})
+
+        solar_power_kw = 0.0
+        grid_power_kw = 0.0
+        battery_power_kw = 0.0
+        load_power_kw = 0.0
+        battery_soc = 0.0
+
+        for key in (
+            "tesla_coordinator",
+            "sigenergy_coordinator",
+            "sungrow_coordinator",
+            "foxess_coordinator",
+        ):
+            coordinator = entry_data.get(key)
+            if coordinator and coordinator.data:
+                solar_power_kw = coordinator.data.get("solar_power", 0) or 0
+                grid_power_kw = coordinator.data.get("grid_power", 0) or 0
+                battery_power_kw = coordinator.data.get("battery_power", 0) or 0
+                load_power_kw = coordinator.data.get("load_power", 0) or 0
+                battery_soc = coordinator.data.get("battery_level", 0) or 0
+                break
+
+        return {
+            "battery_soc": battery_soc,
+            "solar_power_kw": solar_power_kw,
+            "grid_power_kw": grid_power_kw,
+            "battery_power_kw": battery_power_kw,
+            "load_power_kw": load_power_kw,
+        }
+
+    async def get(self, request):
+        """Get normalized EV loadpoint status."""
+        try:
+            from .automations.actions import _dynamic_ev_state, _calculate_solar_surplus
+            from .automations.loadpoint_status import (
+                build_generic_charger_observation,
+                build_loadpoint_status,
+            )
+            from .automations.ev_ownership import get_ev_last_commands, get_ev_ownerships
+            from .automations.ev_charging_planner import (
+                get_ev_charging_coordinator,
+                get_price_level_executor,
+                get_scheduled_charging_executor,
+            )
+            from .const import (
+                CONF_GENERIC_CHARGER_AMPS_ENTITY,
+                CONF_GENERIC_CHARGER_ENABLED,
+                CONF_GENERIC_CHARGER_SOC_ENTITY,
+                CONF_GENERIC_CHARGER_STATUS_ENTITY,
+                CONF_GENERIC_CHARGER_SWITCH_ENTITY,
+            )
+
+            entry_id = self._config_entry.entry_id
+            entry_data = self._hass.data.get(DOMAIN, {}).get(entry_id, {})
+
+            site = self._site_snapshot()
+            live_status = {
+                "solar_power": site["solar_power_kw"] * 1000,
+                "grid_power": site["grid_power_kw"] * 1000,
+                "battery_power": site["battery_power_kw"] * 1000,
+                "load_power": site["load_power_kw"] * 1000,
+                "battery_soc": site["battery_soc"],
+            }
+            site["surplus_kw"] = round(
+                _calculate_solar_surplus(
+                    live_status,
+                    0,
+                    {"surplus_calculation": "grid_based", "household_buffer_kw": 0.5},
+                ),
+                2,
+            )
+
+            observed_vehicles = []
+            for vehicle in _get_ev_vehicles_status(self._hass, self._config_entry):
+                observed_vehicles.append({
+                    "vehicle_id": vehicle.get("vehicle_id"),
+                    "vehicle_name": vehicle.get("vehicle_name"),
+                    "charger_type": "tesla",
+                    "ev_power_kw": vehicle.get("ev_power_kw", 0),
+                    "ev_soc": vehicle.get("ev_soc"),
+                    "is_connected": vehicle.get("is_connected", False),
+                    "is_charging": vehicle.get("is_charging", False),
+                })
+
+            zaptec_cached = entry_data.get("zaptec_cached_state")
+            if zaptec_cached:
+                zaptec_mode = (zaptec_cached.get("charger_operation_mode") or "").lower()
+                power_w = zaptec_cached.get("total_charge_power_w", 0) or 0
+                power_kw = power_w / 1000
+                zaptec_connected = zaptec_mode in (
+                    "charging",
+                    "connected_waiting",
+                    "connected_finishing",
+                )
+                observed_vehicles.append({
+                    "charger_id": "zaptec_standalone",
+                    "vehicle_name": "Zaptec Charger",
+                    "charger_type": "zaptec",
+                    "ev_power_kw": power_kw,
+                    "is_connected": zaptec_connected or power_kw > 0.05,
+                    "is_charging": zaptec_mode == "charging" or power_kw > 0.05,
+                    "blocking_reason": zaptec_mode or None,
+                })
+
+            opts = {**self._config_entry.data, **self._config_entry.options}
+            if opts.get(CONF_GENERIC_CHARGER_ENABLED):
+                switch_entity = opts.get(CONF_GENERIC_CHARGER_SWITCH_ENTITY)
+                amps_entity = opts.get(CONF_GENERIC_CHARGER_AMPS_ENTITY)
+                status_entity = opts.get(CONF_GENERIC_CHARGER_STATUS_ENTITY)
+                soc_entity = opts.get(CONF_GENERIC_CHARGER_SOC_ENTITY)
+
+                switch_state = self._hass.states.get(switch_entity) if switch_entity else None
+                amps_state = self._hass.states.get(amps_entity) if amps_entity else None
+                status_state = self._hass.states.get(status_entity) if status_entity else None
+                soc_state = self._hass.states.get(soc_entity) if soc_entity else None
+
+                vehicle_name = "EV"
+                automation_store = entry_data.get("automation_store")
+                if automation_store:
+                    stored_data = getattr(automation_store, "_data", {}) or {}
+                    for config in stored_data.get("vehicle_charging_configs", []):
+                        if config.get("vehicle_id") == "generic_ev" or config.get("charger_type") == "generic":
+                            vehicle_name = config.get("display_name") or vehicle_name
+                            break
+
+                observed_vehicles.append(
+                    build_generic_charger_observation(
+                        vehicle_name=vehicle_name,
+                        switch_state=switch_state.state if switch_state else None,
+                        amps_value=amps_state.state if amps_state else None,
+                        status_state=status_state.state if status_state else None,
+                        soc_value=soc_state.state if soc_state else None,
+                    )
+                )
+
+            ocpp_server = entry_data.get("ocpp_server")
+            if ocpp_server:
+                try:
+                    for cp_id, cp in ocpp_server.charge_points.items():
+                        power_w = getattr(cp, "meter_power_w", 0) or 0
+                        active_transaction = bool(getattr(cp, "active_transaction", None))
+                        observed_vehicles.append({
+                            "charger_id": f"ocpp_{cp_id}",
+                            "vehicle_name": f"OCPP {cp_id[:8]}",
+                            "charger_type": "ocpp",
+                            "ev_power_kw": power_w / 1000,
+                            "is_connected": active_transaction or power_w > 50,
+                            "is_charging": power_w > 50,
+                        })
+                except Exception as err:
+                    _LOGGER.debug("Error checking built-in OCPP server for loadpoints: %s", err)
+
+            try:
+                from homeassistant.helpers import entity_registry as er_local
+                from .automations.ocpp_status import (
+                    extract_hacs_ocpp_prefix,
+                    is_ocpp_charging,
+                    is_ocpp_vehicle_present,
+                    normalize_ocpp_status,
+                )
+
+                ent_reg = er_local.async_get(self._hass)
+                ocpp_chargers = {}
+                for entity in ent_reg.entities.values():
+                    if entity.platform != "ocpp":
+                        continue
+                    state = self._hass.states.get(entity.entity_id)
+                    if not state or state.state in ("unknown", "unavailable"):
+                        continue
+                    entity_id = entity.entity_id.lower()
+                    prefix = extract_hacs_ocpp_prefix(entity_id)
+                    if not prefix:
+                        continue
+                    charger = ocpp_chargers.setdefault(prefix, {
+                        "status": None,
+                        "power_kw": 0.0,
+                        "connected": False,
+                        "charging": False,
+                    })
+                    if entity_id.endswith("_status") or entity_id.endswith("_status_connector"):
+                        charger["status"] = normalize_ocpp_status(state.state)
+                        charger["connected"] = is_ocpp_vehicle_present(state.state)
+                        charger["charging"] = is_ocpp_charging(state.state)
+                    elif entity_id.endswith("_current_power"):
+                        try:
+                            raw_power = float(state.state)
+                        except (TypeError, ValueError):
+                            continue
+                        power_kw = raw_power / 1000 if raw_power > 100 else raw_power
+                        power_w = raw_power if raw_power > 100 else raw_power * 1000
+                        charger["power_kw"] = power_kw
+                        charger["connected"] = charger["connected"] or power_w > 50
+                        charger["charging"] = charger["charging"] or power_w > 50
+
+                for prefix, charger in ocpp_chargers.items():
+                    observed_vehicles.append({
+                        "charger_id": f"ocpp_{prefix}",
+                        "vehicle_name": f"OCPP {prefix[:12]}",
+                        "charger_type": "ocpp",
+                        "ev_power_kw": charger["power_kw"],
+                        "is_connected": charger["connected"],
+                        "is_charging": charger["charging"],
+                        "blocking_reason": charger["status"],
+                    })
+            except Exception as err:
+                _LOGGER.debug("Error checking HACS OCPP integration for loadpoints: %s", err)
+
+            loadpoints = build_loadpoint_status(
+                _dynamic_ev_state.get(entry_id, {}),
+                observed_vehicles,
+                site,
+                get_ev_ownerships(self._hass, self._config_entry),
+                get_ev_last_commands(self._hass, self._config_entry),
+            )
+
+            coordinator = get_ev_charging_coordinator()
+            price_level = get_price_level_executor()
+            scheduled = get_scheduled_charging_executor()
+
+            return web.json_response({
+                "success": True,
+                "site": site,
+                "loadpoints": loadpoints,
+                "modes": {
+                    "coordinator": coordinator.get_state() if coordinator else None,
+                    "price_level": price_level.get_state() if price_level else None,
+                    "scheduled": scheduled.get_state() if scheduled else None,
+                },
+            })
+
+        except Exception as e:
+            _LOGGER.error("Error getting EV loadpoint status: %s", e, exc_info=True)
+            return web.json_response({
+                "success": False,
+                "error": str(e)
+            }, status=500)
+
+
 class PriceRecommendationView(HomeAssistantView):
     """API endpoint for EV charging price recommendation.
 
@@ -11757,6 +12243,10 @@ class PriceRecommendationView(HomeAssistantView):
             from .automations.actions import (
                 get_price_recommendation,
                 _calculate_solar_surplus,
+            )
+            from .solar_surplus_config import (
+                get_solar_surplus_min_battery_soc,
+                normalize_solar_surplus_config,
             )
 
             entry_id = self._config_entry.entry_id
@@ -11806,6 +12296,17 @@ class PriceRecommendationView(HomeAssistantView):
                 load_power_kw = voltx_coordinator.data.get("load_power", 0)
                 battery_soc = voltx_coordinator.data.get("battery_level", 0)
 
+            # Get solar-surplus config from the automation store where the app saves it.
+            automation_store = entry_data.get("automation_store")
+            stored_solar_config = {}
+            if automation_store:
+                stored_data = getattr(automation_store, '_data', {}) or {}
+                stored_solar_config = stored_data.get("solar_surplus_config", {})
+            if not stored_solar_config:
+                stored_solar_config = entry_data.get("solar_surplus_config", {})
+            solar_config = normalize_solar_surplus_config(stored_solar_config)
+            home_battery_minimum = get_solar_surplus_min_battery_soc(solar_config)
+
             # Build live_status dict for surplus calculation (expects watts)
             live_status = {
                 "solar_power": solar_power_kw * 1000,
@@ -11815,7 +12316,7 @@ class PriceRecommendationView(HomeAssistantView):
                 "battery_soc": battery_soc,
             }
 
-            surplus_kw = _calculate_solar_surplus(live_status, 0, {"household_buffer_kw": 0.5})
+            surplus_kw = _calculate_solar_surplus(live_status, 0, solar_config)
 
             # Get current prices based on electricity provider
             import_price_cents = 30.0  # Default
@@ -11886,12 +12387,6 @@ class PriceRecommendationView(HomeAssistantView):
                     import_price_cents = price_data.get("import_price_cents", import_price_cents)
                     export_price_cents = price_data.get("export_price_cents", export_price_cents)
                     price_source = "price_data"
-
-            # Get home battery minimum from config if available
-            home_battery_minimum = 80
-            solar_config = entry_data.get("solar_surplus_config", {})
-            if solar_config:
-                home_battery_minimum = solar_config.get("home_battery_minimum", 80)
 
             # Get recommendation
             recommendation = get_price_recommendation(
@@ -12929,6 +13424,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     _LOGGER.info("Entry state: %s", entry.state)
     _LOGGER.info("=" * 60)
 
+    def _entry_value(key: str, default: Any = None) -> Any:
+        """Read config entry options with data fallback."""
+        return entry.options.get(key, entry.data.get(key, default))
+
     # Register the parent (hub) device.
     dev_reg = dr.async_get(hass)
     dev_reg.async_get_or_create(
@@ -13027,17 +13526,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         entry.data.get(CONF_ELECTRICITY_PROVIDER, "amber")
     )
 
-    # Only treat stored Amber token as active when the provider actually uses Amber prices.
-    # GloBird / AEMO VPP / other custom-tariff entries may have a stale token from a prior
-    # configuration; creating an AmberPriceCoordinator for them causes a 403 on first
-    # refresh → ConfigEntryNotReady → "Failed setup, will retry".
-    has_amber = (
-        bool(entry.data.get(CONF_AMBER_API_TOKEN))
-        and electricity_provider not in ("globird", "aemo_vpp", "tou_only", "other", "nz")
-    )
     flow_power_price_source = entry.options.get(
         CONF_FLOW_POWER_PRICE_SOURCE,
         entry.data.get(CONF_FLOW_POWER_PRICE_SOURCE, "amber")
+    )
+    # Only treat a stored Amber token as active when the selected provider
+    # actually uses Amber prices. Other providers can carry stale Amber tokens
+    # from a previous configuration, and using them masks the real provider
+    # coordinator.
+    has_amber = (
+        bool(entry.data.get(CONF_AMBER_API_TOKEN))
+        and (
+            electricity_provider == "amber"
+            or (
+                electricity_provider == "flow_power"
+                and flow_power_price_source == "amber"
+            )
+        )
     )
     has_flow_power_aemo = (
         electricity_provider == "flow_power" and
@@ -13051,7 +13556,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Check for Octopus Energy UK configuration
     has_octopus = electricity_provider == "octopus" and bool(
-        entry.data.get(CONF_OCTOPUS_PRODUCT_CODE)
+        _entry_value(CONF_OCTOPUS_PRODUCT_CODE)
     )
 
     # Check for EPEX Day-Ahead (EU) configuration
@@ -13432,11 +13937,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             CONF_SAJ_BATTERY_CAPACITY_KWH,
             entry.data.get(CONF_SAJ_BATTERY_CAPACITY_KWH, DEFAULT_SAJ_BATTERY_CAPACITY_KWH),
         )
+        saj_inverter_rated_kw = entry.options.get(
+            CONF_SAJ_INVERTER_RATED_KW,
+            entry.data.get(CONF_SAJ_INVERTER_RATED_KW, DEFAULT_SAJ_INVERTER_RATED_KW),
+        )
+        # The SAJ inverter's discharge_depth register cannot be reliably written from
+        # stanus74 (writes silently ignored). Pass the user-configured backup_reserve
+        # so the controller enforces the floor in software for force_discharge calls.
+        saj_reserve_pct = entry.options.get(
+            CONF_OPTIMIZATION_BACKUP_RESERVE,
+            entry.data.get(CONF_OPTIMIZATION_BACKUP_RESERVE, DEFAULT_OPTIMIZATION_BACKUP_RESERVE),
+        )
+        if saj_reserve_pct is not None and saj_reserve_pct <= 1:
+            saj_reserve_pct = saj_reserve_pct * 100  # decimal → percent
         saj_h2_coordinator = SajH2EnergyCoordinator(
             hass,
             saj_entry_id=entry.data[CONF_SAJ_CONFIG_ENTRY_ID],
             battery_capacity_kwh=float(saj_capacity_kwh),
             entry_id=entry.entry_id,
+            min_soc_pct=float(saj_reserve_pct or 5.0),
+            inverter_rated_kw=float(saj_inverter_rated_kw),
         )
     else:
         # Get initial Tesla API token and provider
@@ -13469,6 +13989,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             api_provider=tesla_api_provider,
             token_getter=token_getter,
             entry_id=entry.entry_id,
+            fleet_base_url=entry.data.get(CONF_FLEET_API_BASE_URL),
         )
 
     # Fetch initial data
@@ -13637,7 +14158,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
 
     # Tesla AEMO Spike Manager (tariff-based) — only for Tesla
-    if aemo_spike_enabled and has_tesla_site and not is_sigenergy and not is_sungrow and not is_foxess and not is_goodwe and not is_voltx and not is_esy_sunhome and not is_saj_h2:
+    if aemo_spike_enabled and has_tesla_site and not is_sigenergy and not is_sungrow and not is_foxess and not is_goodwe and not is_voltx and not is_alphaess and not is_esy_sunhome and not is_solax and not is_saj_h2:
         aemo_region = entry.options.get(
             CONF_AEMO_REGION,
             entry.data.get(CONF_AEMO_REGION)
@@ -13667,7 +14188,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             _LOGGER.warning("AEMO spike detection enabled but no region configured")
 
     # Generic AEMO Spike Manager (service-call-based) for non-Tesla systems
-    if aemo_spike_enabled and (is_sigenergy or is_sungrow or is_foxess or is_voltx or is_esy_sunhome or is_solax or is_saj_h2):
+    if aemo_spike_enabled and (is_sigenergy or is_sungrow or is_foxess or is_voltx or is_esy_sunhome or is_solax or is_saj_h2 or is_goodwe or is_alphaess):
         aemo_region = entry.options.get(
             CONF_AEMO_REGION,
             entry.data.get(CONF_AEMO_REGION)
@@ -13685,6 +14206,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "solax" if is_solax else
                 "saj_h2" if is_saj_h2 else
                 "esy_sunhome" if is_esy_sunhome else
+                "goodwe" if is_goodwe else
+                "alphaess" if is_alphaess else
                 "foxess"
             )
             generic_aemo_spike_manager = GenericAEMOSpikeManager(
@@ -13825,9 +14348,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         entry.data.get(CONF_FLOW_POWER_STATE, "NSW1")
     )
 
-    # Check for "aemo_sensor" (legacy) or "aemo" (new) price source
-    # Both now use the direct AEMO API
-    use_aemo_pricing = flow_power_price_source in ("aemo_sensor", "aemo")
+    # Check for "aemo_sensor" (legacy) or "aemo" (new) price source.
+    # Both now use the direct AEMO API, but only Flow Power uses AEMO as an
+    # optimizer price feed. Other providers can retain stale Flow Power
+    # options after a provider switch and must not inherit AEMO prices.
+    use_aemo_pricing = (
+        electricity_provider == "flow_power"
+        and flow_power_price_source in ("aemo_sensor", "aemo")
+    )
 
     if use_aemo_pricing and flow_power_state:
         from .coordinator import AEMOPriceCoordinator
@@ -13987,11 +14515,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Initialize Octopus Energy UK Price Coordinator if configured
     octopus_coordinator = None
     if has_octopus:
-        octopus_product_code = entry.data.get(CONF_OCTOPUS_PRODUCT_CODE)
-        octopus_tariff_code = entry.data.get(CONF_OCTOPUS_TARIFF_CODE)
-        octopus_region = entry.data.get(CONF_OCTOPUS_REGION, "C")
-        octopus_export_product_code = entry.data.get(CONF_OCTOPUS_EXPORT_PRODUCT_CODE)
-        octopus_export_tariff_code = entry.data.get(CONF_OCTOPUS_EXPORT_TARIFF_CODE)
+        octopus_product_code = _entry_value(CONF_OCTOPUS_PRODUCT_CODE)
+        octopus_tariff_code = _entry_value(CONF_OCTOPUS_TARIFF_CODE)
+        octopus_region = _entry_value(CONF_OCTOPUS_REGION, "C")
+        octopus_export_product_code = _entry_value(CONF_OCTOPUS_EXPORT_PRODUCT_CODE)
+        octopus_export_tariff_code = _entry_value(CONF_OCTOPUS_EXPORT_TARIFF_CODE)
 
         # Try to discover actual export tariff from user's Octopus account
         if not octopus_export_product_code:
@@ -14017,7 +14545,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         # Fallback: derive export codes from product key if not stored or discovered
         if not octopus_export_product_code:
-            octopus_product_key = entry.data.get(CONF_OCTOPUS_PRODUCT, "")
+            octopus_product_key = _entry_value(CONF_OCTOPUS_PRODUCT, "")
             fallback_export_code = OCTOPUS_EXPORT_PRODUCT_CODES.get(octopus_product_key)
             if fallback_export_code:
                 octopus_export_product_code = fallback_export_code
@@ -14146,7 +14674,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "epex_coordinator": epex_coordinator,  # For EPEX Day-Ahead EU pricing
         "ws_client": ws_client,  # Store for cleanup on unload
         "entry": entry,
-        "auto_sync_cancel": None,  # Will store the timer cancel function
+        "aemo_dispatch_unsub": None,  # Will store the AEMO dispatch listener unsubscriber
+        "octopus_sync_cancel": None,  # Will store the Octopus :00/:30 cron cancel function
         "aemo_spike_cancel": None,  # Will store the AEMO spike check cancel function
         "generic_aemo_spike_cancel": None,  # Will store the generic AEMO spike check cancel function
         "demand_charging_cancel": None,  # Will store the demand period grid charging cancel function
@@ -14190,6 +14719,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "_calibration_check_unsub": None,
     }
 
+    from .auto_update import async_setup_auto_update
+    hass.data[DOMAIN][entry.entry_id]["auto_update_cancel"] = await async_setup_auto_update(
+        hass,
+        entry,
+    )
+
     # Track firmware version for change notifications (Tesla only)
     if tesla_coordinator:
         last_known_firmware = stored_data.get("last_known_firmware")
@@ -14232,7 +14767,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if electricity_provider in ("globird", "aemo_vpp", "other", "tou_only", "nz"):
         initial_custom_tariff = entry.data.get("initial_custom_tariff")
         if initial_custom_tariff:
-            tariff_schedule = convert_custom_tariff_to_schedule(initial_custom_tariff)
+            tariff_schedule = convert_custom_tariff_to_schedule(
+                initial_custom_tariff,
+                currency=currency_for_entry(entry, hass),
+            )
             hass.data[DOMAIN][entry.entry_id]["tariff_schedule"] = tariff_schedule
             _LOGGER.info(f"Early tariff_schedule initialized for {electricity_provider} from config flow data")
 
@@ -14264,7 +14802,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 return None
 
             session = async_get_clientsession(hass)
-            api_base_url = get_tesla_api_base_url(current_provider)
+            api_base_url = get_tesla_api_base_url(current_provider, entry.data.get(CONF_FLEET_API_BASE_URL))
             headers = {
                 "Authorization": f"Bearer {current_token}",
                 "Content-Type": "application/json",
@@ -14335,7 +14873,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 return
 
             session = async_get_clientsession(hass)
-            api_base = get_tesla_api_base_url(current_provider)
+            api_base = get_tesla_api_base_url(current_provider, entry.data.get(CONF_FLEET_API_BASE_URL))
             headers = {
                 "Authorization": f"Bearer {current_token}",
                 "Content-Type": "application/json",
@@ -14995,64 +15533,30 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     # Register services
-    async def handle_sync_initial_forecast() -> None:
-        """
-        STAGE 1 (0s): Sync immediately at start of 5-min period using forecast price.
+    async def handle_sync_rest_api_check(check_name="manual") -> None:
+        """Run a single TOU sync against the live (settled) price.
 
-        This gets the predicted price to Tesla ASAP at the start of each period.
-        Later stages will re-sync if the actual price differs from forecast.
-        """
-        # Skip if no price coordinator available (AEMO spike-only mode without pricing)
-        if not amber_coordinator and not aemo_sensor_coordinator and not octopus_coordinator:
-            _LOGGER.debug("TOU sync skipped - no price coordinator available (AEMO spike-only mode)")
-            return
+        Used by:
+          - The AEMO new-dispatch event handler (NEM providers).
+          - The Octopus :00/:30 cron (UK provider).
+          - The legacy `power_sync.sync_tou` service call (manual user request).
 
-        if not await coordinator.should_do_initial_sync():
-            _LOGGER.info("⏭️  Initial forecast sync already done this period")
-            return
-
-        _LOGGER.info("🚀 Stage 1: Initial forecast sync at start of period")
-        await _handle_sync_tou_internal(None, sync_mode='initial_forecast')
-        await coordinator.mark_initial_sync_done()
-
-    async def handle_sync_tou_with_websocket_data(websocket_data) -> None:
-        """
-        STAGE 2 (WebSocket): Re-sync only if price differs from what we synced.
-
-        Called by WebSocket callback when new price data arrives.
-        Compares with last synced price and only re-syncs if difference > threshold.
-        """
-        _LOGGER.info("📡 Stage 2: WebSocket price received - checking if re-sync needed")
-        await _handle_sync_tou_internal(websocket_data, sync_mode='websocket_update')
-
-    async def handle_sync_rest_api_check(check_name="fallback") -> None:
-        """
-        STAGE 3/4 (35s/60s): Check REST API and re-sync if price differs.
-
-        Called at 35s and 60s as fallback if WebSocket hasn't delivered.
-        Fetches current price from REST API and compares with last synced price.
-
-        Args:
-            check_name: Label for logging (e.g., "35s check", "60s final")
+        Manual force charge / force discharge handlers don't call this — they
+        invoke `send_tariff_to_tesla` directly with their override tariff,
+        and the in-progress force action also short-circuits this function
+        via the guard inside `_handle_sync_tou_internal`.
         """
         # Skip if no price coordinator available (AEMO spike-only mode without pricing)
         if not amber_coordinator and not aemo_sensor_coordinator and not octopus_coordinator:
             _LOGGER.debug("TOU sync skipped - no price coordinator available (AEMO spike-only mode)")
             return
 
-        if await coordinator.has_websocket_delivered():
-            _LOGGER.info(f"⏭️  REST API {check_name}: WebSocket already delivered this period, skipping")
-            return
-
-        _LOGGER.info(f"⏰ Stage 3/4: REST API {check_name} - checking if re-sync needed")
-        await _handle_sync_tou_internal(None, sync_mode='rest_api_check')
+        _LOGGER.info(f"⏰ TOU sync ({check_name})")
+        await _handle_sync_tou_internal(None, sync_mode='settled_price')
 
     async def handle_sync_tou(call: ServiceCall) -> None:
-        """
-        LEGACY: Cron fallback sync (now calls handle_sync_rest_api_check).
-        Kept for backwards compatibility and service call.
-        """
-        await handle_sync_rest_api_check(check_name="legacy fallback")
+        """Service handler for `power_sync.sync_tou` — manual user-triggered sync."""
+        await handle_sync_rest_api_check(check_name="service call")
 
     async def _get_nem_region_from_amber() -> Optional[str]:
         """Auto-detect NEM region from Amber site's network field.
@@ -15100,57 +15604,46 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             session = async_get_clientsession(hass)
             headers = {"Authorization": f"Bearer {amber_token}"}
 
-            # If no site ID stored, fetch all sites and use first active one
-            if not amber_site_id:
-                _LOGGER.debug("No Amber site ID in config, fetching sites list...")
-                try:
-                    async with session.get(
-                        f"{AMBER_API_BASE_URL}/sites",
-                        headers=headers,
-                        timeout=aiohttp.ClientTimeout(total=10),
-                    ) as sites_response:
-                        if sites_response.status == 200:
-                            sites = await sites_response.json()
-                            # Prefer active site
-                            active_sites = [s for s in sites if s.get("status") == "active"]
-                            if active_sites:
-                                amber_site_id = active_sites[0]["id"]
-                            elif sites:
-                                amber_site_id = sites[0]["id"]
-                            if amber_site_id:
-                                _LOGGER.info(f"Auto-selected Amber site: {amber_site_id}")
-                        else:
-                            _LOGGER.debug(f"Failed to fetch Amber sites: HTTP {sites_response.status}")
-                except Exception as e:
-                    _LOGGER.debug(f"Error fetching Amber sites: {e}")
-
-            if not amber_site_id:
-                _LOGGER.debug("Could not determine Amber site ID for NEM region auto-detection")
-                return None
-
-            # Fetch Amber site info
+            # Amber only exposes GET /sites (list) — there is no
+            # GET /sites/{id} endpoint. Fetch the list once and pick
+            # the matching site (or fall back to first active).
             async with session.get(
-                f"{AMBER_API_BASE_URL}/sites/{amber_site_id}",
+                f"{AMBER_API_BASE_URL}/sites",
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=10),
-            ) as response:
-                if response.status == 200:
-                    site_info = await response.json()
-                    network = site_info.get("network")
+            ) as sites_response:
+                if sites_response.status != 200:
+                    _LOGGER.debug(f"Failed to fetch Amber sites: HTTP {sites_response.status}")
+                    return None
+                sites = await sites_response.json()
 
-                    if network:
-                        nem_region = NETWORK_TO_NEM_REGION.get(network)
-                        if nem_region:
-                            _LOGGER.info(f"Auto-detected NEM region: {nem_region} (network: {network})")
-                            # Cache the result
-                            hass.data[DOMAIN][entry.entry_id]["amber_nem_region"] = nem_region
-                            return nem_region
-                        else:
-                            _LOGGER.warning(f"Unknown network '{network}' - cannot determine NEM region")
-                    else:
-                        _LOGGER.debug("Amber site info doesn't include network field")
-                else:
-                    _LOGGER.debug(f"Failed to fetch Amber site info: HTTP {response.status}")
+            if not isinstance(sites, list) or not sites:
+                _LOGGER.debug("Amber /sites returned no sites")
+                return None
+
+            site_info = None
+            if amber_site_id:
+                site_info = next((s for s in sites if s.get("id") == amber_site_id), None)
+            if site_info is None:
+                # No stored ID, or the stored ID didn't match — pick the
+                # first active site (matches the original fallback).
+                active_sites = [s for s in sites if s.get("status") == "active"]
+                site_info = active_sites[0] if active_sites else sites[0]
+                _LOGGER.info(f"Auto-selected Amber site for NEM region detection: {site_info.get('id')}")
+
+            network = site_info.get("network")
+            if not network:
+                _LOGGER.debug("Amber site info doesn't include network field")
+                return None
+
+            nem_region = NETWORK_TO_NEM_REGION.get(network)
+            if not nem_region:
+                _LOGGER.warning(f"Unknown network '{network}' - cannot determine NEM region")
+                return None
+
+            _LOGGER.info(f"Auto-detected NEM region: {nem_region} (network: {network})")
+            hass.data[DOMAIN][entry.entry_id]["amber_nem_region"] = nem_region
+            return nem_region
 
         except Exception as e:
             _LOGGER.debug(f"Error auto-detecting NEM region: {e}")
@@ -15249,6 +15742,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             return
 
         try:
+            # Skip cloud TOU upload when LP optimizer is active. The LP drives
+            # the inverter via Modbus directly; uploading a competing TOU plan
+            # to Sigenergy Cloud causes the inverter to charge/discharge on a
+            # schedule the LP didn't choose.
+            optimization_provider = entry.options.get(
+                CONF_OPTIMIZATION_PROVIDER,
+                entry.data.get(CONF_OPTIMIZATION_PROVIDER, OPT_PROVIDER_NATIVE)
+            )
+            if optimization_provider == OPT_PROVIDER_POWERSYNC:
+                _LOGGER.debug("Sigenergy Cloud TOU sync skipped — LP optimizer controls via Modbus")
+                return
+
             # Get Sigenergy credentials from config entry
             station_id = entry.data.get(CONF_SIGENERGY_STATION_ID)
             username = entry.data.get(CONF_SIGENERGY_USERNAME)
@@ -15278,6 +15783,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             if not nem_region:
                 nem_region = await _get_nem_region_from_amber()
 
+            # Resolve timezone for non-NEM providers (Octopus UK, etc.). Without
+            # this, the converter falls back to Australia/Sydney and bucket keys
+            # land ~10h off real local time.
+            provider_for_tz = entry.options.get(
+                CONF_ELECTRICITY_PROVIDER,
+                entry.data.get(CONF_ELECTRICITY_PROVIDER, "amber"),
+            )
+            timezone_name = _resolve_non_nem_timezone(hass, provider_for_tz)
+
             # Convert Amber forecast to Sigenergy format
             general_prices = [p for p in forecast_data if p.get("channelType") == "general"]
             feedin_prices = [p for p in forecast_data if p.get("channelType") == "feedIn"]
@@ -15305,11 +15819,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
             buy_prices = convert_amber_prices_to_sigenergy(
                 general_prices, price_type="buy", forecast_type=forecast_type,
-                current_actual_interval=current_actual_interval, nem_region=nem_region
+                current_actual_interval=current_actual_interval, nem_region=nem_region,
+                timezone_name=timezone_name,
             )
             sell_prices = convert_amber_prices_to_sigenergy(
                 feedin_prices, price_type="sell", forecast_type=forecast_type,
-                current_actual_interval=current_actual_interval, nem_region=nem_region
+                current_actual_interval=current_actual_interval, nem_region=nem_region,
+                timezone_name=timezone_name,
             )
 
             if not buy_prices:
@@ -15409,11 +15925,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             )
 
             try:
+                provider_label = (provider_for_tz or "amber").replace("_", " ").title()
                 result = await client.set_tariff_rate(
                     station_id=station_id,
                     buy_prices=buy_prices,
                     sell_prices=sell_prices if sell_prices else buy_prices,
-                    plan_name="PowerSync Amber",
+                    plan_name=f"PowerSync {provider_label}",
                 )
 
                 if result.get("success"):
@@ -15422,7 +15939,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     hass.data[DOMAIN][entry.entry_id]["sigenergy_tariff"] = {
                         "buy_prices": buy_prices,
                         "sell_prices": sell_prices if sell_prices else buy_prices,
-                        "synced_at": datetime.now().isoformat(),
+                        "synced_at": dt_util.now().isoformat(),
                         "sync_mode": sync_mode,
                     }
                 else:
@@ -15485,17 +16002,27 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             if not nem_region:
                 nem_region = await _get_nem_region_from_amber()
 
+            # Non-NEM providers (Octopus UK, etc.) need an explicit IANA TZ —
+            # otherwise converter falls back to Australia/Sydney and slots invert.
+            provider_for_tz = entry.options.get(
+                CONF_ELECTRICITY_PROVIDER,
+                entry.data.get(CONF_ELECTRICITY_PROVIDER, "amber"),
+            )
+            timezone_name = _resolve_non_nem_timezone(hass, provider_for_tz)
+
             # Convert Amber forecast to price slots (reuse Sigenergy converter for consistency)
             general_prices = [p for p in forecast_data if p.get("channelType") == "general"]
             feedin_prices = [p for p in forecast_data if p.get("channelType") == "feedIn"]
 
             buy_prices = convert_amber_prices_to_sigenergy(
                 general_prices, price_type="buy", forecast_type=forecast_type,
-                current_actual_interval=current_actual_interval, nem_region=nem_region
+                current_actual_interval=current_actual_interval, nem_region=nem_region,
+                timezone_name=timezone_name,
             )
             sell_prices = convert_amber_prices_to_sigenergy(
                 feedin_prices, price_type="sell", forecast_type=forecast_type,
-                current_actual_interval=current_actual_interval, nem_region=nem_region
+                current_actual_interval=current_actual_interval, nem_region=nem_region,
+                timezone_name=timezone_name,
             )
 
             if not buy_prices:
@@ -15523,7 +16050,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     "groups": groups,
                     "buy_prices": buy_prices,
                     "sell_prices": sell_prices if sell_prices else buy_prices,
-                    "synced_at": datetime.now().isoformat(),
+                    "synced_at": dt_util.now().isoformat(),
                     "sync_mode": sync_mode,
                 }
             finally:
@@ -15532,16 +16059,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         except Exception as e:
             _LOGGER.error(f"Error in FoxESS schedule sync: {e}", exc_info=True)
 
-    async def _handle_sync_tou_internal(websocket_data, sync_mode='initial_forecast') -> None:
-        """
-        Internal sync logic with smart price-aware re-sync.
+    async def _handle_sync_tou_internal(websocket_data, sync_mode='settled_price') -> None:
+        """Internal sync logic with price-aware de-dupe.
 
         Args:
-            websocket_data: Price data from WebSocket (or None to fetch from REST API)
-            sync_mode: One of:
-                - 'initial_forecast': Always sync, record the price (Stage 1)
-                - 'websocket_update': Re-sync only if price differs (Stage 2)
-                - 'rest_api_check': Check REST API and re-sync if differs (Stage 3/4)
+            websocket_data: Reserved for future WebSocket-driven flows. Always
+                None today — REST is refreshed inside this function.
+            sync_mode: Always 'settled_price' in current callers. Kept as a
+                parameter so future provider-specific sync paths can pass a
+                different label without changing the signature.
         """
         # Determine battery system type for routing
         battery_system = entry.data.get(CONF_BATTERY_SYSTEM, "tesla")
@@ -15559,7 +16085,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if force_discharge_state.get("active"):
             expires_at = force_discharge_state.get("expires_at")
             if expires_at:
-                from homeassistant.util import dt as dt_util
                 remaining = (expires_at - dt_util.utcnow()).total_seconds() / 60
                 _LOGGER.info(f"⏭️  TOU sync skipped - Force discharge active ({remaining:.1f} min remaining)")
             else:
@@ -15570,7 +16095,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if force_charge_state.get("active"):
             expires_at = force_charge_state.get("expires_at")
             if expires_at:
-                from homeassistant.util import dt as dt_util
                 remaining = (expires_at - dt_util.utcnow()).total_seconds() / 60
                 _LOGGER.info(f"⏭️  TOU sync skipped - Force charge active ({remaining:.1f} min remaining)")
             else:
@@ -15712,14 +16236,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             else:
                 _LOGGER.error("No Amber price data available from REST API")
 
-        # SMART SYNC: For non-initial syncs, check if price has changed enough to warrant re-sync
-        if sync_mode != 'initial_forecast':
-            if general_price is not None or feedin_price is not None:
-                if not coordinator.should_resync_for_price(general_price, feedin_price):
-                    _LOGGER.info(f"⏭️  Price unchanged - skipping re-sync")
-                    return
-                _LOGGER.info(f"🔄 Price changed - proceeding with re-sync")
-
         # Get forecast data from appropriate coordinator
         if use_localvolts:
             # Localvolts coordinator already refreshed above
@@ -15831,16 +16347,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 except Exception as notify_err:
                     _LOGGER.debug(f"Could not send forecast discrepancy notification: {notify_err}")
 
-        # Check for price spikes (extreme prices in settled/actual data)
-        # Only runs on REST API sync (Stage 3/4 at :35/:60) when actual prices are available
-        # This avoids false alerts from potentially inaccurate forecast prices
-        # Works for all providers with forecast data (Amber, Octopus, Flow Power, etc.)
+        # Check for price spikes (extreme prices in settled/actual data).
+        # Runs on every TOU sync now — sync only fires after AEMO settled
+        # publish, so prices are reliably actual rather than forecasts.
         price_spike_alert_enabled = entry.options.get(
             CONF_PRICE_SPIKE_ALERT,
             entry.data.get(CONF_PRICE_SPIKE_ALERT, False)
         )
         if (
-            sync_mode == 'rest_api_check' and
+            sync_mode == 'settled_price' and
             price_spike_alert_enabled and
             forecast_data
         ):
@@ -16021,8 +16536,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 return
             _LOGGER.info("🔀 Using Sigenergy Cloud API for tariff sync")
             await _sync_tariff_to_sigenergy(forecast_data, sync_mode, current_actual_interval)
-            if general_price is not None or feedin_price is not None:
-                coordinator.record_synced_price(general_price, feedin_price)
             return
 
         # FoxESS: sync to Cloud API if configured, otherwise store for sensors only
@@ -16054,17 +16567,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 export_boost_enabled=export_boost_enabled,
                 export_price_offset=export_price_offset,
                 export_min_price=export_min_price,
+                currency=currency_for_entry(entry, hass),
             )
             if tariff:
                 tariff = _apply_provider_tariff_adjustments(tariff, forecast_data, electricity_provider)
-                from datetime import datetime as dt
                 from homeassistant.helpers.dispatcher import async_dispatcher_send
                 buy_prices = tariff.get("energy_charges", {}).get("Summer", {}).get("rates", {})
                 sell_prices = tariff.get("sell_tariff", {}).get("energy_charges", {}).get("Summer", {}).get("rates", {})
                 hass.data[DOMAIN][entry.entry_id]["tariff_schedule"] = {
                     "buy_prices": buy_prices,
                     "sell_prices": sell_prices,
-                    "last_sync": dt.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    **currency_metadata(tariff.get("currency")),
+                    "last_sync": dt_util.now().strftime("%Y-%m-%d %H:%M:%S"),
                 }
                 async_dispatcher_send(hass, f"power_sync_tariff_updated_{entry.entry_id}")
                 _LOGGER.info("Tariff schedule stored for foxess dashboard (%d periods)", len(buy_prices))
@@ -16093,17 +16607,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 export_boost_enabled=export_boost_enabled,
                 export_price_offset=export_price_offset,
                 export_min_price=export_min_price,
+                currency=currency_for_entry(entry, hass),
             )
             if tariff:
                 tariff = _apply_provider_tariff_adjustments(tariff, forecast_data, electricity_provider)
-                from datetime import datetime as dt
                 from homeassistant.helpers.dispatcher import async_dispatcher_send
                 buy_prices = tariff.get("energy_charges", {}).get("Summer", {}).get("rates", {})
                 sell_prices = tariff.get("sell_tariff", {}).get("energy_charges", {}).get("Summer", {}).get("rates", {})
                 hass.data[DOMAIN][entry.entry_id]["tariff_schedule"] = {
                     "buy_prices": buy_prices,
                     "sell_prices": sell_prices,
-                    "last_sync": dt.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    **currency_metadata(tariff.get("currency")),
+                    "last_sync": dt_util.now().strftime("%Y-%m-%d %H:%M:%S"),
                 }
                 async_dispatcher_send(hass, f"power_sync_tariff_updated_{entry.entry_id}")
                 _LOGGER.info("Tariff schedule stored for sungrow dashboard (%d periods)", len(buy_prices))
@@ -16129,6 +16644,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             export_boost_enabled=export_boost_enabled,
             export_price_offset=export_price_offset,
             export_min_price=export_min_price,
+            currency=currency_for_entry(entry, hass),
         )
 
         if not tariff:
@@ -16285,7 +16801,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 tariff = apply_chip_mode(tariff, chip_start, chip_end, chip_threshold)
 
         # Store tariff schedule in hass.data for the sensor to read
-        from datetime import datetime as dt
         from homeassistant.helpers.dispatcher import async_dispatcher_send
         # Buy prices are at top level, sell prices are under sell_tariff
         buy_prices = tariff.get("energy_charges", {}).get("Summer", {}).get("rates", {})
@@ -16294,7 +16809,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.data[DOMAIN][entry.entry_id]["tariff_schedule"] = {
             "buy_prices": buy_prices,
             "sell_prices": sell_prices,
-            "last_sync": dt.now().strftime("%Y-%m-%d %H:%M:%S"),
+            **currency_metadata(tariff.get("currency")),
+            "last_sync": dt_util.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
 
         # Log price summary for debugging dashboard display issues
@@ -16351,6 +16867,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 tariff,
                 s_token,
                 s_provider,
+                fleet_base_url=entry.data.get(CONF_FLEET_API_BASE_URL),
             )
             if not site_success:
                 _LOGGER.error("Failed to sync TOU to Tesla site %s", site_id)
@@ -16362,7 +16879,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             # --- Calibration detection helper ---
             def _record_mode_stick_failure(hass, entry_id):
                 """Record a mode-verification failure and check for calibration pattern."""
-                from homeassistant.util import dt as dt_util
                 entry_data = hass.data.get(DOMAIN, {}).get(entry_id, {})
                 failures = entry_data.get("_mode_stick_failures", [])
                 now = dt_util.utcnow()
@@ -16382,23 +16898,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     return True  # newly detected
                 return False
 
-            # Alpha: Force mode toggle for faster Powerwall response
-            # Only toggle on settled prices, not forecast (reduces unnecessary toggles)
+            # Alpha: Force mode toggle for faster Powerwall response.
+            # Every TOU sync now runs against settled prices, so the
+            # previous "only toggle on settled" guard is implicit.
             force_mode_toggle = entry.options.get(
                 CONF_FORCE_TARIFF_MODE_TOGGLE,
                 entry.data.get(CONF_FORCE_TARIFF_MODE_TOGGLE, False)
             )
-            if force_mode_toggle and sync_mode != 'initial_forecast':
+            if force_mode_toggle:
                 # Skip toggle if calibration suspected (tariff upload still proceeds)
                 _toggle_entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
                 if _toggle_entry_data.get("calibration_suspected"):
                     _LOGGER.debug("Skipping force mode toggle — calibration suspected")
                     force_mode_toggle = False  # Skip toggle below but don't skip tariff upload
 
-            if force_mode_toggle and sync_mode != 'initial_forecast':
+            if force_mode_toggle:
                 try:
                     site_id = entry.data[CONF_TESLA_ENERGY_SITE_ID]
-                    api_base = get_tesla_api_base_url(current_provider)
+                    api_base = get_tesla_api_base_url(current_provider, entry.data.get(CONF_FLEET_API_BASE_URL))
                     headers = {"Authorization": f"Bearer {current_token}", "Content-Type": "application/json"}
                     session = async_get_clientsession(hass)
 
@@ -16423,7 +16940,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         # Check if we recently toggled - if so, Tesla might have reverted the mode
                         # Only re-toggle once after the initial toggle to avoid infinite loops
                         # (if self_consumption persists after our re-toggle, it's the user's choice)
-                        from homeassistant.util import dt as dt_util
                         last_toggle_time = hass.data[DOMAIN].get(entry.entry_id, {}).get("last_force_toggle_time")
                         retoggle_attempted = hass.data[DOMAIN].get(entry.entry_id, {}).get("retoggle_attempted", False)
                         now = dt_util.utcnow()
@@ -16526,7 +17042,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                                                 # Only update toggle time on fresh toggles, not re-toggles
                                                 # This prevents the re-toggle window from refreshing indefinitely
                                                 if not force_retoggle:
-                                                    from homeassistant.util import dt as dt_util
                                                     if entry.entry_id not in hass.data[DOMAIN]:
                                                         hass.data[DOMAIN][entry.entry_id] = {}
                                                     hass.data[DOMAIN][entry.entry_id]["last_force_toggle_time"] = dt_util.utcnow()
@@ -16540,7 +17055,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                                             _LOGGER.warning("Could not verify mode (status %s) - assuming success", verify_response.status)
                                             switched_back = True
                                             if not force_retoggle:
-                                                from homeassistant.util import dt as dt_util
                                                 if entry.entry_id not in hass.data[DOMAIN]:
                                                     hass.data[DOMAIN][entry.entry_id] = {}
                                                 hass.data[DOMAIN][entry.entry_id]["last_force_toggle_time"] = dt_util.utcnow()
@@ -16579,7 +17093,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                                             _cal_session = async_get_clientsession(hass)
                                             _cal_site_id = entry.data[CONF_TESLA_ENERGY_SITE_ID]
                                             _cal_token = current_token
-                                            _cal_api_base = get_tesla_api_base_url(current_provider)
+                                            _cal_api_base = get_tesla_api_base_url(current_provider, entry.data.get(CONF_FLEET_API_BASE_URL))
                                             _cal_headers = {"Authorization": f"Bearer {_cal_token}", "Content-Type": "application/json"}
 
                                             # Try setting autonomous mode
@@ -16632,8 +17146,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                                         except Exception as _cal_err:
                                             _LOGGER.debug("Calibration recovery check error: %s", _cal_err)
 
-                                    from homeassistant.helpers.event import async_track_time_interval
-                                    _cal_unsub = async_track_time_interval(
+                                    from homeassistant.helpers.event import async_track_time_interval as _track_cal_interval
+                                    _cal_unsub = _track_cal_interval(
                                         hass, _calibration_recovery_check, timedelta(minutes=30)
                                     )
                                     _cal_ed_store = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
@@ -16697,15 +17211,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 except Exception as e:
                     _LOGGER.warning(f"Force mode toggle failed: {e}")
 
-            # Record the synced price for smart price-change detection
-            if general_price is not None or feedin_price is not None:
-                coordinator.record_synced_price(general_price, feedin_price)
-
             # Enforce grid charging setting after TOU sync (counteracts VPP overrides)
             entry_data = hass.data[DOMAIN].get(entry.entry_id, {})
             dc_coordinator = entry_data.get("demand_charge_coordinator")
             if dc_coordinator and dc_coordinator.enabled and not entry_data.get("demand_allow_grid_charging", False):
-                from homeassistant.util import dt as dt_util
                 current_time = dt_util.now()
                 in_peak = dc_coordinator._is_in_peak_period(current_time)
 
@@ -17142,7 +17651,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 return
 
             session = async_get_clientsession(hass)
-            api_base_url = get_tesla_api_base_url(current_provider)
+            api_base_url = get_tesla_api_base_url(current_provider, entry.data.get(CONF_FLEET_API_BASE_URL))
             headers = {
                 "Authorization": f"Bearer {current_token}",
                 "Content-Type": "application/json",
@@ -17476,7 +17985,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 return
 
             session = async_get_clientsession(hass)
-            api_base_url = get_tesla_api_base_url(current_provider)
+            api_base_url = get_tesla_api_base_url(current_provider, entry.data.get(CONF_FLEET_API_BASE_URL))
             headers = {
                 "Authorization": f"Bearer {current_token}",
                 "Content-Type": "application/json",
@@ -17807,7 +18316,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Helper function to persist force mode state to storage
     async def persist_force_mode_state() -> None:
         """Persist current force charge/discharge state to storage."""
-        store = hass.data[DOMAIN][entry.entry_id]["store"]
         stored_data = await store.async_load() or {}
 
         # Only save what's needed to restore after restart
@@ -17842,7 +18350,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Restore force mode state from persistence (after HA restart)
     async def restore_force_mode_from_persistence():
         """Restore force charge/discharge state after HA restart."""
-        from homeassistant.util import dt as dt_util
 
         if not persisted_force_state:
             return
@@ -17889,7 +18396,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     _LOGGER.error(f"Error restoring after expired force mode: {e}", exc_info=True)
 
                 # Clear the persisted state
-                store = hass.data[DOMAIN][entry.entry_id]["store"]
                 stored_data = await store.async_load() or {}
                 stored_data["force_mode_state"] = None
                 await store.async_save(stored_data)
@@ -18004,7 +18510,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     async def handle_force_discharge(call: ServiceCall) -> None:
         """Force discharge mode - switches to autonomous with high export tariff."""
-        from homeassistant.util import dt as dt_util
 
         # Warn if calibration suspected (don't block — user manual command)
         _fd_entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
@@ -18645,7 +19150,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         "Authorization": f"Bearer {current_token}",
                         "Content-Type": "application/json",
                     }
-                    api_base = get_tesla_api_base_url(provider)
+                    api_base = get_tesla_api_base_url(provider, entry.data.get(CONF_FLEET_API_BASE_URL))
                     site_state = {}
 
                     _LOGGER.info("Saving current tariff before force discharge for site %s...", site_id)
@@ -18778,7 +19283,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     "Authorization": f"Bearer {current_token}",
                     "Content-Type": "application/json",
                 }
-                api_base = get_tesla_api_base_url(provider)
+                api_base = get_tesla_api_base_url(provider, entry.data.get(CONF_FLEET_API_BASE_URL))
 
                 saved_mode = (force_discharge_state.get("saved_states") or {}).get(site_id, {}).get("saved_operation_mode")
                 if saved_mode != "autonomous":
@@ -18804,6 +19309,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     discharge_tariff,
                     current_token,
                     provider,
+                    fleet_base_url=entry.data.get(CONF_FLEET_API_BASE_URL),
                 )
                 if not success:
                     _LOGGER.error("Failed to upload discharge tariff to site %s", site_id)
@@ -18875,7 +19381,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             The expiry datetime is aligned to the end of the tariff window,
             ensuring the timer doesn't fire before the tariff window ends.
         """
-        from homeassistant.util import dt as dt_util
 
         # Very high sell rate to encourage Powerwall to export all energy
         sell_rate_discharge = 99.00  # $99/kWh - huge incentive to discharge
@@ -18974,7 +19479,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "name": f"Force Discharge ({duration_minutes}min)",
             "utility": "PowerSync",
             "code": f"DISCHARGE_{duration_minutes}",
-            "currency": "AUD",
+            "currency": currency_for_entry(entry, hass),
             "daily_charges": [{"name": "Supply Charge"}],
             "demand_charges": {
                 "ALL": {"rates": {"ALL": 0}},
@@ -19042,7 +19547,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     async def handle_force_charge(call: ServiceCall) -> None:
         """Force charge mode - switches to autonomous with free import tariff."""
-        from homeassistant.util import dt as dt_util
 
         # Warn if calibration suspected (don't block — user manual command)
         _fc_entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
@@ -19768,7 +20272,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         "Authorization": f"Bearer {current_token}",
                         "Content-Type": "application/json",
                     }
-                    api_base = get_tesla_api_base_url(provider)
+                    api_base = get_tesla_api_base_url(provider, entry.data.get(CONF_FLEET_API_BASE_URL))
                     site_state = {}
 
                     _LOGGER.info("Saving current tariff before force charge for site %s...", site_id)
@@ -19864,7 +20368,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     "Authorization": f"Bearer {current_token}",
                     "Content-Type": "application/json",
                 }
-                api_base = get_tesla_api_base_url(provider)
+                api_base = get_tesla_api_base_url(provider, entry.data.get(CONF_FLEET_API_BASE_URL))
 
                 saved_mode = (force_charge_state.get("saved_states") or {}).get(site_id, {}).get("saved_operation_mode")
                 if saved_mode != "autonomous":
@@ -19903,6 +20407,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     charge_tariff,
                     current_token,
                     provider,
+                    fleet_base_url=entry.data.get(CONF_FLEET_API_BASE_URL),
                 )
                 if not success:
                     _LOGGER.error("Failed to upload charge tariff to site %s", site_id)
@@ -19977,7 +20482,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             The expiry datetime is aligned to the end of the tariff window,
             ensuring the timer doesn't fire before the tariff window ends.
         """
-        from homeassistant.util import dt as dt_util
 
         # Rates during charge window - free to buy, no sell incentive
         buy_rate_charge = 0.00    # $0/kWh - maximum incentive to charge
@@ -20072,7 +20576,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "name": f"Force Charge ({duration_minutes}min)",
             "utility": "PowerSync",
             "code": f"CHARGE_{duration_minutes}",
-            "currency": "AUD",
+            "currency": currency_for_entry(entry, hass),
             "daily_charges": [{"name": "Supply Charge"}],
             "demand_charges": {
                 "ALL": {"rates": {"ALL": 0}},
@@ -20140,7 +20644,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     async def handle_restore_normal(call: ServiceCall) -> None:
         """Restore normal operation - restore saved tariff or trigger Amber sync."""
-        from homeassistant.util import dt as dt_util
         # Log call context for debugging (helps identify if called by automation)
         context = call.context
         source = call.data.get("source", "user")
@@ -20171,14 +20674,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     "active": False,
                 })
 
-        # Set a cooldown so the optimizer doesn't immediately re-trigger force mode.
-        # User-initiated restores (user_id set) get a 30-min cooldown.
-        # Optimizer-initiated restores (no user_id) get no cooldown.
+        # No cooldown: a Stop Charge / Stop Discharge press is a one-shot
+        # override that washes through on the next 5-min LP cycle if the
+        # plan still wants the same action. Users who want to disable the
+        # optimizer for an extended period should toggle the enabled flag,
+        # not rely on Restore to suppress force modes for 30 min.
         entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
-        if context.user_id is not None:
-            cooldown_until = dt_util.utcnow() + timedelta(minutes=30)
-            entry_data["restore_cooldown_until"] = cooldown_until
-            _LOGGER.info("User-initiated restore — optimizer force actions suppressed until %s", cooldown_until.isoformat())
 
         # Check if optimizer is active (and not in monitoring mode) — suppress routine notifications
         # (optimizer transitions between force modes frequently; AEMO spikes have their own notification)
@@ -20603,7 +21104,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         "Authorization": f"Bearer {current_token}",
                         "Content-Type": "application/json",
                     }
-                    api_base = get_tesla_api_base_url(provider)
+                    api_base = get_tesla_api_base_url(provider, entry.data.get(CONF_FLEET_API_BASE_URL))
                     async with session.post(
                         f"{api_base}/api/1/energy_sites/{site_id}/operation",
                         headers=headers,
@@ -20646,6 +21147,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     if site_tariff:
                         success = await send_tariff_to_tesla(
                             hass, site_id, site_tariff, current_token, provider,
+                            fleet_base_url=entry.data.get(CONF_FLEET_API_BASE_URL),
                         )
                         if success:
                             _LOGGER.info("Restored saved tariff for site %s", site_id)
@@ -20676,7 +21178,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     "Authorization": f"Bearer {current_token}",
                     "Content-Type": "application/json",
                 }
-                api_base = get_tesla_api_base_url(provider)
+                api_base = get_tesla_api_base_url(provider, entry.data.get(CONF_FLEET_API_BASE_URL))
 
                 # Per-site saved mode, or fall back to global saved mode
                 discharge_saved = force_discharge_state.get("saved_states") or {}
@@ -20897,7 +21399,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         Source-aware: optimizer-sourced calls skip state management so the
         user-facing Controls screen never displays automated activity.
         """
-        from homeassistant.util import dt as dt_util
 
         raw_duration = call.data.get("duration", DEFAULT_DISCHARGE_DURATION)
         try:
@@ -20920,6 +21421,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             ("foxess_coordinator", "foxess"),
             ("goodwe_coordinator", "goodwe"),
             ("alphaess_coordinator", "alphaess"),
+            ("saj_h2_coordinator", "saj_h2"),
         ):
             coord = entry_data.get(coord_key)
             if coord:
@@ -21058,7 +21560,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         - Does NOT restore TOU tariff
         - Does NOT send push notifications
         """
-        from homeassistant.util import dt as dt_util
 
         source = call.data.get("source", "user")
         _LOGGER.info("Setting pure self-consumption mode (source=%s)", source)
@@ -21230,6 +21731,29 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 _LOGGER.error(f"Error setting SAJ H2 self-consumption: {e}", exc_info=True)
                 return
 
+        # Check if this is a Solax system
+        is_solax_sc = bool(
+            entry.data.get(CONF_SOLAX_CONFIG_ENTRY_ID)
+            or entry.data.get(CONF_SOLAX_ENTITY_PREFIX)
+        )
+        if is_solax_sc:
+            try:
+                entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+                solax_coord = entry_data.get("solax_coordinator")
+                if not solax_coord:
+                    _LOGGER.error("Self-consumption: Solax coordinator not available")
+                    return
+
+                success = await solax_coord.restore_normal()
+                if success:
+                    _LOGGER.info("Solax self-consumption mode restored")
+                else:
+                    _LOGGER.error("Failed to set Solax self-consumption mode")
+                return
+            except Exception as e:
+                _LOGGER.error(f"Error setting Solax self-consumption: {e}", exc_info=True)
+                return
+
         # Tesla Powerwall
         try:
             site_configs = _get_tesla_site_configs(hass, entry)
@@ -21243,7 +21767,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     "Authorization": f"Bearer {current_token}",
                     "Content-Type": "application/json",
                 }
-                api_base = get_tesla_api_base_url(provider)
+                api_base = get_tesla_api_base_url(provider, entry.data.get(CONF_FLEET_API_BASE_URL))
 
                 async with session.post(
                     f"{api_base}/api/1/energy_sites/{site_id}/operation",
@@ -21283,7 +21807,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         is_voltx = bool(entry.data.get(CONF_VOLTX_HOST))
         is_esy_sunhome_auto = bool(entry.data.get(CONF_ESY_CONFIG_ENTRY_ID))
         is_saj_h2_auto = bool(entry.data.get(CONF_SAJ_CONFIG_ENTRY_ID))
-        if is_foxess or is_sungrow or is_sigenergy or is_goodwe or is_alphaess or is_voltx or is_esy_sunhome_auto or is_saj_h2_auto:
+        is_solax_auto = bool(
+            entry.data.get(CONF_SOLAX_CONFIG_ENTRY_ID)
+            or entry.data.get(CONF_SOLAX_ENTITY_PREFIX)
+        )
+        if (
+            is_foxess
+            or is_sungrow
+            or is_sigenergy
+            or is_goodwe
+            or is_alphaess
+            or is_voltx
+            or is_esy_sunhome_auto
+            or is_saj_h2_auto
+            or is_solax_auto
+        ):
             _LOGGER.debug("Non-Tesla system — autonomous mode is implicit, skipping")
             return
 
@@ -21300,7 +21838,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     "Authorization": f"Bearer {current_token}",
                     "Content-Type": "application/json",
                 }
-                api_base = get_tesla_api_base_url(provider)
+                api_base = get_tesla_api_base_url(provider, entry.data.get(CONF_FLEET_API_BASE_URL))
 
                 async with session.post(
                     f"{api_base}/api/1/energy_sites/{site_id}/operation",
@@ -21466,12 +22004,31 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         elif bool(entry.data.get(CONF_SAJ_CONFIG_ENTRY_ID)):
             # SAJ H2: no backup reserve register — no-op
             _LOGGER.debug("SAJ H2 does not support backup reserve (no-op)")
+        elif bool(
+            entry.data.get(CONF_SOLAX_CONFIG_ENTRY_ID)
+            or entry.data.get(CONF_SOLAX_ENTITY_PREFIX)
+        ):
+            # Solax via homeassistant-solax-modbus entities
+            try:
+                entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+                solax_coord = entry_data.get("solax_coordinator")
+                if not solax_coord:
+                    _LOGGER.error("Solax coordinator not available for set_backup_reserve")
+                    return
+
+                success = await solax_coord.set_backup_reserve(percent)
+                if success:
+                    _LOGGER.info(f"Solax backup reserve set to {percent}%")
+                else:
+                    _LOGGER.error("Failed to set Solax backup reserve")
+
+            except Exception as e:
+                _LOGGER.error(f"Error setting Solax backup reserve: {e}", exc_info=True)
         else:
-            # Tesla Powerwall via Fleet API
+            # Tesla Powerwall — local V1R first when paired, cloud Fleet API as fallback.
             try:
                 # Tesla constraint (July 2025): only 0-80% and 100% are valid.
                 # Values 81-99% are rejected and auto-clamped to 80%.
-                # Clamp here to avoid silent misbehaviour.
                 if 81 <= percent <= 99:
                     _LOGGER.info(
                         "Clamping backup reserve %d%% → 100%% (Tesla rejects 81-99%%)",
@@ -21479,56 +22036,79 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     )
                     percent = 100
 
-                site_configs = _get_tesla_site_configs(hass, entry)
-                if not site_configs:
-                    _LOGGER.error("Missing Tesla site ID or token for set_backup_reserve")
-                    return
+                from .const import CONF_POWERWALL_LOCAL_DIN
+                from .powerwall_local.dispatch import dispatch_powerwall_write
 
-                session = async_get_clientsession(hass)
-                for site_id, current_token, provider in site_configs:
-                    headers = {
-                        "Authorization": f"Bearer {current_token}",
-                        "Content-Type": "application/json",
-                    }
-                    api_base = get_tesla_api_base_url(provider)
+                async def _local(transport) -> bool:
+                    din = entry.data.get(CONF_POWERWALL_LOCAL_DIN)
+                    if not din:
+                        return False
+                    return await transport.write_config(
+                        din, {"site_info.backup_reserve_percent": percent}
+                    )
 
-                    # Retry up to 3 times for backup reserve
-                    for attempt in range(1, 4):
-                        try:
-                            async with session.post(
-                                f"{api_base}/api/1/energy_sites/{site_id}/backup",
-                                headers=headers,
-                                json={"backup_reserve_percent": percent},
-                                timeout=aiohttp.ClientTimeout(total=30),
-                            ) as response:
-                                if response.status == 200:
-                                    _LOGGER.info("Tesla site %s backup reserve set to %d%%", site_id, percent)
-                                    _tesla_coord_for_cache = hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("tesla_coordinator")
-                                    if _tesla_coord_for_cache is not None:
-                                        _tesla_coord_for_cache.invalidate_site_info_cache()
-                                    if percent == 100:
-                                        hass.async_create_task(_tesla_charge_kick("backup_reserve_100"))
-                                    break
-                                elif response.status in (429, 500, 502, 503, 504):
-                                    text = await response.text()
-                                    _LOGGER.warning(
-                                        "Tesla backup reserve attempt %d/3 failed for site %s: %s",
-                                        attempt, site_id, response.status,
-                                    )
-                                    if attempt < 3:
-                                        await asyncio.sleep(2 ** attempt)
+                async def _cloud() -> bool:
+                    site_configs = _get_tesla_site_configs(hass, entry)
+                    if not site_configs:
+                        _LOGGER.error("Missing Tesla site ID or token for set_backup_reserve")
+                        return False
+
+                    any_ok = False
+                    session = async_get_clientsession(hass)
+                    for site_id, current_token, provider in site_configs:
+                        headers = {
+                            "Authorization": f"Bearer {current_token}",
+                            "Content-Type": "application/json",
+                        }
+                        api_base = get_tesla_api_base_url(provider, entry.data.get(CONF_FLEET_API_BASE_URL))
+
+                        # Retry up to 3 times for backup reserve
+                        for attempt in range(1, 4):
+                            try:
+                                async with session.post(
+                                    f"{api_base}/api/1/energy_sites/{site_id}/backup",
+                                    headers=headers,
+                                    json={"backup_reserve_percent": percent},
+                                    timeout=aiohttp.ClientTimeout(total=30),
+                                ) as response:
+                                    if response.status == 200:
+                                        _LOGGER.info("Tesla site %s backup reserve set to %d%%", site_id, percent)
+                                        any_ok = True
+                                        break
+                                    elif response.status in (429, 500, 502, 503, 504):
+                                        text = await response.text()
+                                        _LOGGER.warning(
+                                            "Tesla backup reserve attempt %d/3 failed for site %s: %s",
+                                            attempt, site_id, response.status,
+                                        )
+                                        if attempt < 3:
+                                            await asyncio.sleep(2 ** attempt)
+                                        else:
+                                            _LOGGER.error("Failed to set Tesla backup reserve for site %s after 3 attempts: %s - %s", site_id, response.status, text[:200])
+                                            hass.async_create_task(_notify_api_error(hass, "Backup Reserve Failed", f"Could not set backup reserve after 3 attempts — Tesla API {response.status}"))
                                     else:
-                                        _LOGGER.error("Failed to set Tesla backup reserve for site %s after 3 attempts: %s - %s", site_id, response.status, text[:200])
-                                        hass.async_create_task(_notify_api_error(hass, "Backup Reserve Failed", f"Could not set backup reserve after 3 attempts — Tesla API {response.status}"))
-                                else:
-                                    text = await response.text()
-                                    _LOGGER.error("Failed to set Tesla backup reserve for site %s: %s - %s", site_id, response.status, text[:200])
-                                    hass.async_create_task(_notify_api_error(hass, "Force Charge Failed", "Could not set backup reserve — Tesla API error"))
-                                    break
-                        except asyncio.TimeoutError:
-                            _LOGGER.warning("Tesla backup reserve attempt %d/3 timed out for site %s", attempt, site_id)
-                            if attempt < 3:
-                                await asyncio.sleep(2 ** attempt)
+                                        text = await response.text()
+                                        _LOGGER.error("Failed to set Tesla backup reserve for site %s: %s - %s", site_id, response.status, text[:200])
+                                        hass.async_create_task(_notify_api_error(hass, "Force Charge Failed", "Could not set backup reserve — Tesla API error"))
+                                        break
+                            except asyncio.TimeoutError:
+                                _LOGGER.warning("Tesla backup reserve attempt %d/3 timed out for site %s", attempt, site_id)
+                                if attempt < 3:
+                                    await asyncio.sleep(2 ** attempt)
+                    return any_ok
+
+                success = await dispatch_powerwall_write(
+                    hass, entry,
+                    local_call=_local,
+                    cloud_call=_cloud,
+                    label="set_backup_reserve",
+                )
+                if success:
+                    _tesla_coord_for_cache = hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("tesla_coordinator")
+                    if _tesla_coord_for_cache is not None:
+                        _tesla_coord_for_cache.invalidate_site_info_cache()
+                    if percent == 100:
+                        hass.async_create_task(_tesla_charge_kick("backup_reserve_100"))
 
             except Exception as e:
                 _LOGGER.error(f"Error setting Tesla backup reserve: {e}", exc_info=True)
@@ -21560,27 +22140,41 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             _LOGGER.debug("Could not persist backup reserve: %s", e)
 
     async def handle_set_operation_mode(call: ServiceCall) -> None:
-        """Set the Powerwall operation mode."""
+        """Set the Powerwall operation mode.
+
+        Local V1R first when paired; cloud Fleet API as fallback.
+        """
         mode = call.data.get("mode")
-        if mode not in ("autonomous", "self_consumption"):
-            _LOGGER.error(f"Invalid operation mode: {mode}. Must be 'autonomous' or 'self_consumption'.")
+        if mode not in ("autonomous", "self_consumption", "backup"):
+            _LOGGER.error(f"Invalid operation mode: {mode}. Must be 'autonomous', 'self_consumption', or 'backup'.")
             return
 
         _LOGGER.info(f"⚙️ Setting operation mode to {mode}")
 
-        try:
+        from .const import CONF_POWERWALL_LOCAL_DIN
+        from .powerwall_local.dispatch import dispatch_powerwall_write
+
+        async def _local(transport) -> bool:
+            din = entry.data.get(CONF_POWERWALL_LOCAL_DIN)
+            if not din:
+                return False
+            # default_real_mode lives at the top level of config.json, not under site_info.
+            return await transport.write_config(din, {"default_real_mode": mode})
+
+        async def _cloud() -> bool:
             site_configs = _get_tesla_site_configs(hass, entry)
             if not site_configs:
                 _LOGGER.error("Missing Tesla site ID or token for set_operation_mode")
-                return
+                return False
 
+            any_ok = False
             session = async_get_clientsession(hass)
             for site_id, current_token, provider in site_configs:
                 headers = {
                     "Authorization": f"Bearer {current_token}",
                     "Content-Type": "application/json",
                 }
-                api_base = get_tesla_api_base_url(provider)
+                api_base = get_tesla_api_base_url(provider, entry.data.get(CONF_FLEET_API_BASE_URL))
 
                 # Retry up to 3 times for operation mode
                 for attempt in range(1, 4):
@@ -21593,13 +22187,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         ) as response:
                             if response.status == 200:
                                 _LOGGER.info("Operation mode set to %s for site %s", mode, site_id)
-                                _tesla_coord_for_cache = hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("tesla_coordinator")
-                                if _tesla_coord_for_cache is not None:
-                                    _tesla_coord_for_cache.invalidate_site_info_cache()
-                                if mode == "self_consumption":
-                                    if entry.entry_id in hass.data[DOMAIN]:
-                                        hass.data[DOMAIN][entry.entry_id].pop("last_force_toggle_time", None)
-                                        _LOGGER.debug("Cleared last_force_toggle_time (user set self_consumption)")
+                                any_ok = True
                                 break
                             elif response.status in (429, 500, 502, 503, 504):
                                 _LOGGER.warning(
@@ -21621,7 +22209,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         _LOGGER.warning("Tesla operation mode attempt %d/3 timed out for site %s", attempt, site_id)
                         if attempt < 3:
                             await asyncio.sleep(2 ** attempt)
+            return any_ok
 
+        try:
+            success = await dispatch_powerwall_write(
+                hass, entry,
+                local_call=_local,
+                cloud_call=_cloud,
+                label="set_operation_mode",
+            )
+            if success:
+                _tesla_coord_for_cache = hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("tesla_coordinator")
+                if _tesla_coord_for_cache is not None:
+                    _tesla_coord_for_cache.invalidate_site_info_cache()
+                if mode == "self_consumption":
+                    if entry.entry_id in hass.data[DOMAIN]:
+                        hass.data[DOMAIN][entry.entry_id].pop("last_force_toggle_time", None)
+                        _LOGGER.debug("Cleared last_force_toggle_time (user set self_consumption)")
         except Exception as e:
             _LOGGER.error(f"Error setting operation mode: {e}", exc_info=True)
 
@@ -21680,52 +22284,75 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         _LOGGER.error("GoodWe: failed to restore export limit")
                 return
 
-            site_configs = _get_tesla_site_configs(hass, entry)
-            if not site_configs:
-                _LOGGER.debug("set_grid_export: no Tesla site config (non-Tesla system)")
-                return
+            from .const import CONF_POWERWALL_LOCAL_DIN
+            from .powerwall_local.dispatch import dispatch_powerwall_write
 
-            session = async_get_clientsession(hass)
-            for site_id, current_token, provider in site_configs:
-                headers = {
-                    "Authorization": f"Bearer {current_token}",
-                    "Content-Type": "application/json",
-                }
-                api_base = get_tesla_api_base_url(provider)
+            async def _local(transport) -> bool:
+                din = entry.data.get(CONF_POWERWALL_LOCAL_DIN)
+                if not din:
+                    return False
+                return await transport.write_config(
+                    din, {"site_info.customer_preferred_export_rule": rule}
+                )
 
-                async with session.post(
-                    f"{api_base}/api/1/energy_sites/{site_id}/grid_import_export",
-                    headers=headers,
-                    json={"customer_preferred_export_rule": rule},
-                    timeout=aiohttp.ClientTimeout(total=30),
-                ) as response:
-                    if response.status == 200:
-                        _LOGGER.info("Grid export rule set to %s for site %s", rule, site_id)
-                        _tesla_coord_for_cache = hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("tesla_coordinator")
-                        if _tesla_coord_for_cache is not None:
-                            _tesla_coord_for_cache.invalidate_site_info_cache()
-                        solar_curtailment_enabled = entry.options.get(
-                            CONF_BATTERY_CURTAILMENT_ENABLED,
-                            entry.data.get(CONF_BATTERY_CURTAILMENT_ENABLED, False)
-                        )
-                        if solar_curtailment_enabled:
-                            entry_data = hass.data.setdefault(DOMAIN, {}).setdefault(entry.entry_id, {})
-                            entry_data["manual_export_override"] = True
-                            entry_data["manual_export_rule"] = rule
-                            _LOGGER.info("Manual export override enabled: %s", rule)
-                            # Persist so the override survives HA restarts / config reloads
-                            try:
-                                _store = entry_data.get("store")
-                                if _store:
-                                    _sd = await _store.async_load() or {}
-                                    _sd["manual_export_override"] = True
-                                    _sd["manual_export_rule"] = rule
-                                    await _store.async_save(_sd)
-                            except Exception as _persist_err:
-                                _LOGGER.debug("Could not persist manual_export_override: %s", _persist_err)
-                    else:
-                        text = await response.text()
-                        _LOGGER.error("Failed to set grid export rule for site %s: %s - %s", site_id, response.status, text)
+            async def _cloud() -> bool:
+                site_configs = _get_tesla_site_configs(hass, entry)
+                if not site_configs:
+                    _LOGGER.debug("set_grid_export: no Tesla site config (non-Tesla system)")
+                    return False
+
+                any_ok = False
+                session = async_get_clientsession(hass)
+                for site_id, current_token, provider in site_configs:
+                    headers = {
+                        "Authorization": f"Bearer {current_token}",
+                        "Content-Type": "application/json",
+                    }
+                    api_base = get_tesla_api_base_url(provider, entry.data.get(CONF_FLEET_API_BASE_URL))
+
+                    async with session.post(
+                        f"{api_base}/api/1/energy_sites/{site_id}/grid_import_export",
+                        headers=headers,
+                        json={"customer_preferred_export_rule": rule},
+                        timeout=aiohttp.ClientTimeout(total=30),
+                    ) as response:
+                        if response.status == 200:
+                            _LOGGER.info("Grid export rule set to %s for site %s", rule, site_id)
+                            any_ok = True
+                        else:
+                            text = await response.text()
+                            _LOGGER.error("Failed to set grid export rule for site %s: %s - %s", site_id, response.status, text)
+                return any_ok
+
+            success = await dispatch_powerwall_write(
+                hass, entry,
+                local_call=_local,
+                cloud_call=_cloud,
+                label="set_grid_export",
+            )
+            if success:
+                _tesla_coord_for_cache = hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("tesla_coordinator")
+                if _tesla_coord_for_cache is not None:
+                    _tesla_coord_for_cache.invalidate_site_info_cache()
+                solar_curtailment_enabled = entry.options.get(
+                    CONF_BATTERY_CURTAILMENT_ENABLED,
+                    entry.data.get(CONF_BATTERY_CURTAILMENT_ENABLED, False)
+                )
+                if solar_curtailment_enabled:
+                    entry_data = hass.data.setdefault(DOMAIN, {}).setdefault(entry.entry_id, {})
+                    entry_data["manual_export_override"] = True
+                    entry_data["manual_export_rule"] = rule
+                    _LOGGER.info("Manual export override enabled: %s", rule)
+                    # Persist so the override survives HA restarts / config reloads
+                    try:
+                        _store = entry_data.get("store")
+                        if _store:
+                            _sd = await _store.async_load() or {}
+                            _sd["manual_export_override"] = True
+                            _sd["manual_export_rule"] = rule
+                            await _store.async_save(_sd)
+                    except Exception as _persist_err:
+                        _LOGGER.debug("Could not persist manual_export_override: %s", _persist_err)
 
         except Exception as e:
             _LOGGER.error(f"Error setting grid export rule: {e}", exc_info=True)
@@ -21752,7 +22379,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             _LOGGER.error(f"Error clearing manual export override: {e}", exc_info=True)
 
     async def handle_set_grid_charging(call: ServiceCall) -> None:
-        """Enable or disable grid charging."""
+        """Enable or disable grid charging.
+
+        Cloud-only — disallow_charge_from_grid_with_solar_installed isn't stored
+        in the gateway's local config.json (verified empirically against PW3
+        firmware 26.2.1). It's cloud-side state Tesla pushes to the gateway.
+        """
         enabled = call.data.get("enabled")
         if enabled is None:
             _LOGGER.error("Missing 'enabled' parameter for set_grid_charging")
@@ -21777,7 +22409,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     "Authorization": f"Bearer {current_token}",
                     "Content-Type": "application/json",
                 }
-                api_base = get_tesla_api_base_url(provider)
+                api_base = get_tesla_api_base_url(provider, entry.data.get(CONF_FLEET_API_BASE_URL))
 
                 # Note: Tesla API uses inverted logic - disallow_charge_from_grid_with_solar_installed
                 async with session.post(
@@ -21804,7 +22436,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         return coord
 
     async def handle_set_storm_watch(call: ServiceCall) -> None:
-        """Enable or disable Tesla Storm Watch for the energy site."""
+        """Enable or disable Tesla Storm Watch for the energy site.
+
+        Cloud-only — storm_mode_enabled isn't stored in the gateway's local
+        config.json (verified empirically against PW3 firmware 26.2.1). Tesla
+        keeps storm mode as cloud-side state.
+        """
         enabled = call.data.get("enabled")
         if enabled is None:
             _LOGGER.error("Missing 'enabled' parameter for set_storm_watch")
@@ -21882,6 +22519,163 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         except Exception as e:
             _LOGGER.error("Error setting VPP enrollment: %s", e, exc_info=True)
 
+    async def _persist_max_backup_schedule(payload: dict | None) -> None:
+        """Write or clear the max_backup_schedule key in this entry's Store.
+
+        ``payload=None`` clears the key. Survives HA restart so an in-flight
+        schedule can resume; without this the Powerwall would stay at 100%
+        indefinitely after a reboot mid-window.
+        """
+        entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+        store = entry_data.get("store")
+        if store is None:
+            return
+        try:
+            data = await store.async_load() or {}
+            if payload is None:
+                data.pop("max_backup_schedule", None)
+            else:
+                data["max_backup_schedule"] = payload
+            await store.async_save(data)
+        except Exception as err:
+            _LOGGER.warning("Failed to persist max_backup_schedule: %s", err)
+
+    async def _restore_max_backup_window(end_ts: float, saved_reserve: int | None) -> None:
+        """Re-arm the restoration timer for an already-active window.
+
+        End time and saved reserve come from the persisted Store payload.
+        If the window already expired while HA was down, restore immediately;
+        otherwise schedule the restore for the remaining seconds.
+        """
+        import time as _time
+        from homeassistant.helpers.event import async_call_later
+
+        now = _time.time()
+        remaining = max(0.0, end_ts - now)
+        entry_data = hass.data.setdefault(DOMAIN, {}).setdefault(entry.entry_id, {})
+        entry_data["max_backup_saved_reserve"] = saved_reserve
+        entry_data["max_backup_end_ts"] = end_ts
+
+        if remaining <= 0:
+            _LOGGER.info(
+                "schedule_max_backup: window expired during downtime — restoring reserve to %s%% now",
+                saved_reserve,
+            )
+            await _max_backup_restore(None)
+            return
+
+        cancel = async_call_later(hass, remaining, _max_backup_restore)
+        entry_data["max_backup_cancel"] = cancel
+        _LOGGER.info(
+            "🛡️ Resumed max backup window — restoring reserve to %s%% in %d min",
+            saved_reserve, int(remaining // 60),
+        )
+
+    async def _max_backup_restore(_now) -> None:
+        """One-shot callback that restores the saved reserve and clears storage.
+
+        Bound to ``async_call_later`` from both fresh schedules and on-startup
+        re-arm — the implementation is identical so we share the closure.
+        """
+        data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+        target = data.pop("max_backup_saved_reserve", None)
+        data.pop("max_backup_cancel", None)
+        data.pop("max_backup_end_ts", None)
+        await _persist_max_backup_schedule(None)
+        if target is None:
+            _LOGGER.warning("schedule_max_backup: no saved reserve to restore")
+            return
+        _LOGGER.info("🛡️ Max backup window ended — restoring reserve to %s%%", target)
+        try:
+            await hass.services.async_call(
+                DOMAIN, "set_backup_reserve",
+                {"percent": int(target)}, blocking=True,
+            )
+        except Exception as err:
+            _LOGGER.error("schedule_max_backup: restore failed: %s", err)
+
+    async def handle_schedule_max_backup(call: ServiceCall) -> None:
+        """Charge to 100% for a window, then restore the previous reserve.
+
+        Saves the current backup_reserve_percent, raises it to 100, and
+        schedules a one-shot restoration after ``duration_minutes``. If a
+        prior schedule is still running it is cancelled and the original
+        saved reserve is preserved (so back-to-back schedules don't lose
+        the user's baseline). The schedule is persisted to the per-entry
+        Store and resumes after HA restart.
+        """
+        duration_minutes = call.data.get("duration_minutes")
+        if duration_minutes is None:
+            _LOGGER.error("schedule_max_backup requires 'duration_minutes'")
+            return
+        try:
+            duration_minutes = int(duration_minutes)
+        except (ValueError, TypeError):
+            _LOGGER.error("schedule_max_backup: invalid duration: %r", duration_minutes)
+            return
+        if duration_minutes < 1 or duration_minutes > 1440:
+            _LOGGER.error(
+                "schedule_max_backup: duration_minutes out of range (1-1440): %d",
+                duration_minutes,
+            )
+            return
+
+        from homeassistant.helpers.event import async_call_later
+
+        coord = _get_tesla_coordinator_for_service("schedule_max_backup")
+        if coord is None:
+            return
+        site_info = getattr(coord, "_site_info_cache", None) or {}
+        saved_reserve = site_info.get("backup_reserve_percent")
+
+        entry_data = hass.data.setdefault(DOMAIN, {}).setdefault(entry.entry_id, {})
+        prior_cancel = entry_data.get("max_backup_cancel")
+        if prior_cancel is not None:
+            try:
+                prior_cancel()
+            except Exception:
+                pass
+            saved_reserve = entry_data.get("max_backup_saved_reserve", saved_reserve)
+            _LOGGER.info("schedule_max_backup: replacing existing schedule")
+
+        import time as _time
+        entry_data["max_backup_saved_reserve"] = saved_reserve
+        end_ts = _time.time() + duration_minutes * 60
+        entry_data["max_backup_end_ts"] = end_ts
+
+        _LOGGER.info(
+            "🛡️ Scheduling max backup for %d min (current reserve: %s%%)",
+            duration_minutes, saved_reserve,
+        )
+
+        await hass.services.async_call(
+            DOMAIN, "set_backup_reserve",
+            {"percent": 100}, blocking=True,
+        )
+
+        cancel = async_call_later(hass, duration_minutes * 60, _max_backup_restore)
+        entry_data["max_backup_cancel"] = cancel
+        await _persist_max_backup_schedule({
+            "end_ts": end_ts,
+            "saved_reserve": saved_reserve,
+        })
+
+    async def handle_refresh_calibration(call: ServiceCall) -> None:
+        """Clear PowerSync's calibration_suspected flag.
+
+        Use after a Powerwall calibration completes (or to retry mode toggles
+        sooner than the optimiser's natural recovery window). Does not touch
+        the Powerwall itself — purely resets the integration's local guard.
+        """
+        entry_data = hass.data.setdefault(DOMAIN, {}).setdefault(entry.entry_id, {})
+        was_suspected = entry_data.get("calibration_suspected", False)
+        entry_data["calibration_suspected"] = False
+        entry_data["calibration_detected_at"] = None
+        _LOGGER.info(
+            "🔄 Calibration flag cleared (was %s)",
+            "set" if was_suspected else "already clear",
+        )
+
     # Register force discharge, force charge, and restore normal services
     hass.services.async_register(DOMAIN, SERVICE_FORCE_DISCHARGE, handle_force_discharge)
     hass.services.async_register(DOMAIN, SERVICE_FORCE_CHARGE, handle_force_charge)
@@ -21903,6 +22697,30 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.services.async_register(DOMAIN, "set_storm_watch", handle_set_storm_watch)
     hass.services.async_register(DOMAIN, "set_off_grid_ev_reserve", handle_set_off_grid_ev_reserve)
     hass.services.async_register(DOMAIN, "set_vpp_enrollment", handle_set_vpp_enrollment)
+    hass.services.async_register(DOMAIN, "schedule_max_backup", handle_schedule_max_backup)
+    hass.services.async_register(DOMAIN, "refresh_calibration", handle_refresh_calibration)
+
+    # Resume an in-flight max_backup window if HA restarted mid-schedule.
+    async def _resume_max_backup_if_persisted() -> None:
+        entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+        store = entry_data.get("store")
+        if store is None:
+            return
+        try:
+            data = await store.async_load() or {}
+        except Exception:
+            return
+        schedule = data.get("max_backup_schedule")
+        if not isinstance(schedule, dict):
+            return
+        end_ts = schedule.get("end_ts")
+        saved_reserve = schedule.get("saved_reserve")
+        if not isinstance(end_ts, (int, float)):
+            await _persist_max_backup_schedule(None)
+            return
+        await _restore_max_backup_window(float(end_ts), saved_reserve)
+
+    hass.async_create_task(_resume_max_backup_if_persisted())
 
     _LOGGER.info("🔋 Force charge/discharge, restore, and Powerwall settings services registered")
 
@@ -22180,10 +22998,27 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _LOGGER.info(f"📊 Calendar history requested for period: {period}")
 
         # Get Tesla coordinator
-        tesla_coordinator = hass.data[DOMAIN][entry.entry_id].get("tesla_coordinator")
+        entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+        tesla_coordinator = entry_data.get("tesla_coordinator")
         if not tesla_coordinator:
-            _LOGGER.error("Tesla coordinator not available")
-            return {"success": False, "error": "Tesla coordinator not available"}
+            summary_system, summary_coordinator = _find_calendar_energy_summary_source(
+                hass,
+                entry.entry_id,
+            )
+            if summary_coordinator:
+                _LOGGER.info(
+                    "Calendar history service using %s daily energy summary",
+                    summary_system,
+                )
+                return await _calendar_result_from_energy_summary(
+                    hass,
+                    period,
+                    None,
+                    summary_coordinator,
+                )
+
+            _LOGGER.error("No calendar history coordinator available")
+            return {"success": False, "error": "No calendar history coordinator available"}
 
         # Fetch calendar history
         history = await tesla_coordinator.async_get_calendar_history(period=period)
@@ -22429,12 +23264,140 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 _LOGGER.warning(f"Zaptec state poll error: {e}")
 
         # Poll immediately, then every 60s
-        from homeassistant.helpers.event import async_track_time_interval
+        from homeassistant.helpers.event import async_track_time_interval as _track_zaptec_interval
         await _poll_zaptec_state()
-        unsub_zaptec_poll = async_track_time_interval(
+        unsub_zaptec_poll = _track_zaptec_interval(
             hass, _poll_zaptec_state, timedelta(seconds=60)
         )
         hass.data[DOMAIN][entry.entry_id]["unsub_zaptec_poll"] = unsub_zaptec_poll
+
+    # OCPP charger session tracking — detect sessions whether they were started
+    # by PowerSync (price-level / app button) or externally (HA UI, RFID card,
+    # button on the charger). Polls connector status + power meter per charger
+    # and opens/closes ChargingSession records to match.
+    if all_opts.get(CONF_OCPP_ENABLED):
+        import re as _re
+        _OCPP_SUFFIXES = _re.compile(
+            r"^(sensor|switch|number)\.(\w+?)_(status_connector|status|availability|charge_control|current_power|energy_meter)$",
+            _re.IGNORECASE,
+        )
+        # Per-charger last-seen status to detect transitions across polls
+        hass.data[DOMAIN][entry.entry_id].setdefault("ocpp_session_state", {})
+
+        async def _poll_ocpp_sessions(now=None):
+            """Poll OCPP chargers and track ChargingSession lifecycle."""
+            try:
+                from homeassistant.helpers import entity_registry as _er
+                from .automations.ev_charging_session import get_session_manager
+                from .automations.ocpp_status import (
+                    is_ocpp_charging,
+                    should_end_ocpp_session,
+                )
+
+                sm = get_session_manager()
+                if sm is None:
+                    return
+
+                entity_reg = _er.async_get(hass)
+                charger_ids = set()
+                for reg_entry in entity_reg.entities.values():
+                    if reg_entry.platform != "ocpp":
+                        continue
+                    m = _OCPP_SUFFIXES.match(reg_entry.entity_id)
+                    if m:
+                        charger_ids.add(m.group(2))
+
+                ed = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+                state_map: dict = ed.setdefault("ocpp_session_state", {})
+
+                # Pull current prices once for all chargers
+                import_price = 30.0
+                export_price = 8.0
+                amber_coord = ed.get("amber_coordinator")
+                if amber_coord and amber_coord.data:
+                    for p in amber_coord.data.get("current", []):
+                        if p.get("channelType") == "general":
+                            import_price = p.get("perKwh", 30.0)
+                        elif p.get("channelType") == "feedIn":
+                            export_price = abs(p.get("perKwh", 8.0))
+                elif ed.get("tariff_schedule"):
+                    import_price = ed["tariff_schedule"].get("buy_price", 30.0)
+                    export_price = ed["tariff_schedule"].get("sell_price", 8.0)
+
+                for cid in charger_ids:
+                    vid = f"ocpp_{cid}"
+                    status_state = hass.states.get(f"sensor.{cid}_status_connector")
+                    if status_state is None or status_state.state in ("unavailable", "unknown"):
+                        # Skip chargers we can't read — don't end sessions on
+                        # transient unavailability (network blip etc).
+                        continue
+                    status_lower = status_state.state.lower()
+
+                    power_state = hass.states.get(f"sensor.{cid}_current_power")
+                    power_w = 0.0
+                    if power_state is not None and power_state.state not in ("unavailable", "unknown"):
+                        try:
+                            power_w = float(power_state.state)
+                        except (ValueError, TypeError):
+                            power_w = 0.0
+
+                    is_charging = is_ocpp_charging(status_lower, power_w)
+                    has_session = vid in sm.active_sessions
+
+                    # Start a session on transition into "Charging" (and only
+                    # when no PowerSync-initiated session already exists for
+                    # this charger).
+                    if is_charging and not has_session:
+                        await sm.start_session(vehicle_id=vid, mode="ocpp")
+                        _LOGGER.info(
+                            "📊 OCPP %s: started session (status=%s)",
+                            cid, status_state.state,
+                        )
+
+                    # Update active session with the latest power reading.
+                    # Stop crediting power once the connector leaves "Charging"
+                    # (e.g. Finishing / SuspendedEV) so the session totals
+                    # don't keep growing while idle.
+                    if has_session or (is_charging and vid in sm.active_sessions):
+                        amps = 0
+                        # Heuristic: assume single-phase 230V to derive amps if
+                        # the charger doesn't expose them directly.
+                        if power_w > 0:
+                            amps = int(power_w / 230)
+                        await sm.update_session(
+                            vehicle_id=vid,
+                            power_kw=(power_w / 1000) if is_charging else 0.0,
+                            amps=amps if is_charging else 0,
+                            is_solar=False,
+                            import_price_cents=import_price,
+                            export_price_cents=export_price,
+                        )
+
+                    # End the session once the connector reaches a terminal
+                    # state.  HACS OCPP can remain in "Finishing" after stop,
+                    # so close the session there once power has dropped away.
+                    if should_end_ocpp_session(status_lower, power_w, has_session):
+                        await sm.end_session(
+                            vehicle_id=vid,
+                            reason=f"connector_{status_lower}",
+                        )
+                        _LOGGER.info(
+                            "📊 OCPP %s: ended session (status=%s)",
+                            cid, status_state.state,
+                        )
+
+                    state_map[cid] = {"status": status_lower, "power_w": power_w}
+
+            except Exception as e:
+                _LOGGER.debug("OCPP session poll error: %s", e)
+
+        from homeassistant.helpers.event import async_track_time_interval as _track_ocpp_interval
+        await _poll_ocpp_sessions()
+        unsub_ocpp_poll = _track_ocpp_interval(
+            hass, _poll_ocpp_sessions, timedelta(seconds=30)
+        )
+        hass.data[DOMAIN][entry.entry_id]["unsub_ocpp_poll"] = unsub_ocpp_poll
+        _LOGGER.info("📊 OCPP charging session tracker started (30s poll)")
 
     # Register HTTP endpoints for EV/Tesla vehicles (for mobile app EV section)
     hass.http.register_view(EVStatusView(hass))
@@ -22450,6 +23413,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.http.register_view(SurplusForecastView(hass))
     hass.http.register_view(ChargingBoostView(hass, entry))
     hass.http.register_view(EVWidgetDataView(hass, entry))
+    hass.http.register_view(EVLoadpointStatusView(hass, entry))
     hass.http.register_view(OCPPChargersView(hass, entry))
     hass.http.register_view(OCPPChargerStartView(hass, entry))
     hass.http.register_view(OCPPChargerStopView(hass, entry))
@@ -22469,6 +23433,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     _LOGGER.info("💰 EV price recommendation endpoint registered")
     _LOGGER.info("📅 EV charging schedule/forecast endpoints registered")
     _LOGGER.info("📱 EV widget data endpoint registered")
+    _LOGGER.info("🔌 EV loadpoint status endpoint registered")
     _LOGGER.info("🤖 Auto-schedule endpoints registered at /api/power_sync/ev/auto_schedule/*")
 
     # Initialize session manager for EV charging tracking
@@ -22558,7 +23523,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 _LOGGER.info("Force mode recently expired - using saved tariff to avoid stale force-charge tariff")
 
             if saved_tariff:
-                tariff_data = convert_custom_tariff_to_schedule(saved_tariff)
+                tariff_data = convert_custom_tariff_to_schedule(
+                    saved_tariff,
+                    currency=currency_for_entry(entry, hass),
+                )
                 if tariff_data:
                     hass.data[DOMAIN][entry.entry_id]["tariff_schedule"] = tariff_data
             else:
@@ -22593,7 +23561,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         current_capacity_wh = call.data.get("current_capacity_wh")
         degradation_percent = call.data.get("degradation_percent")
         battery_count = call.data.get("battery_count", 1)
-        scanned_at = call.data.get("scanned_at", datetime.now().isoformat())
+        scanned_at = call.data.get("scanned_at", dt_util.now().isoformat())
         individual_batteries = call.data.get("individual_batteries")  # Optional per-battery data
 
         # Validate required fields
@@ -22656,180 +23624,283 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     _LOGGER.info("🔋 Battery health sync service registered")
 
-    # Wire up WebSocket sync callback now that handlers are defined
+    # Wire up WebSocket data-feed callback. WebSocket no longer triggers a
+    # TOU POST — the AEMO new-dispatch signal is the single source of truth
+    # for "settled price published, sync now". WebSocket data still drives:
+    #   • the live price sensor on the dashboard (via notify_websocket_update)
+    #   • fast-reaction solar curtailment (which needs sub-5-min responsiveness)
     if ws_client:
         def websocket_sync_callback(prices_data):
-            """
-            STAGE 2: WebSocket price arrival triggers re-sync IF price differs.
+            """Forward WebSocket price arrivals to the live sensor + curtailment.
 
-            Smart sync flow:
-            - Stage 1 (0s): Initial forecast already synced
-            - Stage 2 (WebSocket): Re-sync only if price differs from forecast
-            - Stage 3 (35s): REST API fallback if no WebSocket
-            - Stage 4 (60s): Final REST API check
-
-            NOTE: This callback is called from a background WebSocket thread,
-            so we must use call_soon_threadsafe to schedule work on the HA event loop.
+            Called from a background WebSocket thread, so async work is
+            scheduled onto the HA event loop via call_soon_threadsafe.
             """
-            # Notify coordinator that WebSocket delivered (for REST API fallback checks)
             coordinator.notify_websocket_update(prices_data)
 
-            # Trigger sync with price comparison (handle_sync_tou_with_websocket_data does comparison)
-            async def trigger_sync():
-                # Check if auto-sync is enabled (respect user's preference)
-                auto_sync_enabled = entry.options.get(
-                    CONF_AUTO_SYNC_ENABLED,
-                    entry.data.get(CONF_AUTO_SYNC_ENABLED, True)
-                )
-
-                # Check if solar curtailment is enabled
+            async def trigger_curtailment_check():
                 solar_curtailment_enabled = entry.options.get(
                     CONF_BATTERY_CURTAILMENT_ENABLED,
                     entry.data.get(CONF_BATTERY_CURTAILMENT_ENABLED, False)
                 )
-
-                # Skip if neither feature is enabled
-                if not auto_sync_enabled and not solar_curtailment_enabled:
-                    _LOGGER.debug("⏭️  WebSocket price received but auto-sync and curtailment both disabled, skipping")
+                if not solar_curtailment_enabled:
                     return
-
-                _LOGGER.info("📡 Stage 2: WebSocket price received - checking if re-sync needed")
-
                 try:
-                    # 1. Re-sync TOU to Tesla if price changed (handles comparison internally)
-                    if auto_sync_enabled:
-                        await handle_sync_tou_with_websocket_data(prices_data)
-                    else:
-                        _LOGGER.debug("⏭️  Skipping TOU sync (auto-sync disabled)")
-
-                    # 2. Check solar curtailment with WebSocket price (only if curtailment enabled)
-                    if solar_curtailment_enabled:
-                        await handle_solar_curtailment_with_websocket_data(prices_data)
-                    else:
-                        _LOGGER.debug("⏭️  Skipping solar curtailment check (curtailment disabled)")
-
-                    _LOGGER.info("✅ Stage 2 WebSocket sync completed")
+                    await handle_solar_curtailment_with_websocket_data(prices_data)
                 except Exception as e:
-                    _LOGGER.error(f"❌ Error in Stage 2 WebSocket sync: {e}", exc_info=True)
+                    _LOGGER.error(f"❌ Error in WebSocket curtailment check: {e}", exc_info=True)
 
-            # Schedule the async sync using thread-safe method
-            # This callback runs in a background WebSocket thread, not the HA event loop
             hass.loop.call_soon_threadsafe(
-                lambda: hass.async_create_task(trigger_sync())
+                lambda: hass.async_create_task(trigger_curtailment_check())
             )
 
-        # Assign callback to WebSocket client
         ws_client._sync_callback = websocket_sync_callback
-        _LOGGER.info("🔗 WebSocket sync callback configured for smart price-aware sync")
+        _LOGGER.info("🔗 WebSocket data-feed callback configured (live sensor + curtailment)")
 
-    # Set up SMART SYNC with 4-stage approach
-    # Stage 1 (0s): Initial forecast sync at start of period
-    async def auto_sync_initial_forecast(now):
-        """Stage 1: Initial forecast sync at start of 5-min period."""
-        # Ensure WebSocket thread is alive (restart if it died)
-        if ws_client:
-            await ws_client.ensure_running()
+    # TOU sync is now event-driven for NEM providers (Amber, Flow Power, AEMO
+    # sensor, Localvolts) — one POST per 5-min period, fired off the AEMO
+    # new-dispatch signal so it always lands on settled prices instead of
+    # racing the AEMO publish window. Octopus UK is on a different settlement
+    # cadence (30 min, not on NEM) and gets its own :00/:30 cron.
+    from .coordinator import SIGNAL_AEMO_NEW_DISPATCH, AEMOPriceCoordinator
 
-        # Check if auto-sync is enabled in the config entry options
-        auto_sync_enabled = entry.options.get(
+    NEM_PROVIDERS = ("amber", "flow_power", "localvolts", "aemo_sensor")
+    is_nem_provider = electricity_provider in NEM_PROVIDERS
+
+    async def _handle_aemo_dispatch_event(_signal_data) -> None:
+        """Run TOU sync once per AEMO dispatch (settled price publish event).
+
+        Fires for Amber, Flow Power, AEMO sensor, and Localvolts entries.
+        Octopus, GloBird, and AEMO VPP are skipped here — Octopus has its
+        own cron, the others don't sync TOU at all (see provider_check below).
+        """
+        provider = entry.options.get(
+            CONF_ELECTRICITY_PROVIDER,
+            entry.data.get(CONF_ELECTRICITY_PROVIDER, "amber"),
+        )
+        if provider in ("octopus", "globird", "aemo_vpp", "other", "tou_only", "nz", "epex"):
+            return
+
+        if not entry.options.get(
             CONF_AUTO_SYNC_ENABLED,
-            entry.data.get(CONF_AUTO_SYNC_ENABLED, True)
+            entry.data.get(CONF_AUTO_SYNC_ENABLED, True),
+        ):
+            _LOGGER.debug("Auto-sync disabled, skipping AEMO-dispatch sync")
+            return
+
+        # Brief delay so Amber / Localvolts have time to ingest the AEMO
+        # publish into their own REST APIs (network fees, batching).
+        await asyncio.sleep(5)
+        _LOGGER.info("📡 AEMO dispatch received — syncing settled tariff")
+        await handle_sync_rest_api_check(check_name="aemo dispatch")
+
+    def _aemo_dispatch_callback(data) -> None:
+        # HA invokes dispatcher listeners on whichever thread called
+        # `async_dispatcher_send`. Our AEMO coordinator does that on the event
+        # loop, but HA's frame-safety logic can re-trigger the report from a
+        # SyncWorker, which then re-enters the listener off-loop. Either way,
+        # `hass.async_create_task` is not thread-safe — hop back onto the
+        # event loop before scheduling the coroutine.
+        hass.loop.call_soon_threadsafe(
+            lambda: hass.async_create_task(_handle_aemo_dispatch_event(data))
         )
 
-        # Check if settled prices only mode is enabled (skip forecast sync)
-        settled_prices_only = entry.options.get(
-            CONF_SETTLED_PRICES_ONLY,
-            entry.data.get(CONF_SETTLED_PRICES_ONLY, False)
-        )
+    cancel_aemo_dispatch_sub = async_dispatcher_connect(
+        hass, SIGNAL_AEMO_NEW_DISPATCH, _aemo_dispatch_callback,
+    )
+    hass.data[DOMAIN][entry.entry_id]["aemo_dispatch_unsub"] = cancel_aemo_dispatch_sub
 
-        if not auto_sync_enabled:
-            _LOGGER.debug("Auto-sync disabled, skipping initial forecast sync")
-        elif settled_prices_only:
-            _LOGGER.info("⏭️ Settled prices only mode - skipping initial forecast sync (waiting for actual prices at :35/:60)")
+    # The dispatch signal is only emitted by an AEMOPriceCoordinator instance.
+    # Flow Power AEMO mode already builds one earlier (as the price source).
+    # For other NEM providers — Amber, Localvolts, Flow Power on a non-AEMO
+    # price source — we need to spin up a dispatch-trigger coordinator here so
+    # `_handle_aemo_dispatch_event` actually fires for them. The coordinator
+    # is purely a signal source; the user's existing price coordinator
+    # (Amber, Localvolts, etc.) is still the authoritative price feed.
+    aemo_dispatch_trigger_coordinator = None
+    cancel_dispatch_fallback_cron = None
+
+    if is_nem_provider and aemo_sensor_coordinator is None:
+        # Resolve a NEM region: explicit config first, then Tesla
+        # site_info.installation_time_zone, then Amber's network field.
+        resolved_region: Optional[str] = None
+
+        # Step 1: Tesla site_info.installation_time_zone is the strongest
+        # signal — it's the actual physical site where the Powerwall is
+        # installed, set at commissioning, and Tesla pre-populates it from
+        # the address. Try it first so we don't get pinned to a stale
+        # config default below.
+        if tesla_coordinator is not None:
+            try:
+                site_info = await tesla_coordinator.async_get_site_info()
+                if site_info:
+                    tesla_tz = site_info.get("installation_time_zone")
+                    mapped = _nem_region_from_iana_tz(tesla_tz)
+                    if mapped:
+                        _LOGGER.info(
+                            "Auto-detected NEM region %s from Tesla site timezone (%s)",
+                            mapped, tesla_tz,
+                        )
+                        resolved_region = mapped
+            except Exception as e:
+                _LOGGER.debug("Tesla site_info NEM region lookup failed: %s", e)
+
+        # Step 2: Amber's network field gives us a precise NEM region
+        # mapping when the Tesla path didn't resolve (no Powerwall, or
+        # ambiguous timezone like Australia/Adelaide / Australia/Hobart that
+        # we want to confirm against the network).
+        if resolved_region is None and electricity_provider == "amber":
+            try:
+                amber_region = await _get_nem_region_from_amber()
+                if amber_region in _NEM_REGIONS:
+                    resolved_region = amber_region
+            except Exception as e:
+                _LOGGER.debug("Amber NEM region lookup failed: %s", e)
+
+        # Step 3: Explicit CONF_AEMO_REGION is the last resort because it's
+        # a manual override that older entries set when configuring AEMO
+        # spike protection — whatever default they accepted at config time
+        # may now be wrong if the user has since moved or the auto-detect
+        # paths above can give a more accurate answer.
+        if resolved_region is None:
+            configured_region = entry.options.get(
+                CONF_AEMO_REGION,
+                entry.data.get(CONF_AEMO_REGION),
+            )
+            if configured_region in _NEM_REGIONS:
+                _LOGGER.info(
+                    "Using configured CONF_AEMO_REGION=%s for AEMO dispatch trigger",
+                    configured_region,
+                )
+                resolved_region = configured_region
+
+        # Step 4 (Flow Power only): the Flow Power state config IS a NEM
+        # region code, but only meaningful for Flow Power entries — every
+        # other provider falls back to the "NSW1" default in this codebase
+        # which would silently pin Amber/Localvolts users to NSW1 (bug
+        # observed in v2.12.215–217 where QLD/VIC/SA users with no
+        # CONF_AEMO_REGION ended up requesting NSW1 dispatch).
+        if (
+            resolved_region is None
+            and electricity_provider == "flow_power"
+            and flow_power_state in _NEM_REGIONS
+        ):
+            resolved_region = flow_power_state
+
+        if resolved_region:
+            try:
+                session = async_get_clientsession(hass)
+                aemo_dispatch_trigger_coordinator = AEMOPriceCoordinator(
+                    hass, resolved_region, session,
+                )
+                # HA's DataUpdateCoordinator only re-schedules the next refresh
+                # when at least one listener is attached (`_listeners` is
+                # non-empty). For the Flow Power AEMO mode that's the price
+                # sensor; in dispatch-trigger mode no sensor uses this
+                # coordinator's data, so we attach a no-op listener purely to
+                # keep the polling loop alive. Without this the coordinator
+                # runs `first_refresh` once and then never polls again — which
+                # is the bug observed in v2.12.216 where exactly one
+                # "PowerSync changed Utility Rate Plan" entry was sent at
+                # startup and nothing followed for ~1.5 h.
+                trigger_listener_unsub = (
+                    aemo_dispatch_trigger_coordinator.async_add_listener(
+                        lambda: None,
+                    )
+                )
+                hass.data[DOMAIN][entry.entry_id][
+                    "aemo_dispatch_trigger_listener_unsub"
+                ] = trigger_listener_unsub
+                # Schedule the first refresh as a background task so setup
+                # doesn't block on NEMWEB I/O. The dispatch listener has
+                # already been wired above, so the first dispatch event
+                # emitted by this refresh is captured.
+                hass.async_create_task(
+                    aemo_dispatch_trigger_coordinator.async_config_entry_first_refresh()
+                )
+                hass.data[DOMAIN][entry.entry_id]["aemo_dispatch_trigger_coordinator"] = (
+                    aemo_dispatch_trigger_coordinator
+                )
+                _LOGGER.info(
+                    "📡 AEMO-dispatch trigger coordinator started for %s in region %s",
+                    electricity_provider, resolved_region,
+                )
+            except Exception as e:
+                _LOGGER.warning(
+                    "Failed to start AEMO-dispatch trigger coordinator: %s — "
+                    "falling back to periodic cron",
+                    e,
+                )
+                aemo_dispatch_trigger_coordinator = None
+
+        if aemo_dispatch_trigger_coordinator is None:
+            # No region resolvable (or coordinator failed). Fall back to a
+            # periodic cron at +40s past every 5-min boundary so the sync
+            # still runs once per period — by :40s the user's REST price
+            # feed has had time to ingest the latest AEMO settled price.
+            async def _nem_fallback_periodic_sync(now):
+                if not entry.options.get(
+                    CONF_AUTO_SYNC_ENABLED,
+                    entry.data.get(CONF_AUTO_SYNC_ENABLED, True),
+                ):
+                    _LOGGER.debug("Auto-sync disabled, skipping fallback periodic sync")
+                    return
+                await handle_sync_rest_api_check(check_name="cron fallback")
+
+            cancel_dispatch_fallback_cron = async_track_utc_time_change(
+                hass,
+                _nem_fallback_periodic_sync,
+                minute=[0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55],
+                second=40,
+            )
+            hass.data[DOMAIN][entry.entry_id]["dispatch_fallback_cron_cancel"] = (
+                cancel_dispatch_fallback_cron
+            )
+            _LOGGER.warning(
+                "TOU sync: NEM region not auto-detectable for %s — "
+                "running periodic fallback at :40s past every 5-min boundary. "
+                "Set the AEMO region in PowerSync settings to switch to "
+                "AEMO-dispatch-driven sync.",
+                electricity_provider,
+            )
+
+    # Octopus UK is not on NEM and updates every 30 min. Single cron at the
+    # period boundaries (:00 and :30) is the right cadence for them.
+    cancel_octopus_cron = None
+    if electricity_provider == "octopus":
+        async def _octopus_periodic_sync(now):
+            if not entry.options.get(
+                CONF_AUTO_SYNC_ENABLED,
+                entry.data.get(CONF_AUTO_SYNC_ENABLED, True),
+            ):
+                _LOGGER.debug("Auto-sync disabled, skipping Octopus periodic sync")
+                return
+            await handle_sync_rest_api_check(check_name="octopus :00/:30")
+
+        cancel_octopus_cron = async_track_utc_time_change(
+            hass,
+            _octopus_periodic_sync,
+            minute=[0, 30],
+            second=0,
+        )
+        hass.data[DOMAIN][entry.entry_id]["octopus_sync_cancel"] = cancel_octopus_cron
+        _LOGGER.info("🐙 Octopus TOU sync scheduled at :00 and :30 (1 POST per 30-min period)")
+
+    if is_nem_provider:
+        if aemo_sensor_coordinator is not None:
+            _LOGGER.info(
+                "✅ TOU sync wired: AEMO-dispatch-driven (Flow Power AEMO price coordinator)"
+            )
+        elif aemo_dispatch_trigger_coordinator is not None:
+            _LOGGER.info(
+                "✅ TOU sync wired: AEMO-dispatch-driven (dispatch-trigger coordinator)"
+            )
         else:
-            await handle_sync_initial_forecast()
-
-    # Stage 3 (35s): REST API fallback check if no WebSocket
-    async def auto_sync_rest_api_35s(now):
-        """Stage 3: REST API check at 35s if WebSocket hasn't delivered."""
-        auto_sync_enabled = entry.options.get(
-            CONF_AUTO_SYNC_ENABLED,
-            entry.data.get(CONF_AUTO_SYNC_ENABLED, True)
-        )
-
-        if auto_sync_enabled:
-            await handle_sync_rest_api_check(check_name="35s check")
-        else:
-            _LOGGER.debug("Auto-sync disabled, skipping REST API 35s check")
-
-    # Stage 4 (60s): Final REST API check
-    async def auto_sync_rest_api_60s(now):
-        """Stage 4: Final REST API check at 60s."""
-        auto_sync_enabled = entry.options.get(
-            CONF_AUTO_SYNC_ENABLED,
-            entry.data.get(CONF_AUTO_SYNC_ENABLED, True)
-        )
-
-        if auto_sync_enabled:
-            await handle_sync_rest_api_check(check_name="60s final")
-        else:
-            _LOGGER.debug("Auto-sync disabled, skipping REST API 60s check")
-
-    # Perform initial TOU sync if auto-sync is enabled (only in Amber mode)
-    auto_sync_enabled = entry.options.get(
-        CONF_AUTO_SYNC_ENABLED,
-        entry.data.get(CONF_AUTO_SYNC_ENABLED, True)
-    )
-    settled_prices_only = entry.options.get(
-        CONF_SETTLED_PRICES_ONLY,
-        entry.data.get(CONF_SETTLED_PRICES_ONLY, False)
-    )
-
-    if not auto_sync_enabled:
-        _LOGGER.info("Skipping initial TOU sync - auto-sync disabled")
-    elif settled_prices_only:
-        _LOGGER.info("Skipping initial TOU sync - settled prices only mode (will sync at :35/:60)")
-    elif amber_coordinator or aemo_sensor_coordinator or octopus_coordinator:
-        _LOGGER.info("Performing initial TOU sync")
-        await handle_sync_initial_forecast()
-    elif not amber_coordinator and not aemo_sensor_coordinator and not octopus_coordinator:
-        _LOGGER.info("Skipping initial TOU sync - AEMO spike-only mode (no pricing data)")
-
-    # STAGE 1: Initial forecast sync at start of each 5-min period (0s)
-    cancel_timer_stage1 = async_track_utc_time_change(
-        hass,
-        auto_sync_initial_forecast,
-        minute=[0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55],
-        second=0,  # Start of each 5-min period
-    )
-
-    # STAGE 2: WebSocket-triggered sync (handled by callback, not scheduler)
-
-    # STAGE 3: REST API fallback check at 35s if WebSocket hasn't delivered
-    cancel_timer_stage3 = async_track_utc_time_change(
-        hass,
-        auto_sync_rest_api_35s,
-        minute=[0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55],
-        second=35,  # 35s into each period
-    )
-
-    # STAGE 4: Final REST API check at 60s (1 minute into period)
-    cancel_timer_stage4 = async_track_utc_time_change(
-        hass,
-        auto_sync_rest_api_60s,
-        minute=[1, 6, 11, 16, 21, 26, 31, 36, 41, 46, 51, 56],
-        second=0,  # 60s after period start
-    )
-
-    # Store the cancel functions so we can clean them up later
-    hass.data[DOMAIN][entry.entry_id]["auto_sync_cancel"] = cancel_timer_stage1
-    hass.data[DOMAIN][entry.entry_id]["auto_sync_cancel_35s"] = cancel_timer_stage3
-    hass.data[DOMAIN][entry.entry_id]["auto_sync_cancel_60s"] = cancel_timer_stage4
-    _LOGGER.info("✅ Smart sync scheduled with 4-stage approach:")
-    _LOGGER.info("  - Stage 1 (0s): Initial forecast sync at :00, :05, :10, etc.")
-    _LOGGER.info("  - Stage 2 (WebSocket): Re-sync on price change (event-driven)")
-    _LOGGER.info("  - Stage 3 (35s): REST API fallback if no WebSocket")
-    _LOGGER.info("  - Stage 4 (60s): Final REST API check at :01, :06, :11, etc.")
+            _LOGGER.info("✅ TOU sync wired: periodic cron fallback (no NEM region)")
+    elif cancel_octopus_cron is not None:
+        _LOGGER.info("✅ TOU sync wired: Octopus :00/:30 cron")
+    else:
+        _LOGGER.info("✅ TOU sync wired: no automatic sync for %s", electricity_provider)
 
     # Set up automatic curtailment check every 5 minutes (same timing as TOU sync)
     # Triggers at :01:00, :06:00, :11:00, etc. - 60s after Amber price updates
@@ -23093,7 +24164,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if demand_charge_coordinator:
         async def auto_demand_charging_check(now):
             """Automatically check demand period and toggle grid charging."""
-            from homeassistant.util import dt as dt_util
             try:
                 entry_data = hass.data[DOMAIN].get(entry.entry_id, {})
                 dc_coordinator = entry_data.get("demand_charge_coordinator")
@@ -23157,7 +24227,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         # Perform initial demand period check
         _LOGGER.info("Performing initial demand period grid charging check")
-        from homeassistant.util import dt as dt_util
         await auto_demand_charging_check(dt_util.now())
 
     # ========================================
@@ -23198,7 +24267,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         else:
             custom_tariff = automation_store.get_custom_tariff()
             if custom_tariff:
-                tariff_schedule = convert_custom_tariff_to_schedule(custom_tariff)
+                tariff_schedule = convert_custom_tariff_to_schedule(
+                    custom_tariff,
+                    currency=currency_for_entry(entry, hass),
+                )
                 hass.data[DOMAIN][entry.entry_id]["tariff_schedule"] = tariff_schedule
                 _LOGGER.info(f"Custom tariff loaded for {electricity_provider}: {custom_tariff.get('name')}")
 
@@ -23209,6 +24281,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN][entry.entry_id]["automation_engine"] = automation_engine
     # Also store at domain level for HTTP API access
     hass.data[DOMAIN]["automation_store"] = automation_store
+
+    try:
+        from .automations.ev_ownership import restore_ev_runtime_state
+        restored_ev_runtime = restore_ev_runtime_state(hass, entry, automation_store)
+        if (
+            restored_ev_runtime.get("restored_ownership")
+            or restored_ev_runtime.get("restored_commands")
+        ):
+            _LOGGER.info(
+                "Restored EV runtime diagnostics: %d stale owner(s) cleared, %d last command(s) restored",
+                restored_ev_runtime.get("restored_ownership", 0),
+                restored_ev_runtime.get("restored_commands", 0),
+            )
+    except Exception as err:
+        _LOGGER.debug("EV runtime restore failed: %s", err)
 
     # Restore persisted push tokens to hass.data for notification sending
     persisted_tokens = automation_store.get_push_tokens()
@@ -23234,6 +24321,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 get_auto_schedule_executor,
                 get_ev_charging_coordinator,
             )
+            from .automations.live_status import coordinator_data_to_ev_live_status
 
             # Get live status from coordinator (more reliable than API calls)
             entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
@@ -23243,26 +24331,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
             live_status = {}
             if tesla_coordinator and tesla_coordinator.data:
-                live_status = {
-                    "battery_soc": tesla_coordinator.data.get("battery_level", 0),
-                    "solar_power": tesla_coordinator.data.get("solar_power", 0),
-                    "grid_power": tesla_coordinator.data.get("grid_power", 0),
-                    "load_power": tesla_coordinator.data.get("load_power", 0),
-                }
-            elif sigenergy_coordinator and sigenergy_coordinator.data:
-                live_status = {
-                    "battery_soc": sigenergy_coordinator.data.get("battery_level", 0),
-                    "solar_power": sigenergy_coordinator.data.get("solar_power", 0),
-                    "grid_power": sigenergy_coordinator.data.get("grid_power", 0),
-                    "load_power": sigenergy_coordinator.data.get("load_power", 0),
-                }
-            elif sungrow_coordinator and sungrow_coordinator.data:
-                live_status = {
-                    "battery_soc": sungrow_coordinator.data.get("battery_level", 0),
-                    "solar_power": sungrow_coordinator.data.get("solar_power", 0),
-                    "grid_power": sungrow_coordinator.data.get("grid_power", 0),
-                    "load_power": sungrow_coordinator.data.get("load_power", 0),
-                }
+                live_status = coordinator_data_to_ev_live_status(tesla_coordinator.data)
+            else:
+                # Coordinators store power in kW; convert to watts so EV planner
+                # calculations use one unit convention.
+                _kw_coord = None
+                if sigenergy_coordinator and sigenergy_coordinator.data:
+                    _kw_coord = sigenergy_coordinator
+                elif sungrow_coordinator and sungrow_coordinator.data:
+                    _kw_coord = sungrow_coordinator
+                else:
+                    for _key in ("foxess_coordinator", "goodwe_coordinator",
+                                 "alphaess_coordinator", "solax_coordinator"):
+                        _c = entry_data.get(_key)
+                        if _c and _c.data:
+                            _kw_coord = _c
+                            break
+                if _kw_coord:
+                    live_status = coordinator_data_to_ev_live_status(_kw_coord.data)
 
             # Get current price from Amber coordinator if available
             current_price = None
@@ -23298,7 +24384,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     if buy_prices:
                         # Find current time slot price
                         # Format: [{"timeRange": "10:00-10:30", "price": 25.0}, ...]
-                        now = datetime.now()
+                        now = dt_util.now()  # HA tz; container UTC would pick wrong slot
                         current_time = f"{now.hour:02d}:{30 if now.minute >= 30 else 0:02d}"
                         for slot in buy_prices:
                             time_range = slot.get("timeRange", "")
@@ -23325,12 +24411,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     _action_stop_ev_charging_dynamic,
                     _dynamic_ev_state,
                 )
+                from .solar_surplus_config import (
+                    get_solar_surplus_min_battery_soc,
+                    normalize_solar_surplus_config,
+                )
 
                 automation_store_ref = hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("automation_store")
                 if automation_store_ref:
                     stored = getattr(automation_store_ref, '_data', {}) or {}
-                    surplus_config = stored.get("solar_surplus_config", {})
+                    surplus_config = normalize_solar_surplus_config(stored.get("solar_surplus_config", {}))
                     surplus_enabled = surplus_config.get("enabled", False)
+                    min_battery_soc = get_solar_surplus_min_battery_soc(surplus_config)
 
                     # Check which vehicles already have active solar surplus sessions
                     entry_vehicles = _dynamic_ev_state.get(entry.entry_id, {})
@@ -23381,6 +24472,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                                                     vc["max_amps"] = _settings.max_charge_amps
                                                 if vc.get("voltage") is None:
                                                     vc["voltage"] = _settings.voltage
+                                                if vc.get("charger_status_entity") is None:
+                                                    vc["charger_status_entity"] = _settings.charger_status_entity
                                                 _matched = True
                                                 break
                                         if not _matched:
@@ -23393,6 +24486,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                                                         vc["max_amps"] = _settings.max_charge_amps
                                                     if vc.get("voltage") is None:
                                                         vc["voltage"] = _settings.voltage
+                                                    if vc.get("charger_status_entity") is None:
+                                                        vc["charger_status_entity"] = _settings.charger_status_entity
                                                     break
                                 except Exception:
                                     pass
@@ -23402,7 +24497,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                             # Determine charger_type: vehicle config > config entry > default
                             vc_charger_type = vc.get("charger_type")
                             if not vc_charger_type:
-                                from .const import CONF_GENERIC_CHARGER_ENABLED, CONF_GENERIC_CHARGER_SWITCH_ENTITY, CONF_GENERIC_CHARGER_AMPS_ENTITY
+                                from .const import (
+                                    CONF_GENERIC_CHARGER_AMPS_ENTITY,
+                                    CONF_GENERIC_CHARGER_ENABLED,
+                                    CONF_GENERIC_CHARGER_STATUS_ENTITY,
+                                    CONF_GENERIC_CHARGER_SWITCH_ENTITY,
+                                )
                                 _opts = {**entry.data, **entry.options}
                                 if _opts.get(CONF_GENERIC_CHARGER_ENABLED):
                                     vc_charger_type = "generic"
@@ -23410,6 +24510,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                                         vc["charger_switch_entity"] = _opts.get(CONF_GENERIC_CHARGER_SWITCH_ENTITY, "")
                                     if not vc.get("charger_amps_entity"):
                                         vc["charger_amps_entity"] = _opts.get(CONF_GENERIC_CHARGER_AMPS_ENTITY, "")
+                                    if not vc.get("charger_status_entity"):
+                                        vc["charger_status_entity"] = _opts.get(CONF_GENERIC_CHARGER_STATUS_ENTITY, "")
                                 elif _opts.get("ocpp_enabled"):
                                     vc_charger_type = "ocpp"
                                 else:
@@ -23417,6 +24519,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
                             params = {
                                 "dynamic_mode": "solar_surplus",
+                                "owner_mode": "solar_surplus",
                                 "charger_type": vc_charger_type,
                                 "min_charge_amps": vc.get("min_amps", 5),
                                 "max_charge_amps": vc.get("max_amps", 32),
@@ -23424,13 +24527,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                                 "phases": vc_phases,
                                 "charger_switch_entity": vc.get("charger_switch_entity"),
                                 "charger_amps_entity": vc.get("charger_amps_entity"),
+                                "charger_status_entity": vc.get("charger_status_entity"),
                                 "ocpp_charger_id": vc.get("ocpp_charger_id"),
                                 "household_buffer_kw": surplus_config.get("household_buffer_kw", 0.5),
                                 "surplus_calculation": surplus_config.get("surplus_calculation", "grid_based"),
                                 "sustained_surplus_minutes": surplus_config.get("sustained_surplus_minutes", 2),
                                 "stop_delay_minutes": surplus_config.get("stop_delay_minutes", 5),
-                                "min_battery_soc": surplus_config.get("home_battery_minimum", 80),
-                                "pause_below_soc": max(0, surplus_config.get("home_battery_minimum", 80) - 10),
+                                "min_battery_soc": min_battery_soc,
+                                "pause_below_soc": max(0, min_battery_soc - 10),
                                 "dual_vehicle_strategy": surplus_config.get("dual_vehicle_strategy", "priority_first"),
                                 "allow_parallel_charging": allow_parallel,
                                 "max_battery_charge_rate_kw": surplus_config.get("max_battery_charge_rate_kw", 5.0),
@@ -23688,6 +24792,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             else:
                 saved_backup_reserve = DEFAULT_OPTIMIZATION_BACKUP_RESERVE  # 0.20
 
+            def _positive_int_setting(key: str) -> int | None:
+                value = entry.options.get(key, entry.data.get(key))
+                try:
+                    parsed = int(float(value))
+                except (TypeError, ValueError):
+                    return None
+                return parsed if parsed > 0 else None
+
+            saved_capacity_wh = _positive_int_setting(
+                CONF_OPTIMIZATION_BATTERY_CAPACITY_WH
+            )
+            saved_max_charge_w = _positive_int_setting(
+                CONF_OPTIMIZATION_MAX_CHARGE_W
+            )
+            saved_max_discharge_w = _positive_int_setting(
+                CONF_OPTIMIZATION_MAX_DISCHARGE_W
+            )
+
             optimization_coordinator = OptimizationCoordinator(
                 hass=hass,
                 entry_id=entry.entry_id,
@@ -23707,11 +24829,30 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
             # Set cost function, interval, and backup reserve from saved settings
             optimization_coordinator.set_cost_function(saved_cost_function)
-            optimization_coordinator.update_config(
-                interval_minutes=saved_interval_minutes,
-                backup_reserve=saved_backup_reserve,
+            optimizer_config_updates = {
+                "interval_minutes": saved_interval_minutes,
+                "backup_reserve": saved_backup_reserve,
+            }
+            if saved_capacity_wh is not None:
+                optimizer_config_updates["battery_capacity_wh"] = saved_capacity_wh
+            if saved_max_charge_w is not None:
+                optimizer_config_updates["max_charge_w"] = saved_max_charge_w
+            if saved_max_discharge_w is not None:
+                optimizer_config_updates["max_discharge_w"] = saved_max_discharge_w
+            optimization_coordinator.update_config(**optimizer_config_updates)
+            if any(v is not None for v in (saved_capacity_wh, saved_max_charge_w, saved_max_discharge_w)):
+                optimization_coordinator._battery_specs_source = "manual"
+            _LOGGER.info(
+                "Smart Optimization cost function: %s, interval: %smin, "
+                "backup_reserve: %.0f%%, battery specs: %.1fkWh charge %.1fkW discharge %.1fkW (%s)",
+                saved_cost_function,
+                saved_interval_minutes,
+                saved_backup_reserve * 100,
+                optimization_coordinator._config.battery_capacity_wh / 1000,
+                optimization_coordinator._config.max_charge_w / 1000,
+                optimization_coordinator._config.max_discharge_w / 1000,
+                optimization_coordinator._battery_specs_source,
             )
-            _LOGGER.info(f"Smart Optimization cost function: {saved_cost_function}, interval: {saved_interval_minutes}min, backup_reserve: {saved_backup_reserve:.0%}")
 
             # Load hardware backup reserve (user-configured restore target)
             from .const import CONF_HARDWARE_BACKUP_RESERVE
@@ -23814,7 +24955,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     try:
                         from .aemo_api import AEMOAPIClient
                         from homeassistant.helpers.aiohttp_client import async_get_clientsession
-                        from homeassistant.util import dt as dt_util
 
                         session = async_get_clientsession(hass)
                         client = AEMOAPIClient(session)
@@ -24079,18 +25219,100 @@ class OptimizationSettingsView(HomeAssistantView):
         """Handle GET request for optimization settings."""
         # Find the optimization coordinator
         opt_coordinator = None
+        config_entry = None
+        entries = self._hass.config_entries.async_entries(DOMAIN)
+        if entries:
+            config_entry = entries[0]
         for entry_id, data in self._hass.data.get(DOMAIN, {}).items():
             if isinstance(data, dict) and "optimization_coordinator" in data:
                 opt_coordinator = data["optimization_coordinator"]
                 break
 
         if not opt_coordinator:
+            battery_system = (
+                config_entry.data.get(CONF_BATTERY_SYSTEM, "tesla")
+                if config_entry
+                else "tesla"
+            )
+            default_capacity_wh = BATTERY_CAPACITY_DEFAULTS.get(battery_system, 13500)
+            default_power_w = BATTERY_POWER_DEFAULTS.get(battery_system, 5000)
+
+            def _entry_int_setting(key: str, default: int) -> int:
+                if not config_entry:
+                    return default
+                value = config_entry.options.get(
+                    key,
+                    config_entry.data.get(key, default),
+                )
+                try:
+                    parsed = int(float(value))
+                except (TypeError, ValueError):
+                    return default
+                return parsed if parsed > 0 else default
+
+            backup_reserve = DEFAULT_OPTIMIZATION_BACKUP_RESERVE
+            hardware_reserve = 0
+            if config_entry:
+                raw_backup = config_entry.options.get(
+                    CONF_OPTIMIZATION_BACKUP_RESERVE,
+                    config_entry.data.get(
+                        CONF_OPTIMIZATION_BACKUP_RESERVE,
+                        DEFAULT_OPTIMIZATION_BACKUP_RESERVE,
+                    ),
+                )
+                try:
+                    backup_reserve = float(raw_backup)
+                    if backup_reserve > 1:
+                        backup_reserve = backup_reserve / 100
+                except (TypeError, ValueError):
+                    backup_reserve = DEFAULT_OPTIMIZATION_BACKUP_RESERVE
+                raw_hardware = config_entry.options.get(
+                    CONF_HARDWARE_BACKUP_RESERVE,
+                    config_entry.data.get(CONF_HARDWARE_BACKUP_RESERVE, 0),
+                )
+                try:
+                    hardware_reserve = float(raw_hardware)
+                    if hardware_reserve <= 1:
+                        hardware_reserve = hardware_reserve * 100
+                except (TypeError, ValueError):
+                    hardware_reserve = 0
+
             return web.json_response({
                 "success": True,
-                "enabled": False,
+                "enabled": bool(
+                    config_entry
+                    and config_entry.options.get(CONF_OPTIMIZATION_ENABLED, False)
+                ),
                 "cost_function": "cost",
-                "backup_reserve": int(DEFAULT_OPTIMIZATION_BACKUP_RESERVE * 100),
+                "backup_reserve": round(backup_reserve * 100),
                 "ev_integration": False,
+                "config": {
+                    "battery_capacity_wh": _entry_int_setting(
+                        CONF_OPTIMIZATION_BATTERY_CAPACITY_WH,
+                        default_capacity_wh,
+                    ),
+                    "max_charge_w": _entry_int_setting(
+                        CONF_OPTIMIZATION_MAX_CHARGE_W,
+                        default_power_w,
+                    ),
+                    "max_discharge_w": _entry_int_setting(
+                        CONF_OPTIMIZATION_MAX_DISCHARGE_W,
+                        default_power_w,
+                    ),
+                    "backup_reserve": round(backup_reserve * 100),
+                    "hardware_backup_reserve": round(hardware_reserve),
+                    "battery_specs_source": "manual"
+                    if config_entry
+                    and (
+                        config_entry.options.get(CONF_OPTIMIZATION_BATTERY_CAPACITY_WH)
+                        or config_entry.data.get(CONF_OPTIMIZATION_BATTERY_CAPACITY_WH)
+                        or config_entry.options.get(CONF_OPTIMIZATION_MAX_CHARGE_W)
+                        or config_entry.data.get(CONF_OPTIMIZATION_MAX_CHARGE_W)
+                        or config_entry.options.get(CONF_OPTIMIZATION_MAX_DISCHARGE_W)
+                        or config_entry.data.get(CONF_OPTIMIZATION_MAX_DISCHARGE_W)
+                    )
+                    else "default",
+                },
             })
 
         return web.json_response({
@@ -24171,6 +25393,11 @@ class OptimizationSettingsView(HomeAssistantView):
                 new_options[CONF_OPTIMIZATION_EV_INTEGRATION] = settings["ev_integration"]
                 changes.append(f"Set EV integration to {settings['ev_integration']}")
 
+            if "profit_max_enabled" in settings:
+                from .const import CONF_PROFIT_MAX_ENABLED
+                new_options[CONF_PROFIT_MAX_ENABLED] = bool(settings["profit_max_enabled"])
+                changes.append(f"Set profit maximisation mode to {settings['profit_max_enabled']}")
+
             if "cost_function" in settings:
                 from .const import CONF_OPTIMIZATION_COST_FUNCTION
                 new_data[CONF_OPTIMIZATION_COST_FUNCTION] = settings["cost_function"]
@@ -24198,6 +25425,25 @@ class OptimizationSettingsView(HomeAssistantView):
                 if opt_coord:
                     opt_coord._startup_backup_reserve = int(hw_reserve * 100)
                     _LOGGER.info("Updated startup backup reserve to %d%%", int(hw_reserve * 100))
+
+            spec_key_map = {
+                "battery_capacity_wh": CONF_OPTIMIZATION_BATTERY_CAPACITY_WH,
+                "max_charge_w": CONF_OPTIMIZATION_MAX_CHARGE_W,
+                "max_discharge_w": CONF_OPTIMIZATION_MAX_DISCHARGE_W,
+            }
+            for payload_key, option_key in spec_key_map.items():
+                if payload_key not in settings:
+                    continue
+                try:
+                    spec_value = int(float(settings[payload_key]))
+                except (TypeError, ValueError):
+                    continue
+                if spec_value > 0:
+                    new_options[option_key] = spec_value
+                    changes.append(f"Set {payload_key} to {spec_value}")
+                else:
+                    new_options.pop(option_key, None)
+                    changes.append(f"Cleared {payload_key}")
 
             # Update the config entry (both data and options)
             self._hass.config_entries.async_update_entry(config_entry, data=new_data, options=new_options)
@@ -24234,17 +25480,39 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     _LOGGER.info("Unloading PowerSync integration")
 
-    # Cancel the auto-sync timers if they exist (4-stage smart sync)
+    # Tear down TOU sync hooks (AEMO dispatch subscriber + dispatch-trigger
+    # coordinator + cron fallback + optional Octopus cron)
     entry_data = hass.data[DOMAIN].get(entry.entry_id, {})
-    if cancel_timer := entry_data.get("auto_sync_cancel"):
-        cancel_timer()
-        _LOGGER.debug("Cancelled auto-sync timer (Stage 1)")
-    if cancel_timer_35s := entry_data.get("auto_sync_cancel_35s"):
-        cancel_timer_35s()
-        _LOGGER.debug("Cancelled auto-sync timer (Stage 3 - 35s)")
-    if cancel_timer_60s := entry_data.get("auto_sync_cancel_60s"):
-        cancel_timer_60s()
-        _LOGGER.debug("Cancelled auto-sync timer (Stage 4 - 60s)")
+    if aemo_unsub := entry_data.get("aemo_dispatch_unsub"):
+        aemo_unsub()
+        _LOGGER.debug("Unsubscribed AEMO new-dispatch listener")
+    if trigger_listener_unsub := entry_data.get("aemo_dispatch_trigger_listener_unsub"):
+        # Removing the no-op listener tells the coordinator to stop scheduling
+        # the next refresh after the in-flight one (if any) finishes.
+        trigger_listener_unsub()
+        entry_data["aemo_dispatch_trigger_listener_unsub"] = None
+    if trigger_coord := entry_data.get("aemo_dispatch_trigger_coordinator"):
+        # Belt-and-braces: also clear update_interval so the coordinator can't
+        # reschedule, and call async_shutdown if HA exposes it.
+        trigger_coord.update_interval = None
+        if hasattr(trigger_coord, "async_shutdown"):
+            try:
+                await trigger_coord.async_shutdown()
+            except Exception as e:
+                _LOGGER.debug("AEMO dispatch-trigger coordinator shutdown error: %s", e)
+        entry_data["aemo_dispatch_trigger_coordinator"] = None
+        _LOGGER.debug("Stopped AEMO dispatch-trigger coordinator")
+    if fallback_cancel := entry_data.get("dispatch_fallback_cron_cancel"):
+        fallback_cancel()
+        _LOGGER.debug("Cancelled NEM TOU sync periodic fallback")
+    if octopus_cancel := entry_data.get("octopus_sync_cancel"):
+        octopus_cancel()
+        _LOGGER.debug("Cancelled Octopus :00/:30 sync cron")
+
+    # Cancel PowerSync HACS auto-update scheduler if it exists
+    if auto_update_cancel := entry_data.get("auto_update_cancel"):
+        auto_update_cancel()
+        _LOGGER.debug("Cancelled PowerSync auto-update scheduler")
 
     # Cancel the curtailment timer if it exists
     if curtailment_cancel := entry_data.get("curtailment_cancel"):
@@ -24271,6 +25539,11 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if zaptec_client := entry_data.get("zaptec_client"):
         await zaptec_client.close()
         _LOGGER.debug("Closed Zaptec Cloud client")
+
+    # Cancel OCPP session polling
+    if unsub_ocpp := entry_data.get("unsub_ocpp_poll"):
+        unsub_ocpp()
+        _LOGGER.debug("Cancelled OCPP session polling")
 
     # Cancel the AEMO spike timer if it exists
     if aemo_spike_cancel := entry_data.get("aemo_spike_cancel"):
@@ -24311,6 +25584,13 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         automation_cancel()
         _LOGGER.debug("Cancelled automation evaluation timer")
 
+    # Cancel any pending EV boost stop timer. Ownership diagnostics are
+    # persisted below so setup can recover without restoring a stale lease.
+    if ev_boost_cancel := entry_data.get("ev_boost_cancel"):
+        ev_boost_cancel()
+        entry_data["ev_boost_cancel"] = None
+        _LOGGER.debug("Cancelled EV boost timer")
+
     # Flush active EV charging sessions so they're not lost
     if session_manager := entry_data.get("session_manager"):
         for vehicle_id in list(session_manager.active_sessions.keys()):
@@ -24319,6 +25599,15 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 _LOGGER.info(f"Flushed EV charging session for {vehicle_id} on unload")
             except Exception as e:
                 _LOGGER.debug(f"Could not flush session for {vehicle_id}: {e}")
+
+    # Persist EV ownership diagnostics before unload. Active leases are only a
+    # snapshot; setup restores the last-command context and clears stale owners.
+    try:
+        from .automations.ev_ownership import persist_ev_runtime_state
+        if automation_store := entry_data.get("automation_store"):
+            await persist_ev_runtime_state(hass, entry, automation_store)
+    except Exception as err:
+        _LOGGER.debug("EV runtime persist on unload failed: %s", err)
 
     # Save Flow Power TWAP history on unload
     if twap_tracker := entry_data.get("flow_power_twap_tracker"):
@@ -24384,6 +25673,11 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 await coord._energy_acc.async_flush()
             except Exception as e:
                 _LOGGER.debug("Failed to flush energy accumulator for %s: %s", coord_key, e)
+        if coord and hasattr(coord, "async_flush_lifetime_totals"):
+            try:
+                await coord.async_flush_lifetime_totals()
+            except Exception as e:
+                _LOGGER.debug("Failed to flush lifetime totals for %s: %s", coord_key, e)
 
     # Unload platforms
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)

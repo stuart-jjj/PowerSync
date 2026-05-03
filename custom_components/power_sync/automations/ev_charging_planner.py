@@ -14,13 +14,20 @@ import statistics
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, time as dt_time
-from typing import Optional, List, Dict, Any, Tuple, Iterator
+from typing import Optional, List, Dict, Any, Tuple, Iterator, Mapping
 from enum import Enum
 
 import aiohttp
 import re
 
+from homeassistant.util import dt as dt_util
+
 from ..const import TESLA_INTEGRATIONS
+from ..solar_surplus_config import (
+    DEFAULT_SOLAR_SURPLUS_MIN_BATTERY_SOC,
+    get_solar_surplus_min_battery_soc,
+    normalize_solar_surplus_config,
+)
 
 
 class SensitiveDataFilter(logging.Filter):
@@ -89,6 +96,23 @@ def _iter_tesla_vehicle_devices(device_registry) -> Iterator[Tuple[Any, str]]:
                 if len(id_str) == 17 and not id_str.isdigit():
                     yield device, id_str
                     break
+
+
+def _state_power_w(state: Any) -> Optional[float]:
+    """Return a Home Assistant power sensor state as watts."""
+    if not state or state.state in ("unavailable", "unknown", "None", None):
+        return None
+
+    try:
+        value = float(state.state)
+    except (TypeError, ValueError):
+        return None
+
+    unit = str(state.attributes.get("unit_of_measurement", "W")).lower()
+    if unit == "kw":
+        value *= 1000
+
+    return value
 
 
 class ChargingPriority(Enum):
@@ -493,11 +517,39 @@ async def is_ev_plugged_in(
                 _LOGGER.debug("OCPP server found but no charge point has vehicle connected")
                 return False
 
+            # No built-in OCPP server — fall back to HACS lbbrhzn/ocpp entities.
+            # The connector-level status sensor is the most reliable indicator.
+            OCPP_CAR_PRESENT = {'preparing', 'charging', 'suspendedev', 'suspendedevse', 'finishing'}
+            for state in hass.states.async_all():
+                eid = state.entity_id
+                if not (eid.startswith("sensor.") and eid.endswith("_status_connector")):
+                    continue
+                if state.state in ("unavailable", "unknown"):
+                    continue
+                # Only consider entities from the ocpp platform
+                try:
+                    from homeassistant.helpers.entity_registry import async_get as _er_get
+                    _er = _er_get(hass)
+                    _entry = _er.async_get(eid)
+                    if _entry and _entry.platform != "ocpp":
+                        continue
+                except Exception:
+                    pass
+                if state.state.lower() in OCPP_CAR_PRESENT:
+                    _LOGGER.debug("HACS OCPP: %s=%s → car plugged in", eid, state.state)
+                    return True
+            _LOGGER.debug("HACS OCPP: no connector shows car present")
+            return False
+
     # Generic charger — check connector status sensor
     if config_entry:
         opts = {**config_entry.data, **config_entry.options}
         if opts.get(CONF_GENERIC_CHARGER_ENABLED):
             status_entity = opts.get(CONF_GENERIC_CHARGER_STATUS_ENTITY, "")
+            if not status_entity:
+                _LOGGER.debug("Generic charger has no status entity configured, skipping plug detection")
+                return True
+
             if status_entity:
                 state = hass.states.get(status_entity)
                 if state:
@@ -511,15 +563,38 @@ async def is_ev_plugged_in(
                             "charging", "preparing", "suspended_evse",
                             "suspended_ev", "finishing",
                         )
+                        # Charger-level entities can show "available" even when a car is
+                        # connected — fall back to connector-level entities before declaring unplugged.
+                        if not plugged and status in ("available", "disconnected"):
+                            _OCPP_CAR_PRESENT = {"preparing", "charging", "suspendedev", "suspendedevse", "finishing"}
+                            for s in hass.states.async_all():
+                                if (s.entity_id.startswith("sensor.") and s.entity_id.endswith("_status_connector")
+                                        and s.state not in ("unavailable", "unknown")
+                                        and s.state.lower() in _OCPP_CAR_PRESENT):
+                                    _LOGGER.debug(
+                                        "Generic charger: %s=%s but %s=%s → car present",
+                                        status_entity, state.state, s.entity_id, s.state,
+                                    )
+                                    plugged = True
+                                    break
+                        elif not plugged:
+                            _LOGGER.debug(
+                                "Generic charger status %s=%s is not a known unplugged state, treating as ready",
+                                status_entity,
+                                state.state,
+                            )
+                            plugged = True
                     _LOGGER.debug(
                         "Generic charger plugged_in check: %s state=%s → %s",
                         status_entity, state.state, plugged,
                     )
                     return plugged
                 else:
-                    _LOGGER.debug("Generic charger status entity %s not found", status_entity)
-            # No status entity configured — can't determine plug state,
-            # fall through (returns False at end of function)
+                    _LOGGER.debug(
+                        "Generic charger status entity %s not found, skipping plug detection",
+                        status_entity,
+                    )
+                    return True
 
     # Method 0: Teslemetry Bluetooth — check sensor.*_charging_state
     import re as _re
@@ -625,6 +700,116 @@ async def is_ev_plugged_in(
             ble_state = hass.states.get(ble_charger_entity)
             if ble_state:
                 _LOGGER.debug(f"Tesla BLE {prefix} entity exists (state={ble_state.state}), assuming plugged in")
+                return True
+
+    return False
+
+
+async def is_ev_actively_charging(
+    hass: "HomeAssistant",
+    config_entry: "ConfigEntry",
+    vehicle_vin: Optional[str] = None,
+) -> bool:
+    """Probe upstream charger/vehicle state to detect actual charge draw.
+
+    Tesla starts charging on plug-in by default — when that happens without
+    PowerSync issuing a start, the planner's per-vehicle `is_charging` flag
+    stays False and the stop branch never fires. The same gap appears after
+    an integration reload, which wipes the in-memory flag while the vehicle
+    keeps charging. This helper queries Teslemetry BT, Tesla Fleet, and BLE
+    entities directly so the stop branch can act on physical reality rather
+    than PowerSync's bookkeeping.
+    """
+    from ..const import (
+        CONF_TESLA_BLE_ENTITY_PREFIX,
+        DEFAULT_TESLA_BLE_ENTITY_PREFIX,
+    )
+    from homeassistant.helpers import entity_registry as er, device_registry as dr
+    import re as _re
+
+    # Method 0: Teslemetry Bluetooth — sensor.{prefix}_charging_state
+    for state in hass.states.async_all():
+        match = _re.match(r"sensor\.(\w+)_charging_state$", state.entity_id)
+        if not match:
+            continue
+        candidate = match.group(1)
+        if len(candidate) != 17 or not candidate.isalnum():
+            continue
+        if hass.states.get(f"switch.{candidate}_charge") is None:
+            continue
+        if vehicle_vin is not None and candidate.upper() != vehicle_vin.upper():
+            continue
+        if state.state and state.state.lower() == "charging":
+            return True
+        for suffix in ("_charger_power", "_charge_power"):
+            power_state = hass.states.get(f"sensor.{candidate}{suffix}")
+            power_w = _state_power_w(power_state)
+            if power_w is not None and power_w > 100:
+                _LOGGER.debug(
+                    "EV active charging inferred from %s=%sW",
+                    power_state.entity_id,
+                    power_w,
+                )
+                return True
+
+    # Method 1: Tesla Fleet/Teslemetry — sensor.{vehicle}_charging == "Charging"
+    # (binary_sensor.*_charger is plug-state, not charge-state, so we ignore it)
+    entity_registry = er.async_get(hass)
+    device_registry = dr.async_get(hass)
+    for device, device_vin in _iter_tesla_vehicle_devices(device_registry):
+        if vehicle_vin is not None and device_vin != vehicle_vin:
+            continue
+        for entity in entity_registry.entities.values():
+            if entity.device_id != device.id:
+                continue
+            eid = entity.entity_id
+            eid_lower = eid.lower()
+            if (
+                eid.startswith("sensor.")
+                and "_charging" in eid_lower
+                and "charging_" not in eid_lower
+            ):
+                s = hass.states.get(eid)
+                if s and s.state and s.state.lower() == "charging":
+                    return True
+            if (
+                eid.startswith("sensor.")
+                and (
+                    "charger_power" in eid_lower
+                    or "charge_power" in eid_lower
+                    or "charging_power" in eid_lower
+                )
+            ):
+                s = hass.states.get(eid)
+                power_w = _state_power_w(s)
+                if power_w is not None and power_w > 100:
+                    _LOGGER.debug(
+                        "EV active charging inferred from %s=%sW",
+                        eid,
+                        power_w,
+                    )
+                    return True
+
+    # Method 2: Tesla BLE — switch.{prefix}_charger state
+    config = dict(config_entry.options) if config_entry else {}
+    if vehicle_vin and vehicle_vin.startswith("ble_"):
+        ble_prefixes = [vehicle_vin[4:]]
+    else:
+        raw_prefix = config.get(CONF_TESLA_BLE_ENTITY_PREFIX, DEFAULT_TESLA_BLE_ENTITY_PREFIX)
+        ble_prefixes = [p.strip() for p in raw_prefix.split(",") if p.strip()]
+    for prefix in ble_prefixes:
+        s = hass.states.get(f"switch.{prefix}_charger")
+        if s and s.state == "on":
+            return True
+        for suffix in ("_charge_power", "_charger_power"):
+            power_state = hass.states.get(f"sensor.{prefix}{suffix}")
+            power_w = _state_power_w(power_state)
+            if power_w is not None and power_w > 100:
+                _LOGGER.debug(
+                    "EV active charging inferred from %s=%sW",
+                    power_state.entity_id,
+                    power_w,
+                )
                 return True
 
     return False
@@ -1317,7 +1502,11 @@ class PriceForecaster:
                     if custom_tariff:
                         # Convert custom_tariff to tariff_schedule format
                         from .. import convert_custom_tariff_to_schedule
-                        tariff_schedule = convert_custom_tariff_to_schedule(custom_tariff)
+                        from ..currency import currency_for_entry
+                        tariff_schedule = convert_custom_tariff_to_schedule(
+                            custom_tariff,
+                            currency=currency_for_entry(self.config_entry, self.hass),
+                        )
                         _LOGGER.debug(f"Using custom tariff for forecast: {custom_tariff.get('name')}")
 
             if not tariff_schedule:
@@ -1636,6 +1825,28 @@ class ChargingPlanner:
         self.price_forecaster = PriceForecaster(hass, config_entry)
         self._get_battery_schedule = battery_schedule_getter
         self._grid_capacity_kw = grid_capacity_kw
+
+    def _is_grid_charging_blocked_at(self, when: datetime) -> bool:
+        """Return True if grid charging is blocked at `when` due to demand window.
+
+        Honors the user's CONF_DEMAND_ALLOW_GRID_CHARGING override. Solar surplus
+        is always allowed; this only filters grid-source charging options.
+        """
+        from ..const import DOMAIN, CONF_DEMAND_ALLOW_GRID_CHARGING
+        entry_data = self.hass.data.get(DOMAIN, {}).get(self.config_entry.entry_id, {})
+        dc_coord = entry_data.get("demand_charge_coordinator")
+        if not dc_coord or not dc_coord.enabled:
+            return False
+        allow_override = self.config_entry.options.get(
+            CONF_DEMAND_ALLOW_GRID_CHARGING,
+            self.config_entry.data.get(CONF_DEMAND_ALLOW_GRID_CHARGING, False),
+        )
+        if allow_override:
+            return False
+        try:
+            return dc_coord._is_in_peak_period(when)
+        except Exception:
+            return False
 
     async def _get_battery_power_schedule(self, hours: int = 24) -> Dict[str, float]:
         """Get battery power usage per hour from optimizer schedule.
@@ -1992,6 +2203,10 @@ class ChargingPlanner:
                 hour_dt = datetime.fromisoformat(price_data.hour)
                 hour_key = hour_dt.replace(minute=0, second=0, microsecond=0).isoformat()
 
+                # Skip hours that fall inside a demand window (unless override set)
+                if self._is_grid_charging_blocked_at(hour_dt):
+                    continue
+
                 # Dynamic power sharing: cheap hours = battery charging too
                 available_power = self._get_available_ev_power(
                     hour_key,
@@ -2165,7 +2380,11 @@ class ChargingPlanner:
             else:
                 grid_power = charger_power_kw - max(0, solar_available)
 
-            if grid_power > 0.5:  # At least 0.5kW from grid
+            # Skip grid hours that fall inside a demand-charge peak window unless
+            # the user has opted into grid charging during demand windows.
+            grid_blocked = self._is_grid_charging_blocked_at(hour_dt)
+
+            if grid_power > 0.5 and not grid_blocked:  # At least 0.5kW from grid
                 charging_options.append({
                     "hour": price.hour,
                     "hour_dt": hour_dt,
@@ -2391,6 +2610,11 @@ class ChargingPlanner:
                 cost = 0
                 solar_energy += min(energy_this_hour, energy_needed_kwh - energy_allocated)
             else:
+                # Skip grid hours that fall inside a demand window (unless override set).
+                # If this leaves the deadline unmet, the warning/can_meet_target fields
+                # will reflect that — user can opt into demand_allow_grid_charging if needed.
+                if self._is_grid_charging_blocked_at(hour_dt):
+                    continue
                 # Use grid
                 energy_this_hour = charger_power_kw * usable_fraction
                 source = f"grid_{price.period}"
@@ -2439,7 +2663,7 @@ class ChargingPlanner:
         current_surplus_kw: float,
         current_price_cents: float,
         battery_soc: float,
-        min_battery_soc: int = 80,
+        min_battery_soc: int = DEFAULT_SOLAR_SURPLUS_MIN_BATTERY_SOC,
         is_time_critical: bool = False,
     ) -> Tuple[bool, str, str]:
         """
@@ -2669,7 +2893,25 @@ class AutoScheduleSettings:
     # Optional entity overrides for generic chargers
     charger_switch_entity: Optional[str] = None
     charger_amps_entity: Optional[str] = None
+    charger_status_entity: Optional[str] = None
     ocpp_charger_id: Optional[int] = None
+
+    def apply_charger_config(self, config: Mapping[str, Any]) -> None:
+        """Apply app-managed physical charger settings to these settings."""
+        field_map = {
+            "max_amps": "max_charge_amps",
+            "min_amps": "min_charge_amps",
+            "voltage": "voltage",
+            "phases": "phases",
+            "charger_type": "charger_type",
+            "charger_switch_entity": "charger_switch_entity",
+            "charger_amps_entity": "charger_amps_entity",
+            "charger_status_entity": "charger_status_entity",
+            "ocpp_charger_id": "ocpp_charger_id",
+        }
+        for source_key, attr_name in field_map.items():
+            if source_key in config:
+                setattr(self, attr_name, config[source_key])
 
     def to_dict(self) -> dict:
         """Convert to dictionary."""
@@ -2710,6 +2952,7 @@ class AutoScheduleSettings:
             "min_surplus_kw": self.get_min_surplus_kw(),  # Calculated from phases/voltage/amps
             "charger_switch_entity": self.charger_switch_entity,
             "charger_amps_entity": self.charger_amps_entity,
+            "charger_status_entity": self.charger_status_entity,
             "ocpp_charger_id": self.ocpp_charger_id,
         }
 
@@ -2739,34 +2982,42 @@ class AutoScheduleSettings:
         # Handle departure_priorities (per-day strategy overrides)
         departure_priorities: Dict[int, str] = {}
         raw_departure_priorities = data.get("departure_priorities")
-        if raw_departure_priorities and isinstance(raw_departure_priorities, dict):
+        if isinstance(raw_departure_priorities, dict):
             departure_priorities = {int(k): v for k, v in raw_departure_priorities.items()}
 
         # Handle per-day constraint overrides (new names, with backward compat from old names)
         departure_min_battery_to_start: Dict[int, int] = {}
-        raw_dmbts = data.get("departure_min_battery_to_start") or data.get("departure_home_battery_min")
-        if raw_dmbts and isinstance(raw_dmbts, dict):
+        raw_dmbts = (
+            data.get("departure_min_battery_to_start")
+            if isinstance(data.get("departure_min_battery_to_start"), dict)
+            else data.get("departure_home_battery_min")
+        )
+        if isinstance(raw_dmbts, dict):
             departure_min_battery_to_start = {int(k): int(v) for k, v in raw_dmbts.items()}
 
         departure_limit_grid_import: Dict[int, bool] = {}
-        raw_dlgi = data.get("departure_limit_grid_import") or data.get("departure_no_grid_import")
-        if raw_dlgi and isinstance(raw_dlgi, dict):
+        raw_dlgi = (
+            data.get("departure_limit_grid_import")
+            if isinstance(data.get("departure_limit_grid_import"), dict)
+            else data.get("departure_no_grid_import")
+        )
+        if isinstance(raw_dlgi, dict):
             departure_limit_grid_import = {int(k): bool(v) for k, v in raw_dlgi.items()}
 
         departure_consume_battery_level: Dict[int, int] = {}
         raw_dcbl = data.get("departure_consume_battery_level")
-        if raw_dcbl and isinstance(raw_dcbl, dict):
+        if isinstance(raw_dcbl, dict):
             departure_consume_battery_level = {int(k): int(v) for k, v in raw_dcbl.items()}
 
         departure_stop_at_battery_floor: Dict[int, bool] = {}
         raw_dsabf = data.get("departure_stop_at_battery_floor")
-        if raw_dsabf and isinstance(raw_dsabf, dict):
+        if isinstance(raw_dsabf, dict):
             departure_stop_at_battery_floor = {int(k): bool(v) for k, v in raw_dsabf.items()}
 
         # Handle departure_times migration from legacy format
         departure_times: Dict[int, str] = {}
         raw_departure_times = data.get("departure_times")
-        if raw_departure_times and isinstance(raw_departure_times, dict):
+        if isinstance(raw_departure_times, dict):
             # New format: {"0": "07:30", "4": "07:30"} or {0: "07:30"}
             departure_times = {int(k): v for k, v in raw_departure_times.items()}
         else:
@@ -2802,6 +3053,7 @@ class AutoScheduleSettings:
             phases=data.get("phases", 1),
             charger_switch_entity=data.get("charger_switch_entity"),
             charger_amps_entity=data.get("charger_amps_entity"),
+            charger_status_entity=data.get("charger_status_entity"),
             ocpp_charger_id=data.get("ocpp_charger_id"),
         )
 
@@ -3021,6 +3273,19 @@ class AutoScheduleExecutor:
 
         return amps
 
+    def _power_to_amps_for_settings(
+        self,
+        power_w: float,
+        settings: "AutoScheduleSettings",
+    ) -> int:
+        """Convert watts to amps using the vehicle's charger configuration."""
+        return self._power_to_amps(
+            power_w,
+            settings.voltage,
+            settings.phases,
+            settings.max_charge_amps,
+        )
+
     async def _set_vehicle_charge_rate(
         self,
         vehicle_id: str,
@@ -3045,13 +3310,8 @@ class AutoScheduleExecutor:
         """
         from .actions import _set_vehicle_amps
 
-        # Get home power settings for voltage/phases
-        home_config = await self._get_home_power_settings()
-        phases = 1 if home_config.get("phase_type") == "single" else 3
-        voltage = 230  # Australia standard
-
         # Convert power to amps (use per-vehicle max from settings)
-        target_amps = self._power_to_amps(power_w, voltage, phases, settings.max_charge_amps)
+        target_amps = self._power_to_amps_for_settings(power_w, settings)
 
         if target_amps == 0:
             return False
@@ -3072,6 +3332,7 @@ class AutoScheduleExecutor:
             "charger_type": settings.charger_type,
             "charger_switch_entity": settings.charger_switch_entity,
             "charger_amps_entity": settings.charger_amps_entity,
+            "charger_status_entity": settings.charger_status_entity,
             "ocpp_charger_id": settings.ocpp_charger_id,
         }
 
@@ -3084,7 +3345,7 @@ class AutoScheduleExecutor:
                 self._current_charge_amps[vehicle_id] = target_amps
                 _LOGGER.info(
                     f"⚡ Variable charge rate: Set {vehicle_id} to {target_amps}A "
-                    f"({power_w/1000:.1f}kW @ {voltage}V/{phases}ph)"
+                    f"({power_w/1000:.1f}kW @ {settings.voltage}V/{settings.phases}ph)"
                 )
                 return True
             else:
@@ -3690,16 +3951,7 @@ class AutoScheduleExecutor:
             stored_data = getattr(self._store, '_data', {}) or {}
             for vc in stored_data.get("vehicle_charging_configs", []):
                 if vc.get("vehicle_id") == vehicle_id:
-                    if "max_amps" in vc:
-                        settings.max_charge_amps = vc["max_amps"]
-                    if "min_amps" in vc:
-                        settings.min_charge_amps = vc["min_amps"]
-                    if "voltage" in vc:
-                        settings.voltage = vc["voltage"]
-                    if "phases" in vc:
-                        settings.phases = vc["phases"]
-                    if "charger_type" in vc:
-                        settings.charger_type = vc["charger_type"]
+                    settings.apply_charger_config(vc)
                     return
         except Exception:
             pass
@@ -3778,7 +4030,7 @@ class AutoScheduleExecutor:
             next_start, next_end, next_power = ml_schedule.get_next_charging_window(now)
 
             # Calculate target amps for logging (use per-vehicle max)
-            target_amps = self._power_to_amps(power_w, max_amps=settings.max_charge_amps) if power_w > 0 else 0
+            target_amps = self._power_to_amps_for_settings(power_w, settings) if power_w > 0 else 0
 
             if should_charge:
                 reason = f"Smart Optimization: charge at {power_w/1000:.1f}kW ({target_amps}A)"
@@ -3850,7 +4102,7 @@ class AutoScheduleExecutor:
         # Note: min_battery_soc affects surplus calculation (prevents discharge),
         # but does NOT block EV charging from solar or grid.
         # The Powerwall's own backup reserve handles discharge protection.
-        weekday = datetime.now().weekday()
+        weekday = dt_util.now().weekday()  # HA tz; container UTC would mis-classify weekday near midnight
         effective_priority = settings.get_effective_priority(weekday)
         effective_limit_grid = settings.get_effective_limit_grid_import(weekday)
         effective_max_price = settings.get_effective_max_grid_price(weekday)
@@ -3898,6 +4150,35 @@ class AutoScheduleExecutor:
                 should_charge = False
                 reason = "Solar-only mode - no grid charging"
 
+            # Block grid charging during demand-charge peak windows.
+            # Mirrors the existing Tesla Powerwall block in __init__.py — when
+            # demand_allow_grid_charging is False, grid imports during the peak
+            # window would raise the billed peak. Manual/automation-initiated
+            # charging (HA service calls, switch presses) bypasses this path.
+            elif self.planner._is_grid_charging_blocked_at(dt_util.now()):
+                should_charge = False
+                reason = "In demand peak period - grid charging blocked (toggle 'Allow grid charging during demand windows' to override)"
+
+        # For opportunistic grid charging, defer to price-level policy if configured.
+        # The plan's cheapest window (e.g. 30c) can make even 12c look "opportunistic",
+        # but the user may have a tighter threshold (e.g. 5c) in price-level settings.
+        # Planned windows (source != "grid_opportunistic") are never blocked this way.
+        if should_charge and source == "grid_opportunistic":
+            executor = get_price_level_executor()
+            if executor is not None:
+                pl_settings = executor._get_settings()
+                if pl_settings.get("enabled", False):
+                    pl_should_charge, pl_reason, _ = await executor.get_charging_decision_for_vehicle(
+                        vehicle_vin, current_price_cents
+                    )
+                    if not pl_should_charge:
+                        should_charge = False
+                        reason = f"Opportunistic blocked by price policy: {pl_reason}"
+                        _LOGGER.debug(
+                            f"Auto-schedule: opportunistic grid charging for {vehicle_id} "
+                            f"blocked by price-level policy: {pl_reason}"
+                        )
+
         # Check surplus constraint for solar charging
         # Tesla requires minimum 5A to charge:
         # - Single phase: 5A × 230V = 1.15kW
@@ -3905,13 +4186,9 @@ class AutoScheduleExecutor:
         if should_charge and source == "solar_surplus":
             # Get solar surplus config to check home_battery_minimum and parallel charging settings
             solar_config = await self._get_solar_surplus_config()
-            min_battery_for_ev = solar_config.get("home_battery_minimum", 80)
+            min_battery_for_ev = get_solar_surplus_min_battery_soc(solar_config)
             allow_parallel = solar_config.get("allow_parallel_charging", False)
             max_battery_charge_kw = solar_config.get("max_battery_charge_rate_kw", 5.0)
-
-            # Get home power settings for phases
-            home_power = await self._get_home_power_settings()
-            phases = 3 if home_power.get("phase_type") == "three" else 1
 
             # Check if battery needs priority (battery below threshold)
             if battery_soc < min_battery_for_ev:
@@ -3961,7 +4238,8 @@ class AutoScheduleExecutor:
                     _LOGGER.info(
                         f"Auto-schedule: In solar window but no surplus - "
                         f"solar={solar_power_kw:.1f}kW, load={load_power_kw:.1f}kW, "
-                        f"surplus={current_surplus_kw:.1f}kW < {min_surplus:.1f}kW needed (phases={phases})"
+                        f"surplus={current_surplus_kw:.1f}kW < {min_surplus:.1f}kW needed "
+                        f"(phases={settings.phases})"
                     )
 
         # Find current window (if in one)
@@ -4116,7 +4394,7 @@ class AutoScheduleExecutor:
                     return buy_cents
 
                 # Try Amber format with PERIOD_HH_MM keys
-                now = datetime.now()
+                now = dt_util.now()  # HA tz, not container UTC
                 period_key = f"PERIOD_{now.hour:02d}_{30 if now.minute >= 30 else 0:02d}"
                 buy_prices = tariff_schedule.get("buy_prices", {})
                 if period_key in buy_prices:
@@ -4129,7 +4407,7 @@ class AutoScheduleExecutor:
                 if buy_prices:
                     # Find current time slot price
                     # Format: [{"timeRange": "10:00-10:30", "price": 25.0}, ...]
-                    now = datetime.now()
+                    now = dt_util.now()  # HA tz, not container UTC
                     current_time = f"{now.hour:02d}:{30 if now.minute >= 30 else 0:02d}"
                     for slot in buy_prices:
                         time_range = slot.get("timeRange", "")
@@ -4137,7 +4415,7 @@ class AutoScheduleExecutor:
                             return slot.get("price", 30.0)  # Already in cents
 
             # Default fallback based on time of day
-            hour = datetime.now().hour
+            hour = dt_util.now().hour  # HA tz, not container UTC
             if 7 <= hour < 9 or 17 <= hour < 21:
                 return 45.0  # Peak
             elif 9 <= hour < 17:
@@ -4170,19 +4448,13 @@ class AutoScheduleExecutor:
                 stored_data = getattr(automation_store, '_data', {}) or {}
                 config = stored_data.get("solar_surplus_config", {})
                 if config:
-                    return config
+                    return normalize_solar_surplus_config(config)
 
             # Return defaults
-            return {
-                "enabled": False,
-                "household_buffer_kw": 0.5,
-                "sustained_surplus_minutes": 2,
-                "stop_delay_minutes": 5,
-                "home_battery_minimum": 80,
-            }
+            return normalize_solar_surplus_config()
         except Exception as e:
             _LOGGER.debug(f"Failed to get solar surplus config: {e}")
-            return {"home_battery_minimum": 80}
+            return normalize_solar_surplus_config()
 
     async def _get_home_power_settings(self) -> dict:
         """Get home power settings from storage.
@@ -4619,25 +4891,29 @@ class AutoScheduleExecutor:
         vehicle_vin = self._resolve_vehicle_vin(vehicle_id) if vehicle_id != "_default" else None
 
         params = {
+            "vehicle_id": vehicle_id,
             "vehicle_vin": vehicle_vin,
             "vehicle_name": settings.display_name,
             "dynamic_mode": dynamic_mode,
+            "owner_mode": "smart_schedule_solar_surplus" if source == "solar_surplus" else "smart_schedule",
+            "allow_ownership_takeover": True,
             "min_charge_amps": settings.min_charge_amps,
             "max_charge_amps": settings.max_charge_amps,
             "voltage": settings.voltage,
             "phases": settings.phases,
             "charger_type": settings.charger_type,
-            "min_battery_soc": settings.get_effective_min_battery_to_start(datetime.now().weekday()),
+            "min_battery_soc": settings.get_effective_min_battery_to_start(dt_util.now().weekday()),
             "pause_below_soc": (
-                settings.get_effective_consume_battery_level(datetime.now().weekday())
-                if settings.get_effective_consume_battery_level(datetime.now().weekday()) > 0
-                else max(0, settings.get_effective_min_battery_to_start(datetime.now().weekday()) - 10)
+                settings.get_effective_consume_battery_level(dt_util.now().weekday())
+                if settings.get_effective_consume_battery_level(dt_util.now().weekday()) > 0
+                else max(0, settings.get_effective_min_battery_to_start(dt_util.now().weekday()) - 10)
             ),
-            "stop_at_battery_floor": settings.get_effective_stop_at_battery_floor(datetime.now().weekday()),
+            "stop_at_battery_floor": settings.get_effective_stop_at_battery_floor(dt_util.now().weekday()),
             "charger_switch_entity": settings.charger_switch_entity,
             "charger_amps_entity": settings.charger_amps_entity,
+            "charger_status_entity": settings.charger_status_entity,
             "ocpp_charger_id": settings.ocpp_charger_id,
-            "no_grid_import": settings.get_effective_limit_grid_import(datetime.now().weekday()),
+            "no_grid_import": settings.get_effective_limit_grid_import(dt_util.now().weekday()),
             **_get_optimizer_battery_params(self.hass, self.config_entry),
         }
 
@@ -4668,7 +4944,7 @@ class AutoScheduleExecutor:
         # Resolve vehicle_id to actual VIN or BLE identifier
         vehicle_vin = self._resolve_vehicle_vin(vehicle_id) if vehicle_id != "_default" else None
 
-        params = {"vehicle_vin": vehicle_vin}
+        params = {"vehicle_id": vehicle_vin or vehicle_id, "vehicle_vin": vehicle_vin}
 
         try:
             await _action_stop_ev_charging_dynamic(self.hass, self.config_entry, params)
@@ -4721,6 +4997,389 @@ class PriceLevelChargingState:
     managed_by_powersync: bool = False
 
 
+def _get_active_dynamic_ev_mode(hass: "HomeAssistant", config_entry: "ConfigEntry", vehicle_id: str) -> Optional[str]:
+    """Return the active dynamic EV mode that currently owns a vehicle, if any."""
+    try:
+        from .ev_ownership import get_active_ev_owner_mode
+        owner_mode = get_active_ev_owner_mode(hass, config_entry, vehicle_id)
+        if owner_mode:
+            return owner_mode
+    except Exception:
+        pass
+
+    try:
+        from .actions import DEFAULT_VEHICLE_ID, _dynamic_ev_state
+    except Exception:
+        return None
+
+    entry_vehicles = _dynamic_ev_state.get(config_entry.entry_id, {})
+    candidate_ids = [vehicle_id]
+    if vehicle_id != DEFAULT_VEHICLE_ID:
+        candidate_ids.append(DEFAULT_VEHICLE_ID)
+    else:
+        candidate_ids.extend(vid for vid in entry_vehicles if vid != DEFAULT_VEHICLE_ID)
+
+    for candidate_id in candidate_ids:
+        state = entry_vehicles.get(candidate_id)
+        if not state or not state.get("active"):
+            continue
+        params = state.get("params") or {}
+        return str(params.get("owner_mode") or params.get("dynamic_mode") or "dynamic")
+
+    return None
+
+
+def _can_stop_owned_loadpoint(
+    hass: "HomeAssistant",
+    config_entry: "ConfigEntry",
+    vehicle_id: str,
+    *,
+    expected_owner_mode: str,
+    command: str = "stop",
+) -> bool:
+    """Return whether a direct charger path may stop a loadpoint."""
+    return _can_stop_loadpoint_for_mode(
+        hass,
+        config_entry,
+        vehicle_id,
+        expected_owner_mode=expected_owner_mode,
+        command=command,
+    )
+
+
+def _can_stop_loadpoint_for_mode(
+    hass: "HomeAssistant",
+    config_entry: "ConfigEntry",
+    vehicle_id: Optional[str],
+    *,
+    expected_owner_mode: str,
+    command: str = "stop",
+    allow_unowned: bool = False,
+    allow_no_owner: bool = False,
+) -> bool:
+    """Return whether a mode may send a physical stop command."""
+    try:
+        from .ev_ownership import (
+            owner_family,
+            record_ev_command,
+        )
+
+        active_mode = _get_active_dynamic_ev_mode(hass, config_entry, vehicle_id or "_default")
+        if active_mode and owner_family(active_mode) == owner_family(expected_owner_mode):
+            return True
+        if not active_mode and (allow_unowned or allow_no_owner):
+            return True
+
+        reason = (
+            f"{active_mode} owns this loadpoint"
+            if active_mode else
+            "loadpoint is not owned by this mode"
+        )
+        record_ev_command(
+            hass,
+            config_entry,
+            vehicle_id,
+            command=command,
+            success=False,
+            reason=reason,
+        )
+        _LOGGER.info(
+            "EV stop blocked for %s: expected %s, found %s",
+            vehicle_id,
+            expected_owner_mode,
+            active_mode or "unowned",
+        )
+        return False
+    except Exception as err:
+        _LOGGER.debug("EV ownership stop guard failed for %s: %s", vehicle_id, err)
+        return False
+
+
+def _configured_charger_type(opts: Mapping[str, Any]) -> str:
+    """Return the configured charger backend used by dynamic EV actions."""
+    from ..const import (
+        CONF_GENERIC_CHARGER_ENABLED,
+        CONF_OCPP_ENABLED,
+        CONF_ZAPTEC_STANDALONE_ENABLED,
+        CONF_ZAPTEC_USERNAME,
+    )
+
+    if opts.get(CONF_ZAPTEC_STANDALONE_ENABLED) and opts.get(CONF_ZAPTEC_USERNAME):
+        return "zaptec"
+    if opts.get(CONF_GENERIC_CHARGER_ENABLED):
+        return "generic"
+    if opts.get(CONF_OCPP_ENABLED):
+        return "ocpp"
+    return "tesla"
+
+
+def _resolve_dynamic_loadpoint_id(
+    charger_type: str,
+    vehicle_vin: Optional[str],
+    params: Mapping[str, Any],
+    configured_vehicle_id: Optional[str] = None,
+) -> Optional[str]:
+    """Return the runtime loadpoint id for a configured charger backend."""
+    if vehicle_vin:
+        return vehicle_vin
+    if charger_type == "zaptec":
+        return "zaptec_standalone"
+    if charger_type == "generic":
+        return configured_vehicle_id or "generic_ev"
+    if charger_type == "ocpp":
+        charger_id = str(params.get("ocpp_charger_id") or "ocpp_charger")
+        return charger_id if charger_id.startswith("ocpp_") else f"ocpp_{charger_id}"
+    return vehicle_vin
+
+
+def _with_configured_charger_entities(
+    params: dict,
+    opts: Mapping[str, Any],
+    charger_type: str,
+) -> dict:
+    """Attach charger-specific entity ids to dynamic EV action params."""
+    if charger_type == "generic":
+        from ..const import (
+            CONF_GENERIC_CHARGER_AMPS_ENTITY,
+            CONF_GENERIC_CHARGER_STATUS_ENTITY,
+            CONF_GENERIC_CHARGER_SWITCH_ENTITY,
+        )
+
+        params["charger_switch_entity"] = params.get("charger_switch_entity") or opts.get(
+            CONF_GENERIC_CHARGER_SWITCH_ENTITY,
+            "",
+        )
+        params["charger_amps_entity"] = params.get("charger_amps_entity") or opts.get(
+            CONF_GENERIC_CHARGER_AMPS_ENTITY,
+            "",
+        )
+        params["charger_status_entity"] = params.get("charger_status_entity") or opts.get(
+            CONF_GENERIC_CHARGER_STATUS_ENTITY,
+            "",
+        )
+    elif charger_type == "ocpp":
+        params["ocpp_charger_id"] = params.get("ocpp_charger_id") or opts.get("ocpp_charger_id", "ocpp_charger")
+    return params
+
+
+def _build_dynamic_charging_params(
+    hass: "HomeAssistant",
+    domain: str,
+    config_entry: "ConfigEntry",
+    opts: Mapping[str, Any],
+    *,
+    owner_mode: str,
+    vehicle_vin: Optional[str] = None,
+    dynamic_mode: str = "battery_target",
+    no_grid_import: bool = False,
+    allow_ownership_takeover: bool = False,
+) -> dict:
+    """Build dynamic EV start params consistently for all coordinated modes."""
+    vehicle_charger_params = _get_vehicle_charger_params(
+        hass,
+        domain,
+        config_entry,
+        vehicle_vin,
+    )
+    configured_vehicle_id = vehicle_charger_params.pop("_configured_vehicle_id", None)
+    charger_type = vehicle_charger_params.get("charger_type") or _configured_charger_type(opts)
+
+    params = {
+        "dynamic_mode": dynamic_mode,
+        "owner_mode": owner_mode,
+        **vehicle_charger_params,
+        **_get_optimizer_battery_params(hass, config_entry),
+        "charger_type": charger_type,
+    }
+    if no_grid_import:
+        params["no_grid_import"] = True
+    if allow_ownership_takeover:
+        params["allow_ownership_takeover"] = True
+    params = _with_configured_charger_entities(params, opts, charger_type)
+    loadpoint_id = _resolve_dynamic_loadpoint_id(
+        charger_type,
+        vehicle_vin,
+        params,
+        configured_vehicle_id,
+    )
+    params["vehicle_vin"] = loadpoint_id
+    params["vehicle_id"] = loadpoint_id
+    return params
+
+
+def _build_dynamic_stop_params(
+    hass: "HomeAssistant",
+    domain: str,
+    config_entry: "ConfigEntry",
+    opts: Mapping[str, Any],
+    *,
+    vehicle_vin: Optional[str] = None,
+    stop_untracked: bool = False,
+    reason: Optional[str] = None,
+) -> dict:
+    """Build dynamic EV stop params consistently for all coordinated modes."""
+    vehicle_charger_params = _get_vehicle_charger_params(
+        hass,
+        domain,
+        config_entry,
+        vehicle_vin,
+    )
+    configured_vehicle_id = vehicle_charger_params.pop("_configured_vehicle_id", None)
+    charger_type = vehicle_charger_params.get("charger_type") or _configured_charger_type(opts)
+
+    params = {
+        **vehicle_charger_params,
+        "charger_type": charger_type,
+    }
+    if stop_untracked:
+        params["stop_untracked"] = True
+    if reason:
+        params["stop_reason"] = reason
+    params = _with_configured_charger_entities(params, opts, charger_type)
+    loadpoint_id = _resolve_dynamic_loadpoint_id(
+        charger_type,
+        vehicle_vin,
+        params,
+        configured_vehicle_id,
+    )
+    params["vehicle_id"] = loadpoint_id
+    params["vehicle_vin"] = loadpoint_id
+    return params
+
+
+async def _start_coordinated_charging(
+    hass: "HomeAssistant",
+    domain: str,
+    config_entry: "ConfigEntry",
+    *,
+    owner_mode: str,
+    reason: str,
+    vehicle_vin: Optional[str] = None,
+    no_grid_import: bool = False,
+    allow_ownership_takeover: bool = False,
+    cooldown_state: Optional[Any] = None,
+    log_prefix: str = "EV charging",
+) -> bool:
+    """Start charging through the configured dynamic charger action."""
+    opts = {**config_entry.data, **config_entry.options}
+    params = _build_dynamic_charging_params(
+        hass,
+        domain,
+        config_entry,
+        opts,
+        owner_mode=owner_mode,
+        vehicle_vin=vehicle_vin,
+        no_grid_import=no_grid_import,
+        allow_ownership_takeover=allow_ownership_takeover,
+    )
+    charger_type = params.get("charger_type", _configured_charger_type(opts))
+    if (
+        charger_type == "zaptec"
+        and cooldown_state is not None
+        and time.time() < getattr(cooldown_state, "start_cooldown_until", 0.0)
+    ):
+        remaining = getattr(cooldown_state, "start_cooldown_until", 0.0) - time.time()
+        _LOGGER.debug("Zaptec start in cooldown (%.0fs remaining)", remaining)
+        return False
+
+    from .actions import _action_start_ev_charging_dynamic
+
+    try:
+        success = await _action_start_ev_charging_dynamic(
+            hass,
+            config_entry,
+            params,
+            context=None,
+        )
+        if success and charger_type == "zaptec" and cooldown_state is not None:
+            cooldown_state.consecutive_start_failures = 0
+            cooldown_state.start_cooldown_until = 0.0
+            if hasattr(cooldown_state, "managed_by_powersync"):
+                cooldown_state.managed_by_powersync = False
+        return success
+    except Exception as err:
+        if charger_type == "zaptec" and cooldown_state is not None:
+            cooldown_state.consecutive_start_failures += 1
+            if cooldown_state.consecutive_start_failures >= 3:
+                cooldown_state.start_cooldown_until = time.time() + 300
+                _LOGGER.warning(
+                    "Zaptec start failed %d times, cooling down 5min: %s",
+                    cooldown_state.consecutive_start_failures,
+                    err,
+                )
+                return False
+        _LOGGER.error("%s: Error starting: %s", log_prefix, err)
+        return False
+
+
+async def _stop_coordinated_charging(
+    hass: "HomeAssistant",
+    domain: str,
+    config_entry: "ConfigEntry",
+    *,
+    expected_owner_mode: str,
+    reason: str,
+    vehicle_vin: Optional[str] = None,
+    command: str = "stop",
+    stop_untracked: bool = False,
+    cooldown_state: Optional[Any] = None,
+    log_prefix: str = "EV charging",
+) -> bool:
+    """Stop charging through the configured dynamic charger action."""
+    opts = {**config_entry.data, **config_entry.options}
+    params = _build_dynamic_stop_params(
+        hass,
+        domain,
+        config_entry,
+        opts,
+        vehicle_vin=vehicle_vin,
+        stop_untracked=stop_untracked,
+        reason=reason,
+    )
+    charger_type = params.get("charger_type", _configured_charger_type(opts))
+    loadpoint_id = params.get("vehicle_id") or params.get("vehicle_vin")
+    if charger_type == "zaptec":
+        if cooldown_state is not None and time.time() < getattr(cooldown_state, "stop_cooldown_until", 0.0):
+            remaining = getattr(cooldown_state, "stop_cooldown_until", 0.0) - time.time()
+            _LOGGER.debug("Zaptec stop in cooldown (%.0fs remaining)", remaining)
+            return False
+
+    if not _can_stop_loadpoint_for_mode(
+        hass,
+        config_entry,
+        loadpoint_id,
+        expected_owner_mode=expected_owner_mode,
+        command=command,
+        allow_unowned=stop_untracked,
+        allow_no_owner=not stop_untracked,
+    ):
+        return False
+
+    from .actions import _action_stop_ev_charging_dynamic
+
+    try:
+        success = await _action_stop_ev_charging_dynamic(hass, config_entry, params)
+        if success and charger_type == "zaptec" and cooldown_state is not None:
+            cooldown_state.consecutive_stop_failures = 0
+            cooldown_state.stop_cooldown_until = 0.0
+            if hasattr(cooldown_state, "managed_by_powersync"):
+                cooldown_state.managed_by_powersync = True
+        return success
+    except Exception as err:
+        if charger_type == "zaptec" and cooldown_state is not None:
+            cooldown_state.consecutive_stop_failures += 1
+            if cooldown_state.consecutive_stop_failures >= 3:
+                cooldown_state.stop_cooldown_until = time.time() + 300
+                _LOGGER.warning(
+                    "Zaptec stop failed %d times, cooling down 5min: %s",
+                    cooldown_state.consecutive_stop_failures,
+                    err,
+                )
+                return False
+        _LOGGER.error("%s: Error stopping: %s", log_prefix, err)
+        return False
+
+
 def _get_vehicle_charger_params(
     hass: "HomeAssistant",
     domain: str,
@@ -4745,21 +5404,43 @@ def _get_vehicle_charger_params(
             configs = stored_data.get("vehicle_charging_configs", [])
             for vc in configs:
                 if vehicle_vin and vc.get("vehicle_id") == vehicle_vin:
-                    return {
+                    params = {
+                        "_configured_vehicle_id": vc.get("vehicle_id"),
                         "min_charge_amps": vc.get("min_amps", 5),
                         "max_charge_amps": vc.get("max_amps", 32),
                         "voltage": vc.get("voltage", 230),
                         "phases": vc.get("phases", 1),
                     }
+                    for key in (
+                        "charger_type",
+                        "charger_switch_entity",
+                        "charger_amps_entity",
+                        "charger_status_entity",
+                        "ocpp_charger_id",
+                    ):
+                        if vc.get(key) is not None:
+                            params[key] = vc.get(key)
+                    return params
             # No VIN match — use first config
             if configs:
                 vc = configs[0]
-                return {
+                params = {
+                    "_configured_vehicle_id": vc.get("vehicle_id"),
                     "min_charge_amps": vc.get("min_amps", 5),
                     "max_charge_amps": vc.get("max_amps", 32),
                     "voltage": vc.get("voltage", 230),
                     "phases": vc.get("phases", 1),
                 }
+                for key in (
+                    "charger_type",
+                    "charger_switch_entity",
+                    "charger_amps_entity",
+                    "charger_status_entity",
+                    "ocpp_charger_id",
+                ):
+                    if vc.get(key) is not None:
+                        params[key] = vc.get(key)
+                return params
     except Exception:
         pass
 
@@ -4771,18 +5452,30 @@ def _get_vehicle_charger_params(
                 for vid, settings in exec_instance._settings.items():
                     if vid == vehicle_vin:
                         return {
+                            "_configured_vehicle_id": vid,
                             "min_charge_amps": settings.min_charge_amps,
                             "max_charge_amps": settings.max_charge_amps,
                             "voltage": settings.voltage,
                             "phases": settings.phases,
+                            "charger_type": settings.charger_type,
+                            "charger_switch_entity": settings.charger_switch_entity,
+                            "charger_amps_entity": settings.charger_amps_entity,
+                            "charger_status_entity": settings.charger_status_entity,
+                            "ocpp_charger_id": settings.ocpp_charger_id,
                         }
             # No VIN match — use first available settings
             for vid, settings in exec_instance._settings.items():
                 return {
+                    "_configured_vehicle_id": vid,
                     "min_charge_amps": settings.min_charge_amps,
                     "max_charge_amps": settings.max_charge_amps,
                     "voltage": settings.voltage,
                     "phases": settings.phases,
+                    "charger_type": settings.charger_type,
+                    "charger_switch_entity": settings.charger_switch_entity,
+                    "charger_amps_entity": settings.charger_amps_entity,
+                    "charger_status_entity": settings.charger_status_entity,
+                    "ocpp_charger_id": settings.ocpp_charger_id,
                 }
     except Exception:
         pass
@@ -5029,6 +5722,28 @@ class PriceLevelChargingExecutor:
         _LOGGER.warning(f"Could not find EV battery level from any source (VIN: {vehicle_vin})")
         return None
 
+    def _is_grid_charging_blocked_now(self) -> bool:
+        """Return True if grid charging is blocked right now due to demand window.
+
+        Honors the user's CONF_DEMAND_ALLOW_GRID_CHARGING override. Price-level
+        charging is always grid-sourced, so this gates the entire decision path.
+        """
+        from ..const import CONF_DEMAND_ALLOW_GRID_CHARGING
+        entry_data = self.hass.data.get(self._domain, {}).get(self.config_entry.entry_id, {})
+        dc_coord = entry_data.get("demand_charge_coordinator")
+        if not dc_coord or not dc_coord.enabled:
+            return False
+        allow_override = self.config_entry.options.get(
+            CONF_DEMAND_ALLOW_GRID_CHARGING,
+            self.config_entry.data.get(CONF_DEMAND_ALLOW_GRID_CHARGING, False),
+        )
+        if allow_override:
+            return False
+        try:
+            return dc_coord._is_in_peak_period(dt_util.now())
+        except Exception:
+            return False
+
     def _get_or_create_vehicle_state(self, vehicle_vin: str) -> PriceLevelChargingState:
         """Get or create per-vehicle charging state."""
         if vehicle_vin not in self._vehicle_states:
@@ -5048,136 +5763,36 @@ class PriceLevelChargingExecutor:
             reason: Reason for starting charging
             vehicle_vin: Optional VIN for specific vehicle. If None, uses default.
         """
-        # Zaptec standalone path — use Cloud API directly
-        from ..const import CONF_ZAPTEC_STANDALONE_ENABLED, CONF_ZAPTEC_USERNAME, CONF_ZAPTEC_CHARGER_ID, CONF_OCPP_ENABLED, CONF_ZAPTEC_INSTALLATION_ID_CLOUD, CONF_GENERIC_CHARGER_ENABLED, CONF_GENERIC_CHARGER_SWITCH_ENTITY, CONF_GENERIC_CHARGER_AMPS_ENTITY
-        opts = {**self.config_entry.data, **self.config_entry.options}
-        if opts.get(CONF_ZAPTEC_STANDALONE_ENABLED) and opts.get(CONF_ZAPTEC_USERNAME):
-            entry_data = self.hass.data.get(self._domain, {}).get(self.config_entry.entry_id, {})
-            client = entry_data.get("zaptec_client")
-            charger_id = opts.get(CONF_ZAPTEC_CHARGER_ID, "")
-            if client and charger_id:
-                # Circuit breaker — skip if in cooldown
-                zaptec_state = self._get_or_create_vehicle_state("zaptec_standalone")
-                if time.time() < zaptec_state.start_cooldown_until:
-                    _LOGGER.debug("Zaptec start in cooldown (%.0fs remaining)", zaptec_state.start_cooldown_until - time.time())
-                    return False
-                try:
-                    # State-aware start: check charger operation mode
-                    cached_state = entry_data.get("zaptec_cached_state", {})
-                    charger_mode = cached_state.get("charger_operation_mode", "")
-
-                    if charger_mode == "charging":
-                        _LOGGER.info("Zaptec already charging, updating state")
-                    elif charger_mode == "connected_waiting":
-                        # Car just plugged in — Resume (507) won't work.
-                        # Set MaxCurrent to allow car to start drawing.
-                        installation_id = opts.get(CONF_ZAPTEC_INSTALLATION_ID_CLOUD, "")
-                        if installation_id:
-                            await client.set_installation_current(installation_id, 16)
-                            _LOGGER.info("Zaptec in connected_waiting: set MaxCurrent=16A to allow charging")
-                        else:
-                            _LOGGER.warning("Zaptec in connected_waiting but no installation_id configured")
-                            return False
-                    else:
-                        # Paused or unknown — send Resume as before
-                        await client.resume_charging(charger_id)
-
-                    # Update state
-                    if vehicle_vin:
-                        state = self._get_or_create_vehicle_state(vehicle_vin)
-                        state.is_charging = True
-                        state.charging_mode = mode
-                        state.last_decision = "started"
-                        state.last_decision_reason = reason
-                    else:
-                        self._state.is_charging = True
-                        self._state.charging_mode = mode
-                        self._state.last_decision = "started"
-                        self._state.last_decision_reason = reason
-                    zaptec_state.consecutive_start_failures = 0
-                    zaptec_state.start_cooldown_until = 0.0
-                    zaptec_state.managed_by_powersync = False
-                    _LOGGER.info(f"Price-level charging: Started Zaptec ({mode}) - {reason}")
-
-                    # Track charging session
-                    try:
-                        from .ev_charging_session import get_session_manager
-                        sm = get_session_manager()
-                        if sm:
-                            vid = vehicle_vin or "zaptec_standalone"
-                            if vid not in sm.active_sessions:
-                                await sm.start_session(vid, mode)
-                            entry_data = self.hass.data.get(self._domain, {}).get(self.config_entry.entry_id, {})
-                            entry_data["zaptec_charging_session_vid"] = vid
-                    except Exception as sess_err:
-                        _LOGGER.debug("Session tracking start failed: %s", sess_err)
-
-                    return True
-                except Exception as e:
-                    zaptec_state.consecutive_start_failures += 1
-                    if zaptec_state.consecutive_start_failures >= 3:
-                        zaptec_state.start_cooldown_until = time.time() + 300
-                        _LOGGER.warning("Zaptec start failed %d times, cooling down 5min: %s", zaptec_state.consecutive_start_failures, e)
-                    else:
-                        _LOGGER.error(f"Price-level charging: Zaptec start failed: {e}")
-                    return False
-
-        # Determine charger type
-        if opts.get(CONF_GENERIC_CHARGER_ENABLED):
-            charger_type = "generic"
-        elif opts.get(CONF_OCPP_ENABLED):
-            charger_type = "ocpp"
-        else:
-            charger_type = "tesla"
-
-        from .actions import _action_start_ev_charging_dynamic
-
-        charger_params = _get_vehicle_charger_params(
-            self.hass, self._domain, self.config_entry, vehicle_vin
+        success = await _start_coordinated_charging(
+            self.hass,
+            self._domain,
+            self.config_entry,
+            owner_mode=mode,
+            reason=reason,
+            vehicle_vin=vehicle_vin,
+            no_grid_import=self._get_settings().get("no_grid_import", False),
+            allow_ownership_takeover=True,
+            cooldown_state=self._get_or_create_vehicle_state("zaptec_standalone"),
+            log_prefix="Price-level charging",
         )
-        params = {
-            "vehicle_vin": vehicle_vin,
-            "dynamic_mode": "battery_target",
-            **charger_params,
-            **_get_optimizer_battery_params(self.hass, self.config_entry),
-            "charger_type": charger_type,
-            "no_grid_import": self._get_settings().get("no_grid_import", False),
-        }
-        if charger_type == "generic":
-            params["charger_switch_entity"] = opts.get(CONF_GENERIC_CHARGER_SWITCH_ENTITY, "")
-            params["charger_amps_entity"] = opts.get(CONF_GENERIC_CHARGER_AMPS_ENTITY, "")
-        elif charger_type == "ocpp":
-            params["ocpp_charger_id"] = opts.get("ocpp_charger_id", "ocpp_charger")
-
-        try:
-            success = await _action_start_ev_charging_dynamic(
-                self.hass, self.config_entry, params, context=None
-            )
-
-            if success:
-                # Update per-vehicle state if VIN provided, otherwise legacy state
-                if vehicle_vin:
-                    state = self._get_or_create_vehicle_state(vehicle_vin)
-                    state.is_charging = True
-                    state.charging_mode = mode
-                    state.last_decision = "started"
-                    state.last_decision_reason = reason
-                    _LOGGER.info(f"Price-level charging: Started ({mode}) for VIN {vehicle_vin} - {reason}")
-                else:
-                    self._state.is_charging = True
-                    self._state.charging_mode = mode
-                    self._state.last_decision = "started"
-                    self._state.last_decision_reason = reason
-                    _LOGGER.info(f"Price-level charging: Started ({mode}) - {reason}")
-                # Note: Notifications are sent by _action_start_ev_charging_dynamic
-                return True
-            else:
-                _LOGGER.warning(f"Price-level charging: Failed to start - {reason}")
-                return False
-
-        except Exception as e:
-            _LOGGER.error(f"Price-level charging: Error starting: {e}")
+        if not success:
+            _LOGGER.warning(f"Price-level charging: Failed to start - {reason}")
             return False
+
+        if vehicle_vin:
+            state = self._get_or_create_vehicle_state(vehicle_vin)
+            state.is_charging = True
+            state.charging_mode = mode
+            state.last_decision = "started"
+            state.last_decision_reason = reason
+            _LOGGER.info(f"Price-level charging: Started ({mode}) for VIN {vehicle_vin} - {reason}")
+        else:
+            self._state.is_charging = True
+            self._state.charging_mode = mode
+            self._state.last_decision = "started"
+            self._state.last_decision_reason = reason
+            _LOGGER.info(f"Price-level charging: Started ({mode}) - {reason}")
+        return True
 
     async def _stop_charging(self, reason: str, vehicle_vin: Optional[str] = None) -> bool:
         """Stop EV charging.
@@ -5186,112 +5801,40 @@ class PriceLevelChargingExecutor:
             reason: Reason for stopping charging
             vehicle_vin: Optional VIN for specific vehicle. If None, uses default.
         """
-        # Zaptec standalone path — use Cloud API directly
-        from ..const import CONF_ZAPTEC_STANDALONE_ENABLED, CONF_ZAPTEC_USERNAME, CONF_ZAPTEC_CHARGER_ID
-        opts = {**self.config_entry.data, **self.config_entry.options}
-        if opts.get(CONF_ZAPTEC_STANDALONE_ENABLED) and opts.get(CONF_ZAPTEC_USERNAME):
-            entry_data = self.hass.data.get(self._domain, {}).get(self.config_entry.entry_id, {})
-            client = entry_data.get("zaptec_client")
-            charger_id = opts.get(CONF_ZAPTEC_CHARGER_ID, "")
-            if client and charger_id:
-                # Circuit breaker — skip if in cooldown
-                zaptec_state = self._get_or_create_vehicle_state("zaptec_standalone")
-                if time.time() < zaptec_state.stop_cooldown_until:
-                    _LOGGER.debug("Zaptec stop in cooldown (%.0fs remaining)", zaptec_state.stop_cooldown_until - time.time())
-                    return False
+        expected_owner_mode = "price_level"
+        if vehicle_vin:
+            expected_owner_mode = self._get_or_create_vehicle_state(vehicle_vin).charging_mode or "price_level"
+        elif self._state.charging_mode:
+            expected_owner_mode = self._state.charging_mode
 
-                # Skip stop command if charger is already not charging
-                # (e.g. connected_waiting after set_installation_current failed to start)
-                cached_state = entry_data.get("zaptec_cached_state", {})
-                charger_mode = cached_state.get("charger_operation_mode", "")
-                if charger_mode in ("connected_waiting", "disconnected", ""):
-                    _LOGGER.info(
-                        f"Zaptec already in {charger_mode or 'unknown'} mode, "
-                        f"skipping stop command — updating state only"
-                    )
-                    if vehicle_vin:
-                        state = self._get_or_create_vehicle_state(vehicle_vin)
-                        state.is_charging = False
-                        state.charging_mode = ""
-                        state.last_decision = "stopped"
-                        state.last_decision_reason = reason
-                    else:
-                        self._state.is_charging = False
-                        self._state.charging_mode = ""
-                        self._state.last_decision = "stopped"
-                        self._state.last_decision_reason = reason
-                    zaptec_state.managed_by_powersync = True
-                    return True
-
-                try:
-                    await client.stop_charging(charger_id)
-                    if vehicle_vin:
-                        state = self._get_or_create_vehicle_state(vehicle_vin)
-                        state.is_charging = False
-                        state.charging_mode = ""
-                        state.last_decision = "stopped"
-                        state.last_decision_reason = reason
-                    else:
-                        self._state.is_charging = False
-                        self._state.charging_mode = ""
-                        self._state.last_decision = "stopped"
-                        self._state.last_decision_reason = reason
-                    zaptec_state.consecutive_stop_failures = 0
-                    zaptec_state.stop_cooldown_until = 0.0
-                    zaptec_state.managed_by_powersync = True
-                    _LOGGER.info(f"Price-level charging: Stopped Zaptec - {reason}")
-
-                    # End charging session
-                    try:
-                        from .ev_charging_session import get_session_manager
-                        sm = get_session_manager()
-                        if sm:
-                            vid = vehicle_vin or "zaptec_standalone"
-                            if vid in sm.active_sessions:
-                                await sm.end_session(vid, reason)
-                            entry_data = self.hass.data.get(self._domain, {}).get(self.config_entry.entry_id, {})
-                            entry_data["zaptec_charging_session_vid"] = None
-                    except Exception as sess_err:
-                        _LOGGER.debug("Session tracking end failed: %s", sess_err)
-
-                    return True
-                except Exception as e:
-                    zaptec_state.consecutive_stop_failures += 1
-                    if zaptec_state.consecutive_stop_failures >= 3:
-                        zaptec_state.stop_cooldown_until = time.time() + 300
-                        _LOGGER.warning("Zaptec stop failed %d times, cooling down 5min: %s", zaptec_state.consecutive_stop_failures, e)
-                    else:
-                        _LOGGER.error(f"Price-level charging: Zaptec stop failed: {e}")
-                    return False
-
-        # Tesla path
-        from .actions import _action_stop_ev_charging_dynamic
-
-        params = {"vehicle_id": vehicle_vin}
-
-        try:
-            await _action_stop_ev_charging_dynamic(self.hass, self.config_entry, params)
-
-            # Update per-vehicle state if VIN provided, otherwise legacy state
-            if vehicle_vin:
-                state = self._get_or_create_vehicle_state(vehicle_vin)
-                state.is_charging = False
-                state.charging_mode = ""
-                state.last_decision = "stopped"
-                state.last_decision_reason = reason
-                _LOGGER.info(f"Price-level charging: Stopped for VIN {vehicle_vin} - {reason}")
-            else:
-                self._state.is_charging = False
-                self._state.charging_mode = ""
-                self._state.last_decision = "stopped"
-                self._state.last_decision_reason = reason
-                _LOGGER.info(f"Price-level charging: Stopped - {reason}")
-            # Note: Notifications are sent by _action_stop_ev_charging_dynamic
-            return True
-
-        except Exception as e:
-            _LOGGER.error(f"Price-level charging: Error stopping: {e}")
+        success = await _stop_coordinated_charging(
+            self.hass,
+            self._domain,
+            self.config_entry,
+            expected_owner_mode=expected_owner_mode,
+            reason=reason,
+            vehicle_vin=vehicle_vin,
+            stop_untracked=True,
+            cooldown_state=self._get_or_create_vehicle_state("zaptec_standalone"),
+            log_prefix="Price-level charging",
+        )
+        if not success:
             return False
+
+        if vehicle_vin:
+            state = self._get_or_create_vehicle_state(vehicle_vin)
+            state.is_charging = False
+            state.charging_mode = ""
+            state.last_decision = "stopped"
+            state.last_decision_reason = reason
+            _LOGGER.info(f"Price-level charging: Stopped for VIN {vehicle_vin} - {reason}")
+        else:
+            self._state.is_charging = False
+            self._state.charging_mode = ""
+            self._state.last_decision = "stopped"
+            self._state.last_decision_reason = reason
+            _LOGGER.info(f"Price-level charging: Stopped - {reason}")
+        return True
 
     async def get_charging_decision(self, current_price_cents: Optional[float]) -> Tuple[bool, str, str]:
         """
@@ -5315,6 +5858,15 @@ class PriceLevelChargingExecutor:
             self._state.last_decision = "disabled"
             self._state.last_decision_reason = "Price-level charging is disabled"
             return False, "Price-level charging is disabled", ""
+
+        # Block grid charging during demand-charge peak windows.
+        # Price-level charging is always grid-sourced. Manual/automation-initiated
+        # charging (HA service calls, switch presses) bypasses this path.
+        if self._is_grid_charging_blocked_now():
+            reason = "In demand peak period - grid charging blocked (toggle 'Allow grid charging during demand windows' to override)"
+            self._state.last_decision = "waiting"
+            self._state.last_decision_reason = reason
+            return False, reason, ""
 
         # Check if vehicle is at home
         location = await get_ev_location(self.hass, self.config_entry)
@@ -5340,12 +5892,12 @@ class PriceLevelChargingExecutor:
                 self._state.last_decision_reason = reason
                 return False, reason, ""
 
-        # Get current EV SoC
+        # Get current EV SoC. SOC may be unavailable for chargers without a
+        # paired vehicle integration (e.g. generic OCPP / Sigen EVAC). In that
+        # case we still allow price-driven charging: opportunity price first,
+        # then a conservative recovery-price fallback.
         ev_soc = await self._get_ev_soc()
-        if ev_soc is None:
-            self._state.last_decision = "waiting"
-            self._state.last_decision_reason = "Could not get EV state of charge"
-            return False, "Could not get EV state of charge", ""
+        soc_known = ev_soc is not None
 
         # Get price
         if current_price_cents is None:
@@ -5357,8 +5909,8 @@ class PriceLevelChargingExecutor:
         recovery_price = settings.get("recovery_price_cents", 30)
         opportunity_price = settings.get("opportunity_price_cents", 10)
 
-        # Recovery mode: Below recovery_soc, charge if price is low enough
-        if ev_soc < recovery_soc:
+        # Recovery mode: Below recovery_soc, charge if price is low enough.
+        if soc_known and ev_soc < recovery_soc:
             if current_price_cents <= recovery_price:
                 reason = f"Recovery: EV {ev_soc}% < {recovery_soc}%, price {current_price_cents:.1f}c <= {recovery_price}c"
                 self._state.last_decision = "wants_charge"
@@ -5370,18 +5922,27 @@ class PriceLevelChargingExecutor:
                 self._state.last_decision_reason = reason
                 return False, reason, ""
 
-        # Opportunity mode: Above recovery_soc, only charge if price is very low
+        # Opportunity mode: Above recovery_soc OR SOC unknown, gate on the
+        # user's cheapest-price threshold first.
+        soc_label = f"{ev_soc}%" if soc_known else "unknown"
+        if current_price_cents <= opportunity_price:
+            reason = f"Opportunity: EV {soc_label}, price {current_price_cents:.1f}c <= {opportunity_price}c"
+            self._state.last_decision = "wants_charge"
+            self._state.last_decision_reason = reason
+            return True, reason, "price_level_opportunity"
+        elif not soc_known and current_price_cents <= recovery_price:
+            reason = f"Recovery fallback: EV SOC unknown, price {current_price_cents:.1f}c <= {recovery_price}c"
+            self._state.last_decision = "wants_charge"
+            self._state.last_decision_reason = reason
+            return True, reason, "price_level_recovery"
         else:
-            if current_price_cents <= opportunity_price:
-                reason = f"Opportunity: EV {ev_soc}%, price {current_price_cents:.1f}c <= {opportunity_price}c"
-                self._state.last_decision = "wants_charge"
-                self._state.last_decision_reason = reason
-                return True, reason, "price_level_opportunity"
+            if soc_known:
+                reason = f"EV {soc_label} >= {recovery_soc}%, price {current_price_cents:.1f}c > {opportunity_price}c"
             else:
-                reason = f"EV {ev_soc}% >= {recovery_soc}%, price {current_price_cents:.1f}c > {opportunity_price}c"
-                self._state.last_decision = "waiting"
-                self._state.last_decision_reason = reason
-                return False, reason, ""
+                reason = f"EV SOC unknown, price {current_price_cents:.1f}c > recovery price {recovery_price}c"
+            self._state.last_decision = "waiting"
+            self._state.last_decision_reason = reason
+            return False, reason, ""
 
     async def evaluate(self, current_price_cents: Optional[float]) -> None:
         """
@@ -5429,6 +5990,15 @@ class PriceLevelChargingExecutor:
             vehicle_state.last_decision_reason = "Price-level charging is disabled"
             return False, "Price-level charging is disabled", ""
 
+        # Block grid charging during demand-charge peak windows.
+        # Price-level charging is always grid-sourced. Manual/automation-initiated
+        # charging (HA service calls, switch presses) bypasses this path.
+        if self._is_grid_charging_blocked_now():
+            reason = "In demand peak period - grid charging blocked (toggle 'Allow grid charging during demand windows' to override)"
+            vehicle_state.last_decision = "waiting"
+            vehicle_state.last_decision_reason = reason
+            return False, reason, ""
+
         # Check if vehicle is at home
         location = await get_ev_location(self.hass, self.config_entry, vehicle_vin)
         if location not in ("home", "unknown"):
@@ -5453,12 +6023,12 @@ class PriceLevelChargingExecutor:
                 vehicle_state.last_decision_reason = reason
                 return False, reason, ""
 
-        # Get current EV SoC
+        # Get current EV SoC. May be unavailable for chargers without a paired
+        # vehicle integration (generic OCPP, Sigen EVAC, etc). When unknown,
+        # still allow price-driven charging: opportunity price first, then a
+        # conservative recovery-price fallback.
         ev_soc = await self._get_ev_soc(vehicle_vin)
-        if ev_soc is None:
-            vehicle_state.last_decision = "waiting"
-            vehicle_state.last_decision_reason = "Could not get EV state of charge"
-            return False, "Could not get EV state of charge", ""
+        soc_known = ev_soc is not None
 
         # Get price
         if current_price_cents is None:
@@ -5470,8 +6040,8 @@ class PriceLevelChargingExecutor:
         recovery_price = settings.get("recovery_price_cents", 30)
         opportunity_price = settings.get("opportunity_price_cents", 10)
 
-        # Recovery mode: Below recovery_soc, charge if price is low enough
-        if ev_soc < recovery_soc:
+        # Recovery mode: Below recovery_soc, charge if price is low enough.
+        if soc_known and ev_soc < recovery_soc:
             if current_price_cents <= recovery_price:
                 reason = f"Recovery: EV {ev_soc}% < {recovery_soc}%, price {current_price_cents:.1f}c <= {recovery_price}c"
                 vehicle_state.last_decision = "wants_charge"
@@ -5483,18 +6053,27 @@ class PriceLevelChargingExecutor:
                 vehicle_state.last_decision_reason = reason
                 return False, reason, ""
 
-        # Opportunity mode: Above recovery_soc, only charge if price is very low
+        # Opportunity mode: Above recovery_soc OR SOC unknown, gate on the
+        # user's cheapest-price threshold first.
+        soc_label = f"{ev_soc}%" if soc_known else "unknown"
+        if current_price_cents <= opportunity_price:
+            reason = f"Opportunity: EV {soc_label}, price {current_price_cents:.1f}c <= {opportunity_price}c"
+            vehicle_state.last_decision = "wants_charge"
+            vehicle_state.last_decision_reason = reason
+            return True, reason, "price_level_opportunity"
+        elif not soc_known and current_price_cents <= recovery_price:
+            reason = f"Recovery fallback: EV SOC unknown, price {current_price_cents:.1f}c <= {recovery_price}c"
+            vehicle_state.last_decision = "wants_charge"
+            vehicle_state.last_decision_reason = reason
+            return True, reason, "price_level_recovery"
         else:
-            if current_price_cents <= opportunity_price:
-                reason = f"Opportunity: EV {ev_soc}%, price {current_price_cents:.1f}c <= {opportunity_price}c"
-                vehicle_state.last_decision = "wants_charge"
-                vehicle_state.last_decision_reason = reason
-                return True, reason, "price_level_opportunity"
+            if soc_known:
+                reason = f"EV {soc_label} >= {recovery_soc}%, price {current_price_cents:.1f}c > {opportunity_price}c"
             else:
-                reason = f"EV {ev_soc}% >= {recovery_soc}%, price {current_price_cents:.1f}c > {opportunity_price}c"
-                vehicle_state.last_decision = "waiting"
-                vehicle_state.last_decision_reason = reason
-                return False, reason, ""
+                reason = f"EV SOC unknown, price {current_price_cents:.1f}c > recovery price {recovery_price}c"
+            vehicle_state.last_decision = "waiting"
+            vehicle_state.last_decision_reason = reason
+            return False, reason, ""
 
     async def evaluate_all_vehicles(
         self,
@@ -5531,20 +6110,19 @@ class PriceLevelChargingExecutor:
                 # Release charger when price-level charging is disabled
                 if not should_charge and reason == "Price-level charging is disabled":
                     if vehicle_state.managed_by_powersync:
-                        from ..const import CONF_ZAPTEC_CHARGER_ID, CONF_ZAPTEC_INSTALLATION_ID_CLOUD
-                        entry_data = self.hass.data.get(self._domain, {}).get(self.config_entry.entry_id, {})
-                        client = entry_data.get("zaptec_client")
-                        charger_id = opts.get(CONF_ZAPTEC_CHARGER_ID, "")
-                        if client and charger_id:
-                            try:
-                                await client.resume_charging(charger_id)
-                            except Exception:
-                                try:
-                                    installation_id = opts.get(CONF_ZAPTEC_INSTALLATION_ID_CLOUD, "")
-                                    if installation_id:
-                                        await client.set_installation_current(installation_id, 16)
-                                except Exception:
-                                    pass
+                        from .actions import _action_start_ev_charging
+
+                        await _action_start_ev_charging(
+                            self.hass,
+                            self.config_entry,
+                            {
+                                "charger_type": "zaptec",
+                                "vehicle_id": "zaptec_standalone",
+                                "vehicle_vin": "zaptec_standalone",
+                                "amps": 16,
+                            },
+                            context=None,
+                        )
                         vehicle_state.managed_by_powersync = False
                         vehicle_state.is_charging = False
                         _LOGGER.info("Price-level disabled: released Zaptec charger control")
@@ -5561,11 +6139,16 @@ class PriceLevelChargingExecutor:
                 return results
 
             # Also check OCPP
-            from ..const import CONF_OCPP_ENABLED
+            from ..const import CONF_OCPP_ENABLED, CONF_GENERIC_CHARGER_ENABLED
             if opts.get(CONF_OCPP_ENABLED):
                 decision = await self.get_charging_decision(current_price_cents)
                 should_charge, reason, mode = decision
-                pseudo_vin = "ocpp_charger"
+                # vehicle_id of the form "ocpp_<charger_id>" so price-level
+                # initiated sessions share an identifier with the OCPP poll's
+                # session tracker — prevents double-counted sessions when both
+                # see the same charging cycle.
+                ocpp_charger_id = opts.get("ocpp_charger_id", "ocpp_charger")
+                pseudo_vin = f"ocpp_{ocpp_charger_id}"
                 results[pseudo_vin] = decision
 
                 vehicle_state = self._get_or_create_vehicle_state(pseudo_vin)
@@ -5574,9 +6157,31 @@ class PriceLevelChargingExecutor:
                 )
 
                 if should_charge and not vehicle_state.is_charging:
-                    await self._start_charging(mode, reason)
+                    await self._start_charging(mode, reason, vehicle_vin=pseudo_vin)
                 elif not should_charge and vehicle_state.is_charging:
-                    await self._stop_charging(reason)
+                    await self._stop_charging(reason, vehicle_vin=pseudo_vin)
+                else:
+                    vehicle_state.last_decision = "charging" if vehicle_state.is_charging else "waiting"
+                    vehicle_state.last_decision_reason = reason
+
+                return results
+
+            # Also check Generic Charger (OCPP via lbbrhzn/ocpp or any switch-based charger)
+            if opts.get(CONF_GENERIC_CHARGER_ENABLED):
+                decision = await self.get_charging_decision(current_price_cents)
+                should_charge, reason, mode = decision
+                pseudo_vin = "generic_ev"
+                results[pseudo_vin] = decision
+
+                vehicle_state = self._get_or_create_vehicle_state(pseudo_vin)
+                _LOGGER.debug(
+                    f"Generic Charger decision: should_charge={should_charge}, reason={reason}"
+                )
+
+                if should_charge and not vehicle_state.is_charging:
+                    await self._start_charging(mode, reason, vehicle_vin=pseudo_vin)
+                elif not should_charge and vehicle_state.is_charging:
+                    await self._stop_charging(reason, vehicle_vin=pseudo_vin)
                 else:
                     vehicle_state.last_decision = "charging" if vehicle_state.is_charging else "waiting"
                     vehicle_state.last_decision_reason = reason
@@ -5605,8 +6210,43 @@ class PriceLevelChargingExecutor:
             # Take action per vehicle
             if should_charge and not vehicle_state.is_charging:
                 await self._start_charging(mode, reason, vehicle_vin=vin)
-            elif not should_charge and vehicle_state.is_charging:
-                await self._stop_charging(reason, vehicle_vin=vin)
+            elif not should_charge:
+                # Stop only if this executor started the session. External
+                # charging and other PowerSync modes (solar surplus, scheduled,
+                # auto-schedule) must not be treated as price-level ownership.
+                stop_due_to_state = vehicle_state.is_charging
+
+                if stop_due_to_state:
+                    await self._stop_charging(reason, vehicle_vin=vin)
+                else:
+                    active_dynamic_mode = _get_active_dynamic_ev_mode(self.hass, self.config_entry, vin)
+                    if active_dynamic_mode:
+                        vehicle_state.last_decision = "waiting"
+                        vehicle_state.last_decision_reason = (
+                            f"{reason}; {active_dynamic_mode} mode owns the active charging session"
+                        )
+                        _LOGGER.info(
+                            f"Price-level charging leaving {name} ({vin}) alone: "
+                            f"{active_dynamic_mode} mode owns the active session"
+                        )
+                    elif reason == "Price-level charging is disabled":
+                        vehicle_state.last_decision = "disabled"
+                        vehicle_state.last_decision_reason = reason
+                    else:
+                        # Price-level remains enabled, so it may enforce the
+                        # user's high-price policy against Tesla auto-start.
+                        external_charge = await is_ev_actively_charging(
+                            self.hass, self.config_entry, vehicle_vin=vin
+                        )
+                        if external_charge:
+                            _LOGGER.info(
+                                f"{name} ({vin}) charging without an active price-level "
+                                f"session — sending stop: {reason}"
+                            )
+                            await self._stop_charging(reason, vehicle_vin=vin)
+                        else:
+                            vehicle_state.last_decision = "waiting"
+                            vehicle_state.last_decision_reason = reason
             else:
                 vehicle_state.last_decision = "charging" if vehicle_state.is_charging else "waiting"
                 vehicle_state.last_decision_reason = reason
@@ -5730,7 +6370,7 @@ class ScheduledChargingExecutor:
     def _is_in_time_window(self, start_time_str: str, end_time_str: str) -> bool:
         """Check if current time is within the scheduled window."""
         try:
-            now = datetime.now()
+            now = dt_util.now()  # HA tz; container UTC would mis-trigger schedule windows
             current_time = now.time()
 
             # Parse start and end times
@@ -5754,130 +6394,43 @@ class ScheduledChargingExecutor:
 
     async def _start_charging(self, reason: str) -> bool:
         """Start EV charging."""
-        # Zaptec standalone path
-        from ..const import CONF_ZAPTEC_STANDALONE_ENABLED, CONF_ZAPTEC_USERNAME, CONF_ZAPTEC_CHARGER_ID, CONF_OCPP_ENABLED, CONF_GENERIC_CHARGER_ENABLED, CONF_GENERIC_CHARGER_SWITCH_ENTITY, CONF_GENERIC_CHARGER_AMPS_ENTITY
-        opts = {**self.config_entry.data, **self.config_entry.options}
-        if opts.get(CONF_ZAPTEC_STANDALONE_ENABLED) and opts.get(CONF_ZAPTEC_USERNAME):
-            entry_data = self.hass.data.get(self._domain, {}).get(self.config_entry.entry_id, {})
-            client = entry_data.get("zaptec_client")
-            charger_id = opts.get(CONF_ZAPTEC_CHARGER_ID, "")
-            if client and charger_id:
-                try:
-                    await client.resume_charging(charger_id)
-                    self._state.is_charging = True
-                    self._state.last_decision = "started"
-                    self._state.last_decision_reason = reason
-                    _LOGGER.info(f"Scheduled charging: Started Zaptec - {reason}")
-
-                    # Track charging session
-                    try:
-                        from .ev_charging_session import get_session_manager
-                        sm = get_session_manager()
-                        if sm and "zaptec_standalone" not in sm.active_sessions:
-                            await sm.start_session("zaptec_standalone", "scheduled")
-                            entry_data["zaptec_charging_session_vid"] = "zaptec_standalone"
-                    except Exception as sess_err:
-                        _LOGGER.debug("Session tracking start failed: %s", sess_err)
-
-                    return True
-                except Exception as e:
-                    _LOGGER.error(f"Scheduled charging: Zaptec start failed: {e}")
-                    return False
-
-        # Determine charger type
-        if opts.get(CONF_GENERIC_CHARGER_ENABLED):
-            charger_type = "generic"
-        elif opts.get(CONF_OCPP_ENABLED):
-            charger_type = "ocpp"
-        else:
-            charger_type = "tesla"
-
-        from .actions import _action_start_ev_charging_dynamic
-
-        charger_params = _get_vehicle_charger_params(
-            self.hass, self._domain, self.config_entry
+        success = await _start_coordinated_charging(
+            self.hass,
+            self._domain,
+            self.config_entry,
+            owner_mode="scheduled",
+            reason=reason,
+            allow_ownership_takeover=True,
+            log_prefix="Scheduled charging",
         )
-        params = {
-            "vehicle_vin": None,
-            "dynamic_mode": "battery_target",
-            **charger_params,
-            **_get_optimizer_battery_params(self.hass, self.config_entry),
-            "charger_type": charger_type,
-        }
-        if charger_type == "generic":
-            params["charger_switch_entity"] = opts.get(CONF_GENERIC_CHARGER_SWITCH_ENTITY, "")
-            params["charger_amps_entity"] = opts.get(CONF_GENERIC_CHARGER_AMPS_ENTITY, "")
-        elif charger_type == "ocpp":
-            params["ocpp_charger_id"] = opts.get("ocpp_charger_id", "ocpp_charger")
-
-        try:
-            success = await _action_start_ev_charging_dynamic(
-                self.hass, self.config_entry, params, context=None
-            )
-
-            if success:
-                self._state.is_charging = True
-                self._state.last_decision = "started"
-                self._state.last_decision_reason = reason
-                _LOGGER.info(f"Scheduled charging: Started - {reason}")
-                # Note: Notifications are sent by _action_start_ev_charging_dynamic
-                return True
-            else:
-                _LOGGER.warning(f"Scheduled charging: Failed to start - {reason}")
-                return False
-
-        except Exception as e:
-            _LOGGER.error(f"Scheduled charging: Error starting: {e}")
+        if not success:
+            _LOGGER.warning(f"Scheduled charging: Failed to start - {reason}")
             return False
+
+        self._state.is_charging = True
+        self._state.last_decision = "started"
+        self._state.last_decision_reason = reason
+        _LOGGER.info(f"Scheduled charging: Started - {reason}")
+        return True
 
     async def _stop_charging(self, reason: str) -> bool:
         """Stop EV charging."""
-        # Zaptec standalone path
-        from ..const import CONF_ZAPTEC_STANDALONE_ENABLED, CONF_ZAPTEC_USERNAME, CONF_ZAPTEC_CHARGER_ID
-        opts = {**self.config_entry.data, **self.config_entry.options}
-        if opts.get(CONF_ZAPTEC_STANDALONE_ENABLED) and opts.get(CONF_ZAPTEC_USERNAME):
-            entry_data = self.hass.data.get(self._domain, {}).get(self.config_entry.entry_id, {})
-            client = entry_data.get("zaptec_client")
-            charger_id = opts.get(CONF_ZAPTEC_CHARGER_ID, "")
-            if client and charger_id:
-                try:
-                    await client.stop_charging(charger_id)
-                    self._state.is_charging = False
-                    self._state.last_decision = "stopped"
-                    self._state.last_decision_reason = reason
-                    _LOGGER.info(f"Scheduled charging: Stopped Zaptec - {reason}")
-
-                    # End charging session
-                    try:
-                        from .ev_charging_session import get_session_manager
-                        sm = get_session_manager()
-                        if sm and "zaptec_standalone" in sm.active_sessions:
-                            await sm.end_session("zaptec_standalone", reason)
-                            entry_data["zaptec_charging_session_vid"] = None
-                    except Exception as sess_err:
-                        _LOGGER.debug("Session tracking end failed: %s", sess_err)
-
-                    return True
-                except Exception as e:
-                    _LOGGER.error(f"Scheduled charging: Zaptec stop failed: {e}")
-                    return False
-
-        from .actions import _action_stop_ev_charging_dynamic
-
-        params = {"vehicle_id": None}
-
-        try:
-            await _action_stop_ev_charging_dynamic(self.hass, self.config_entry, params)
-            self._state.is_charging = False
-            self._state.last_decision = "stopped"
-            self._state.last_decision_reason = reason
-            _LOGGER.info(f"Scheduled charging: Stopped - {reason}")
-            # Note: Notifications are sent by _action_stop_ev_charging_dynamic
-            return True
-
-        except Exception as e:
-            _LOGGER.error(f"Scheduled charging: Error stopping: {e}")
+        success = await _stop_coordinated_charging(
+            self.hass,
+            self._domain,
+            self.config_entry,
+            expected_owner_mode="scheduled",
+            reason=reason,
+            log_prefix="Scheduled charging",
+        )
+        if not success:
             return False
+
+        self._state.is_charging = False
+        self._state.last_decision = "stopped"
+        self._state.last_decision_reason = reason
+        _LOGGER.info(f"Scheduled charging: Stopped - {reason}")
+        return True
 
     async def get_charging_decision(self, current_price_cents: Optional[float]) -> Tuple[bool, str, str]:
         """
@@ -6003,6 +6556,13 @@ class ChargingModeDecision:
     source: str  # e.g., "price_level_recovery", "scheduled", "smart_schedule"
 
 
+def _coordinator_owner_mode(modes: List[str]) -> str:
+    """Return the owner mode used by the combined EV charging coordinator."""
+    if "Scheduled" in modes:
+        return "scheduled"
+    return modes[0].lower().replace("-", "_") if modes else "ev_coordinator"
+
+
 class EVChargingModeCoordinator:
     """
     Coordinates multiple EV charging modes using OR logic.
@@ -6026,144 +6586,44 @@ class EVChargingModeCoordinator:
 
     async def _start_charging(self, modes: List[str], reason: str) -> bool:
         """Start EV charging."""
-        # Zaptec standalone path — use Cloud API directly
-        from ..const import CONF_ZAPTEC_STANDALONE_ENABLED, CONF_ZAPTEC_USERNAME, CONF_ZAPTEC_CHARGER_ID, CONF_OCPP_ENABLED, CONF_GENERIC_CHARGER_ENABLED, CONF_GENERIC_CHARGER_SWITCH_ENTITY, CONF_GENERIC_CHARGER_AMPS_ENTITY
-        opts = {**self.config_entry.data, **self.config_entry.options}
-        if opts.get(CONF_ZAPTEC_STANDALONE_ENABLED) and opts.get(CONF_ZAPTEC_USERNAME):
-            entry_data = self.hass.data.get(self._domain, {}).get(self.config_entry.entry_id, {})
-            client = entry_data.get("zaptec_client")
-            charger_id = opts.get(CONF_ZAPTEC_CHARGER_ID, "")
-            if client and charger_id:
-                try:
-                    await client.resume_charging(charger_id)
-                    self._is_charging = True
-                    self._active_modes = modes
-                    self._last_reason = reason
-                    _LOGGER.info(f"EV Coordinator: Started Zaptec charging - modes: {modes}, reason: {reason}")
-
-                    # Track charging session
-                    try:
-                        from .ev_charging_session import get_session_manager
-                        sm = get_session_manager()
-                        if sm and "zaptec_standalone" not in sm.active_sessions:
-                            await sm.start_session("zaptec_standalone", modes[0] if modes else "ev_coordinator")
-                            entry_data["zaptec_charging_session_vid"] = "zaptec_standalone"
-                    except Exception as sess_err:
-                        _LOGGER.debug("Session tracking start failed: %s", sess_err)
-
-                    return True
-                except Exception as e:
-                    _LOGGER.error(f"EV Coordinator: Zaptec start charging failed: {e}")
-                    return False
-
-        # Determine charger type
-        if opts.get(CONF_GENERIC_CHARGER_ENABLED):
-            charger_type = "generic"
-        elif opts.get(CONF_OCPP_ENABLED):
-            charger_type = "ocpp"
-        else:
-            charger_type = "tesla"
-
-        from .actions import _action_start_ev_charging_dynamic
-
-        charger_params = _get_vehicle_charger_params(
-            self.hass, self._domain, self.config_entry
+        owner_mode = _coordinator_owner_mode(modes)
+        success = await _start_coordinated_charging(
+            self.hass,
+            self._domain,
+            self.config_entry,
+            owner_mode=owner_mode,
+            reason=reason,
+            allow_ownership_takeover=True,
+            log_prefix="EV Coordinator",
         )
-        params = {
-            "vehicle_vin": None,
-            "dynamic_mode": "battery_target",
-            **charger_params,
-            **_get_optimizer_battery_params(self.hass, self.config_entry),
-            "charger_type": charger_type,
-        }
-        if charger_type == "generic":
-            params["charger_switch_entity"] = opts.get(CONF_GENERIC_CHARGER_SWITCH_ENTITY, "")
-            params["charger_amps_entity"] = opts.get(CONF_GENERIC_CHARGER_AMPS_ENTITY, "")
-        elif charger_type == "ocpp":
-            params["ocpp_charger_id"] = opts.get("ocpp_charger_id", "ocpp_charger")
-
-        try:
-            success = await _action_start_ev_charging_dynamic(
-                self.hass, self.config_entry, params, context=None
-            )
-
-            if success:
-                self._is_charging = True
-                self._active_modes = modes
-                self._last_reason = reason
-                _LOGGER.info(f"EV Coordinator: Started charging - modes: {modes}, reason: {reason}")
-                # Note: Notifications are sent by _action_start_ev_charging_dynamic
-                return True
-            else:
-                _LOGGER.warning(f"EV Coordinator: Failed to start charging")
-                return False
-
-        except Exception as e:
-            _LOGGER.error(f"EV Coordinator: Error starting charging: {e}")
+        if not success:
+            _LOGGER.warning("EV Coordinator: Failed to start charging")
             return False
+
+        self._is_charging = True
+        self._active_modes = modes
+        self._last_reason = reason
+        _LOGGER.info(f"EV Coordinator: Started charging - modes: {modes}, reason: {reason}")
+        return True
 
     async def _stop_charging(self, reason: str) -> bool:
         """Stop EV charging."""
-        # Zaptec standalone path — use Cloud API directly
-        from ..const import CONF_ZAPTEC_STANDALONE_ENABLED, CONF_ZAPTEC_USERNAME, CONF_ZAPTEC_CHARGER_ID
-        opts = {**self.config_entry.data, **self.config_entry.options}
-        if opts.get(CONF_ZAPTEC_STANDALONE_ENABLED) and opts.get(CONF_ZAPTEC_USERNAME):
-            entry_data = self.hass.data.get(self._domain, {}).get(self.config_entry.entry_id, {})
-            client = entry_data.get("zaptec_client")
-            charger_id = opts.get(CONF_ZAPTEC_CHARGER_ID, "")
-            if client and charger_id:
-                # Skip stop command if charger is already not charging
-                cached_state = entry_data.get("zaptec_cached_state", {})
-                charger_mode = cached_state.get("charger_operation_mode", "")
-                if charger_mode in ("connected_waiting", "disconnected", ""):
-                    _LOGGER.info(
-                        f"EV Coordinator: Zaptec already in {charger_mode or 'unknown'} mode, "
-                        f"skipping stop command"
-                    )
-                    self._is_charging = False
-                    self._active_modes = []
-                    self._last_reason = reason
-                    return True
-
-                try:
-                    await client.stop_charging(charger_id)
-                    self._is_charging = False
-                    self._active_modes = []
-                    self._last_reason = reason
-                    _LOGGER.info(f"EV Coordinator: Stopped Zaptec charging - {reason}")
-
-                    # End charging session
-                    try:
-                        from .ev_charging_session import get_session_manager
-                        sm = get_session_manager()
-                        if sm and "zaptec_standalone" in sm.active_sessions:
-                            await sm.end_session("zaptec_standalone", reason)
-                            entry_data["zaptec_charging_session_vid"] = None
-                    except Exception as sess_err:
-                        _LOGGER.debug("Session tracking end failed: %s", sess_err)
-
-                    return True
-                except Exception as e:
-                    _LOGGER.error(f"EV Coordinator: Zaptec stop charging failed: {e}")
-                    return False
-
-        # Tesla path
-        from .actions import _action_stop_ev_charging_dynamic
-
-        params = {"vehicle_id": None}
-
-        try:
-            await _action_stop_ev_charging_dynamic(self.hass, self.config_entry, params)
-            self._is_charging = False
-            self._active_modes = []
-            self._last_reason = reason
-            _LOGGER.info(f"EV Coordinator: Stopped charging - {reason}")
-            # Note: Notifications are sent by _action_stop_ev_charging_dynamic
-            return True
-
-        except Exception as e:
-            _LOGGER.error(f"EV Coordinator: Error stopping charging: {e}")
+        success = await _stop_coordinated_charging(
+            self.hass,
+            self._domain,
+            self.config_entry,
+            expected_owner_mode=_coordinator_owner_mode(self._active_modes),
+            reason=reason,
+            log_prefix="EV Coordinator",
+        )
+        if not success:
             return False
+
+        self._is_charging = False
+        self._active_modes = []
+        self._last_reason = reason
+        _LOGGER.info(f"EV Coordinator: Stopped charging - {reason}")
+        return True
 
     async def evaluate(
         self,

@@ -433,6 +433,7 @@ def convert_amber_prices_to_sigenergy(
     forecast_type: str = "predicted",
     current_actual_interval: Optional[dict] = None,
     nem_region: Optional[str] = None,
+    timezone_name: Optional[str] = None,
 ) -> list[dict]:
     """Convert Amber price data to Sigenergy timeRange format.
 
@@ -446,6 +447,8 @@ def convert_amber_prices_to_sigenergy(
         current_actual_interval: Dict with 'general' and 'feedIn' ActualInterval data (optional)
                                 If provided, uses this for the current 30-min period instead of averaging
         nem_region: NEM region code (NSW1, VIC1, QLD1, SA1, TAS1) for timezone selection
+        timezone_name: Explicit IANA timezone (e.g. "Europe/London"). When provided,
+                       overrides nem_region — required for non-NEM providers like Octopus UK.
 
     Returns:
         List of {timeRange: "HH:MM-HH:MM", price: float} in cents
@@ -487,17 +490,28 @@ def convert_amber_prices_to_sigenergy(
         "TasNetworks": "TAS1",
     }
 
-    # Determine NEM region - priority: explicit nem_region > auto-detect from network
-    detected_region = nem_region
-    if not detected_region:
-        # Try to auto-detect from Amber price data (network field in site info)
-        # For now, default to Sydney - caller should pass nem_region if available
-        detected_region = None
+    # Resolve timezone — explicit override wins (required for non-NEM providers
+    # like Octopus UK; without this, UK timestamps land in AEST and the slot
+    # keys are inverted ~10 hours).
+    if timezone_name:
+        try:
+            detected_tz = ZoneInfo(timezone_name)
+            _LOGGER.debug(f"Using explicit timezone: {timezone_name}")
+        except Exception as err:
+            _LOGGER.warning(
+                "Invalid timezone_name %r (%s); falling back to NEM region",
+                timezone_name, err,
+            )
+            timezone_name = None
 
-    # Get timezone from NEM region, default to Sydney
-    tz_name = NEM_REGION_TIMEZONES.get(detected_region, "Australia/Sydney")
-    detected_tz = ZoneInfo(tz_name)
-    _LOGGER.debug(f"Using timezone: {detected_tz} (NEM region: {detected_region or 'default Sydney'})")
+    if not timezone_name:
+        detected_region = nem_region or None
+        tz_name = NEM_REGION_TIMEZONES.get(detected_region, "Australia/Sydney")
+        detected_tz = ZoneInfo(tz_name)
+        _LOGGER.debug(
+            f"Using timezone: {detected_tz} "
+            f"(NEM region: {detected_region or 'default Sydney'})"
+        )
 
     # Calculate current 30-min slot for ActualInterval injection (using local time)
     now = datetime.now(detected_tz)

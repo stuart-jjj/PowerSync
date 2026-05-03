@@ -423,11 +423,22 @@ class AlphaESSController(InverterController):
         the house and charges the battery; only grid export is blocked.
         `home_load_w` / `rated_capacity_w` are accepted for interface
         compatibility but unused (zero-export is always the action).
+
+        Active dispatch (0x0880 block) overrides 0x0800 on Smile firmware —
+        release it first so the export limit is actually evaluated.
         """
         try:
             if not await self.connect():
                 _LOGGER.error("Cannot curtail: failed to connect to AlphaESS")
                 return False
+
+            # Active dispatch (force_charge/discharge) overrides the export-limit
+            # register on Smile firmware — release it before writing 0x0800 or
+            # the inverter will ignore the curtailment entirely.
+            if self._dispatch_active:
+                _LOGGER.info("AlphaESS curtail: releasing active dispatch before setting export limit")
+                await self._write_holding_registers(self.REG_DISPATCH_START, [0])
+                self._dispatch_active = False
 
             # Store previous value before overwriting (skip if already curtailed)
             if self._original_export_percent is None:

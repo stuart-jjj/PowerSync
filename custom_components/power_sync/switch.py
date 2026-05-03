@@ -10,16 +10,21 @@ from homeassistant.components.switch import SwitchEntity, SwitchEntityDescriptio
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_time_interval
 
 from .const import (
     DOMAIN,
     CONF_AUTO_SYNC_ENABLED,
+    CONF_AUTO_UPDATE_ENABLED,
+    CONF_AUTO_UPDATE_TIME,
+    DEFAULT_AUTO_UPDATE_TIME,
     CONF_ELECTRICITY_PROVIDER,
     CONF_MONITORING_MODE,
     CONF_POWERWALL_LOCAL_PAIRED,
     SWITCH_TYPE_AUTO_SYNC,
+    SWITCH_TYPE_AUTO_UPDATE,
     SWITCH_TYPE_FORCE_DISCHARGE,
     SWITCH_TYPE_FORCE_CHARGE,
     SWITCH_TYPE_MONITORING_MODE,
@@ -32,6 +37,7 @@ from .const import (
     SENSOR_FAMILY_LP_OPTIMIZER,
     SENSOR_FAMILY_BATTERY,
     SENSOR_FAMILY_CONTROLS,
+    TESLA_SITE_INFO_CONTROL_MAX_AGE_SECONDS,
 )
 
 # Providers that use TOU schedule syncing (Amber, Octopus, Flow Power)
@@ -65,6 +71,18 @@ async def async_setup_entry(
     _LOGGER.info(f"🔋 Switch setup: is_tesla={is_tesla}, provider={electricity_provider}, has_tou_sync={has_tou_sync}")
 
     entities = []
+
+    entities.append(
+        AutoUpdateSwitch(
+            hass=hass,
+            entry=entry,
+            description=SwitchEntityDescription(
+                key=SWITCH_TYPE_AUTO_UPDATE,
+                name="Auto-Update PowerSync",
+                icon="mdi:update",
+            ),
+        ),
+    )
 
     # Monitoring mode switch — always available for all battery systems
     entities.append(
@@ -277,11 +295,85 @@ class AutoSyncSwitch(SwitchEntity):
         return attrs
 
 
+class AutoUpdateSwitch(SwitchEntity):
+    """Switch to enable/disable scheduled PowerSync HACS updates."""
+
+    _attr_has_entity_name = True
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry: ConfigEntry,
+        description: SwitchEntityDescription,
+    ) -> None:
+        """Initialize the switch."""
+        self.hass = hass
+        self.entity_description = description
+        self._entry = entry
+        self._attr_unique_id = f"{entry.entry_id}_{description.key}"
+        self._attr_suggested_object_id = f"power_sync_{description.key}"
+        self._attr_is_on = entry.options.get(
+            CONF_AUTO_UPDATE_ENABLED,
+            entry.data.get(CONF_AUTO_UPDATE_ENABLED, False),
+        )
+
+    @property
+    def device_info(self):
+        return family_device_info(self._entry.entry_id, SENSOR_FAMILY_CONTROLS)
+
+    @property
+    def is_on(self) -> bool:
+        """Return True if scheduled auto-update is enabled."""
+        return self._attr_is_on
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        """Turn scheduled auto-update on."""
+        _LOGGER.info("Enabling scheduled PowerSync auto-update")
+        self._attr_is_on = True
+        new_options = {**self._entry.options}
+        new_options[CONF_AUTO_UPDATE_ENABLED] = True
+        new_options.setdefault(CONF_AUTO_UPDATE_TIME, DEFAULT_AUTO_UPDATE_TIME)
+        self.hass.config_entries.async_update_entry(
+            self._entry,
+            options=new_options,
+        )
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        """Turn scheduled auto-update off."""
+        _LOGGER.info("Disabling scheduled PowerSync auto-update")
+        self._attr_is_on = False
+        new_options = {**self._entry.options}
+        new_options[CONF_AUTO_UPDATE_ENABLED] = False
+        self.hass.config_entries.async_update_entry(
+            self._entry,
+            options=new_options,
+        )
+        self.async_write_ha_state()
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return additional attributes."""
+        entry_data = self.hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {})
+        return {
+            "scheduled_time": self._entry.options.get(
+                CONF_AUTO_UPDATE_TIME,
+                self._entry.data.get(CONF_AUTO_UPDATE_TIME, DEFAULT_AUTO_UPDATE_TIME),
+            ),
+            "last_run": entry_data.get("auto_update_last_run"),
+            "last_result": entry_data.get("auto_update_last_result"),
+            "last_update_entity": entry_data.get("auto_update_last_entity"),
+            "last_check_at": entry_data.get("auto_update_last_check_at"),
+            "last_check_decision": entry_data.get("auto_update_last_check_decision"),
+        }
+
+
 class ForceDischargeSwitch(SwitchEntity):
     """Switch to manually force battery discharge mode."""
 
     _attr_has_entity_name = True
-    _attr_entity_category = EntityCategory.CONFIG
+    # Primary user control — belongs in the device card's Controls section.
 
     def __init__(
         self,
@@ -422,7 +514,7 @@ class ForceChargeSwitch(SwitchEntity):
     """Switch to manually force battery charge mode."""
 
     _attr_has_entity_name = True
-    _attr_entity_category = EntityCategory.CONFIG
+    # Primary user control — belongs in the device card's Controls section.
 
     def __init__(
         self,
@@ -676,8 +768,27 @@ class ProfitMaxModeSwitch(SwitchEntity):
         self._attr_name = "Profit Maximisation Mode"
         self._attr_icon = "mdi:cash-plus"
         from .const import CONF_PROFIT_MAX_ENABLED
-        enabled = entry.options.get(CONF_PROFIT_MAX_ENABLED, False) or entry.data.get(CONF_PROFIT_MAX_ENABLED, False)
+        enabled = entry.options.get(
+            CONF_PROFIT_MAX_ENABLED,
+            entry.data.get(CONF_PROFIT_MAX_ENABLED, False),
+        )
         self._attr_is_on = bool(enabled)
+
+    async def async_added_to_hass(self) -> None:
+        """Register for optimizer setting changes made outside this switch."""
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass,
+                f"{DOMAIN}_{self._entry.entry_id}_profit_max_mode",
+                self._handle_profit_max_update,
+            )
+        )
+
+    @callback
+    def _handle_profit_max_update(self, enabled: bool) -> None:
+        """Update the HA switch state after API-driven changes."""
+        self._attr_is_on = bool(enabled)
+        self.async_write_ha_state()
 
     @property
     def device_info(self):
@@ -686,7 +797,7 @@ class ProfitMaxModeSwitch(SwitchEntity):
     @property
     def is_on(self) -> bool:
         """Return True if profit maximisation mode is active."""
-        return self._attr_is_on
+        return self._coordinator.profit_max_mode
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Enable profit maximisation mode."""
@@ -705,6 +816,7 @@ class _TeslaSiteSwitchBase(SwitchEntity):
     """Base for Tesla Energy Site switches that call coordinator methods."""
 
     _attr_has_entity_name = True
+    _attr_should_poll = True
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry, key: str, name: str, icon: str) -> None:
         self.hass = hass
@@ -721,6 +833,21 @@ class _TeslaSiteSwitchBase(SwitchEntity):
 
     def _tesla_coord(self):
         return self.hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {}).get("tesla_coordinator")
+
+    async def async_update(self) -> None:
+        """Refresh Tesla site_info often enough for controls changed elsewhere."""
+        coord = self._tesla_coord()
+        if coord is None:
+            return
+        try:
+            await coord.async_get_site_info(
+                max_age=TESLA_SITE_INFO_CONTROL_MAX_AGE_SECONDS,
+            )
+        except Exception:
+            _LOGGER.debug(
+                "Could not refresh Tesla site_info for switch entity",
+                exc_info=True,
+            )
 
 
 class GridChargingSwitch(_TeslaSiteSwitchBase):

@@ -130,9 +130,10 @@ class PowerSyncChart extends HTMLElement {
     for (const tick of ticks) {
       const y = yScale(tick);
       svg += `<line x1="${pad.left}" y1="${y}" x2="${W - pad.right}" y2="${y}" stroke="var(--divider-color, #e0e0e0)" stroke-width="0.5" stroke-dasharray="4,3"/>`;
-      const label = config.yUnit === '¢'
-        ? tick.toFixed(tick === Math.round(tick) ? 0 : 1) + '¢'
-        : tick.toFixed(tick === Math.round(tick) ? 0 : 1) + ' ' + (config.yUnit || '');
+      const unit = config.yUnit || '';
+      const compactUnit = config.yUnitCompact || ['c', 'p', 'ct', 'c/kWh', 'p/kWh', 'ct/kWh'].includes(unit);
+      const label = tick.toFixed(tick === Math.round(tick) ? 0 : 1)
+        + (unit ? `${compactUnit ? '' : ' '}${unit}` : '');
       svg += `<text x="${pad.left - 8}" y="${y + 4}" text-anchor="end" font-size="11" fill="var(--secondary-text-color, #888)">${label}</text>`;
     }
 
@@ -479,9 +480,18 @@ class PowerSyncStrategy {
         continue;
       }
       // Registered as Lovelace resource (installed via HACS, just not loaded yet)
-      const inResources = lovelaceResources.some(r =>
-        r.url && r.url.includes(c.element.replace(/-/g, ''))
-      );
+      const resourceNames = [
+        c.element,
+        c.hacs,
+        c.element.replace(/-/g, ''),
+        c.hacs?.replace(/-/g, ''),
+      ]
+        .filter(Boolean)
+        .map(name => name.toLowerCase());
+      const inResources = lovelaceResources.some(r => {
+        const url = String(r.url || '').toLowerCase();
+        return resourceNames.some(name => url.includes(name));
+      });
       loaded[c.element] = inResources;
     }
 
@@ -512,6 +522,40 @@ class PowerSyncStrategy {
 
     // Shorthand: resolve then check
     const hasE = (name) => has(e(name));
+
+    const findSensor = (nameOrNames) => {
+      const names = (Array.isArray(nameOrNames) ? nameOrNames : [nameOrNames])
+        .map((name) => String(name || '').trim())
+        .filter(Boolean);
+      if (names.length === 0) return null;
+
+      const directMatches = [];
+      for (const name of names) {
+        for (const id of [`sensor.power_sync_${name}`, `sensor.${name}`]) {
+          if (hass.states[id]) directMatches.push(id);
+        }
+      }
+
+      const tails = names.map((name) => `_${name}`);
+      const suffixMatches = Object.keys(hass.states || {}).filter((id) => {
+        if (!id.startsWith('sensor.')) return false;
+        const objectId = id.slice('sensor.'.length);
+        return names.includes(objectId) || tails.some((tail) => objectId.endsWith(tail));
+      });
+      const candidates = Array.from(new Set([...directMatches, ...suffixMatches]));
+      if (candidates.length === 0) return null;
+
+      const available = candidates.filter(has);
+      const pool = available.length > 0 ? available : candidates;
+      return pool.sort((a, b) => {
+        const score = (id) => {
+          if (id.startsWith('sensor.power_sync_')) return 0;
+          if (id.includes('goodwe') || id.includes('foxess')) return 1;
+          return 2;
+        };
+        return score(a) - score(b) || a.length - b.length || a.localeCompare(b);
+      })[0];
+    };
 
     // Domain-aware entity finder used by the Tesla Energy Site controls section.
     // The new Tesla entities use _attr_has_entity_name=True, so HA composes
@@ -571,7 +615,7 @@ class PowerSyncStrategy {
 
     // --- Left Column: Price Gauges ---
     if (hasE('current_import_price')) {
-      left.push(_priceGauges(e));
+      left.push(_priceGauges(e, hass));
     }
 
     // --- Left Column: Battery Controls (requires button-card) ---
@@ -599,6 +643,8 @@ class PowerSyncStrategy {
       if (_hasTesla) {
         const teslaSection = _teslaEnergySiteControls(findEntity, findVppSwitches);
         if (teslaSection) left.push(teslaSection);
+        const powerwallStatus = _powerwallStatus(e, hasE);
+        if (powerwallStatus) left.push(powerwallStatus);
       }
     }
 
@@ -609,19 +655,19 @@ class PowerSyncStrategy {
 
     // --- Center Column: Power Flow ---
     if (hasTeslaFlow && hasE('solar_power')) {
-      center.push(_teslaStyleFlow(e, hass));
+      center.push(_teslaStyleFlow(e, hass, findSensor));
     } else if (hasFlowCard && hasE('solar_power')) {
       center.push(_powerFlow(e));
     }
 
     // --- Right Column: Price Chart (Amber/Octopus 24h) — requires apexcharts ---
     if (hasApex && hasE('current_import_price')) {
-      right.push(_priceChart(e));
+      right.push(_priceChart(e, hass));
     }
 
     // --- Right Column: TOU Schedule (uses PowerSyncChart) ---
     if (hasE('tariff_schedule')) {
-      right.push(_touSchedule(e));
+      right.push(_touSchedule(e, hass));
     }
 
     // --- Center Column: LP Forecast Summary ---
@@ -663,7 +709,7 @@ class PowerSyncStrategy {
 
     // --- Center Column: LP Price Chart (48h) ---
     if (hasE('lp_import_price_forecast')) {
-      center.push(_lpPriceChart(e));
+      center.push(_lpPriceChart(e, hass));
     }
 
     // --- Right Column: LP Solar & Load Chart (48h) ---
@@ -683,9 +729,10 @@ class PowerSyncStrategy {
       left.push(_acInverterControls(e));
     }
 
-    // --- Left Column: FoxESS Sensors ---
-    if (hasE('pv1_power')) {
-      left.push(_foxessSensors(e));
+    // --- Left Column: PV String Sensors ---
+    {
+      const pvStringCard = _pvStringSensors(e, hass, findSensor);
+      if (pvStringCard) left.push(pvStringCard);
     }
 
     // --- Left Column: Battery Health (requires button-card) ---
@@ -754,7 +801,9 @@ class PowerSyncStrategy {
     // Gated on the binary_sensor.powerwall_local_paired entity so the card
     // stays hidden until the user completes the pairing flow in the app.
     if (hasE('powerwall_local_paired')) {
-      left.push(_powerwallLocalControl(e));
+      left.push(_powerwallLocalControl(e, hasE));
+      const health = _powerwallHealth(hass);
+      if (health) left.push(health);
     }
 
     // --- Left Column: Flow Power ---
@@ -812,45 +861,136 @@ class PowerSyncStrategy {
 
 // ─── Helpers ─────────────────────────────────────────────────
 
+function _hassCurrency(hass) {
+  return (hass?.config?.currency || 'AUD').toUpperCase();
+}
+
+function _minorCurrencyUnit(currency) {
+  const code = (currency || 'AUD').toUpperCase();
+  if (code === 'GBP') return 'p';
+  if (code === 'EUR') return 'ct';
+  return 'c';
+}
+
+function _currencyFromUnit(unit) {
+  const match = String(unit || '').match(/^([A-Z]{3})(?:\/|$)/);
+  return match ? match[1] : null;
+}
+
+function _priceMeta(hass, entityId) {
+  const attrs = hass?.states?.[entityId]?.attributes || {};
+  const currency = (attrs.currency || _currencyFromUnit(attrs.unit_of_measurement) || _hassCurrency(hass)).toUpperCase();
+  return {
+    currency,
+    priceUnit: attrs.price_unit || `${currency}/kWh`,
+    minorPriceUnit: attrs.minor_price_unit || `${_minorCurrencyUnit(currency)}/kWh`,
+    minorUnit: _minorCurrencyUnit(currency),
+  };
+}
+
+function _formatMajorPriceAsMinor(value, unit) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return '';
+  const display = Number(value) * 100;
+  const decimals = Math.abs(display) >= 100 ? 0 : 1;
+  return `${display.toFixed(decimals)}${unit}`;
+}
+
 // ─── Section Builders ────────────────────────────────────────
 
-function _priceGauges(e) {
+function _svgArcGaugeCard({ entityId, label, unit, min, max, thresholds, multiplier = 1, decimals = 1 }) {
+  // thresholds: { green, yellow, red } in display units (after multiplier).
+  // Color picked is the one whose threshold is the highest <= displayed value.
+  return {
+    type: 'custom:button-card',
+    entity: entityId,
+    show_icon: false,
+    show_state: false,
+    show_name: false,
+    show_label: false,
+    custom_fields: {
+      gauge: `[[[
+        const raw = parseFloat(entity?.state);
+        if (isNaN(raw)) {
+          return '<div style="text-align:center;padding-top:30px;color:#888;">—</div>';
+        }
+        const value = raw * ${multiplier};
+        const min = ${min}, max = ${max};
+        const pct = Math.max(0, Math.min(1, (value - min) / (max - min)));
+        const t = ${JSON.stringify(thresholds)};
+        const stops = [['#f44336', t.red], ['#ff9800', t.yellow], ['#4caf50', t.green]]
+          .filter(([_, th]) => th !== undefined && value >= th)
+          .sort((a, b) => b[1] - a[1]);
+        const color = stops.length > 0 ? stops[0][0] : '#9e9e9e';
+        const r = 50;
+        const circ = Math.PI * r;
+        const fill = pct * circ;
+        const decimals = ${decimals};
+        const display = Math.abs(value) >= 100 ? value.toFixed(0) : value.toFixed(decimals);
+        return \`
+          <div style="display:flex;flex-direction:column;align-items:center;">
+            <div style="font-size:0.85em;color:var(--secondary-text-color);margin-bottom:2px;">${label}</div>
+            <svg viewBox="0 0 120 75" style="width:100%;max-width:140px;">
+              <path d="M 10,60 A 50,50 0 0,1 110,60" fill="none" stroke="var(--divider-color, #444)" stroke-width="10" stroke-linecap="round"/>
+              <path d="M 10,60 A 50,50 0 0,1 110,60" fill="none" stroke="\${color}" stroke-width="10" stroke-linecap="round" stroke-dasharray="\${fill} \${circ}"/>
+              <text x="60" y="54" text-anchor="middle" font-size="20" font-weight="600" fill="var(--primary-text-color)">\${display}</text>
+              <text x="60" y="68" text-anchor="middle" font-size="9" fill="var(--secondary-text-color)">${unit}</text>
+            </svg>
+          </div>
+        \`;
+      ]]]`,
+    },
+    styles: {
+      card: [
+        { 'border-radius': '12px' },
+        { padding: '8px' },
+        { height: '110px' },
+      ],
+      grid: [
+        { 'grid-template-areas': '"gauge"' },
+      ],
+      custom_fields: {
+        gauge: [
+          { 'grid-area': 'gauge' },
+          { 'align-self': 'center' },
+        ],
+      },
+    },
+  };
+}
+
+function _priceGauges(e, hass) {
+  const importMeta = _priceMeta(hass, e('current_import_price'));
+  const exportMeta = _priceMeta(hass, e('current_export_price'));
   return {
     type: 'horizontal-stack',
     cards: [
-      {
-        type: 'gauge',
-        entity: e('current_import_price'),
-        name: 'Import',
-        unit: '$/kWh',
+      _svgArcGaugeCard({
+        entityId: e('current_import_price'),
+        label: 'Import Price',
+        unit: importMeta.minorPriceUnit,
         min: 0,
-        max: 0.6,
-        needle: true,
-        severity: { green: 0, yellow: 0.25, red: 0.4 },
-        card_mod: { style: 'ha-card { height: 110px; }' },
-      },
-      {
-        type: 'gauge',
-        entity: e('current_export_price'),
-        name: 'Export Earnings',
-        unit: '$/kWh',
-        min: -0.1,
-        max: 0.3,
-        needle: true,
-        severity: { red: -0.1, yellow: 0, green: 0.05 },
-        card_mod: { style: 'ha-card { height: 110px; }' },
-      },
-      {
-        type: 'gauge',
-        entity: e('battery_level'),
-        name: 'Battery',
+        max: 60,
+        thresholds: { green: 0, yellow: 25, red: 40 },
+        multiplier: 100,
+      }),
+      _svgArcGaugeCard({
+        entityId: e('current_export_price'),
+        label: 'Export Price',
+        unit: exportMeta.minorPriceUnit,
+        min: -10,
+        max: 30,
+        thresholds: { green: 5, yellow: 0, red: -10 },
+        multiplier: 100,
+      }),
+      _svgArcGaugeCard({
+        entityId: e('battery_level'),
+        label: 'Battery',
         unit: '%',
         min: 0,
         max: 100,
-        needle: true,
-        severity: { red: 0, yellow: 30, green: 60 },
-        card_mod: { style: 'ha-card { height: 110px; }' },
-      },
+        thresholds: { green: 60, yellow: 30, red: 0 },
+        decimals: 0,
+      }),
     ],
   };
 }
@@ -893,14 +1033,25 @@ function _batteryControls(hass) {
     type: 'vertical-stack',
     cards: [
       // Power slider — only shown when the ForcePowerNumber entity exists.
-      // Uses entities card (not tile) so the number entity's native slider renders.
+      // Tile card with numeric-input feature gives a clean inline slider.
       // 0 kW = auto (uses inverter rated/BMS max at dispatch).
       ...(hasForcePower ? [{
-        type: 'entities',
-        entities: [{
-          entity: 'number.power_sync_force_power_kw',
-          name: 'Force Power (0 = Max)',
-        }],
+        type: 'tile',
+        entity: 'number.power_sync_force_power_kw',
+        name: 'Force Power (0 = Max)',
+        icon: 'mdi:lightning-bolt',
+        features: [{ type: 'numeric-input', mode: 'slider' }],
+        card_mod: {
+          style: `
+            ha-card {
+              background: rgba(0, 180, 220, 0.07) !important;
+              border: 1px solid rgba(0, 180, 220, 0.18) !important;
+              border-radius: 12px !important;
+              box-shadow: none !important;
+              --tile-color: rgb(0, 180, 220);
+            }
+          `,
+        },
       }] : []),
       {
         square: false,
@@ -974,8 +1125,46 @@ function _batteryControls(hass) {
       {
         square: false,
         type: 'grid',
-        columns: 1,
+        columns: 2,
         cards: [
+          {
+            type: 'custom:button-card',
+            name: 'Hold SoC',
+            icon: 'mdi:battery-lock',
+            styles: {
+              card: [
+                { height: '40px' },
+                { 'border-radius': '18px' },
+                { padding: '4px 12px' },
+                { background: 'rgba(var(--rgb-blue-color, 33, 150, 243), 0.1)' },
+              ],
+              grid: [
+                { 'grid-template-areas': '"i n"' },
+                { 'grid-template-columns': '24px 1fr' },
+              ],
+              icon: [
+                { 'grid-area': 'i' },
+                { width: '24px' },
+                { color: 'var(--blue-color, #2196F3)' },
+              ],
+              name: [
+                { 'grid-area': 'n' },
+                { 'text-align': 'left' },
+                { 'padding-left': '8px' },
+                { 'font-weight': '600' },
+              ],
+            },
+            tap_action: {
+              action: 'call-service',
+              service: 'power_sync.hold_battery_soc',
+              data: {
+                duration: "[[[ return (states['select.power_sync_force_discharge_duration'] ? states['select.power_sync_force_discharge_duration'].state : '60'); ]]]",
+              },
+              confirmation: {
+                text: "[[[ const dur = states['select.power_sync_force_discharge_duration']?.state ?? '60'; return 'Hold battery at current SoC for ' + dur + ' min?'; ]]]",
+              },
+            },
+          },
           {
             type: 'custom:button-card',
             name: 'Restore',
@@ -1143,10 +1332,22 @@ function _teslaEnergySiteControls(findEntity, findVppSwitches) {
     });
   }
 
-  // ── Status row: storm active + manual export override badges ──
+  // ── Status row: storm active + manual export override + grid services + calibration + PTO ──
+  const gridServicesActive = findEntity('binary_sensor', 'grid_services_active');
+  const calibrationActive = findEntity('binary_sensor', 'calibration_active');
+  const permissionToOperate = findEntity('binary_sensor', 'permission_to_operate');
   const statuses = [];
   if (stormActive) {
     statuses.push({ entity: stormActive, name: 'Storm Watch Active', icon: 'mdi:weather-lightning-rainy' });
+  }
+  if (gridServicesActive) {
+    statuses.push({ entity: gridServicesActive, name: 'Grid Services Active', icon: 'mdi:transmission-tower-export' });
+  }
+  if (calibrationActive) {
+    statuses.push({ entity: calibrationActive, name: 'Calibration Active', icon: 'mdi:battery-sync' });
+  }
+  if (permissionToOperate) {
+    statuses.push({ entity: permissionToOperate, name: 'Permission to Operate', icon: 'mdi:check-decagram' });
   }
   if (manualOverride) {
     statuses.push({ entity: manualOverride, name: 'Manual Export Override', icon: 'mdi:hand-back-right' });
@@ -1174,6 +1375,67 @@ function _teslaEnergySiteControls(findEntity, findVppSwitches) {
       ...cards,
     ],
   };
+}
+
+function _powerwallStatus(e, hasE) {
+  // Live Powerwall vitals: backup runtime, capacity, lifetime totals.
+  // Each row is added only when the underlying sensor has a value, so the
+  // section gracefully scales from a fresh install (no lifetime data yet) to
+  // a long-running site (full energy history).
+  const live = [];
+  if (hasE('backup_time_remaining')) {
+    live.push({ entity: e('backup_time_remaining'), name: 'Backup Time Remaining', icon: 'mdi:timer-sand' });
+  }
+  if (hasE('energy_left')) {
+    live.push({ entity: e('energy_left'), name: 'Energy Available', icon: 'mdi:battery-50' });
+  }
+  if (hasE('total_pack_energy')) {
+    live.push({ entity: e('total_pack_energy'), name: 'Pack Capacity', icon: 'mdi:battery-high' });
+  }
+  if (hasE('grid_services_power')) {
+    live.push({ entity: e('grid_services_power'), name: 'Grid Services Power', icon: 'mdi:transmission-tower' });
+  }
+
+  const lifetime = [];
+  if (hasE('lifetime_solar_energy')) {
+    lifetime.push({ entity: e('lifetime_solar_energy'), name: 'Solar', icon: 'mdi:solar-power-variant' });
+  }
+  if (hasE('lifetime_grid_import')) {
+    lifetime.push({ entity: e('lifetime_grid_import'), name: 'Grid Import', icon: 'mdi:transmission-tower-import' });
+  }
+  if (hasE('lifetime_grid_export')) {
+    lifetime.push({ entity: e('lifetime_grid_export'), name: 'Grid Export', icon: 'mdi:transmission-tower-export' });
+  }
+  if (hasE('lifetime_battery_charged')) {
+    lifetime.push({ entity: e('lifetime_battery_charged'), name: 'Battery Charged', icon: 'mdi:battery-charging-100' });
+  }
+  if (hasE('lifetime_battery_discharged')) {
+    lifetime.push({ entity: e('lifetime_battery_discharged'), name: 'Battery Discharged', icon: 'mdi:battery-arrow-down' });
+  }
+  if (hasE('lifetime_home_consumption')) {
+    lifetime.push({ entity: e('lifetime_home_consumption'), name: 'Home Consumption', icon: 'mdi:home-lightning-bolt' });
+  }
+
+  if (live.length === 0 && lifetime.length === 0) return null;
+
+  const cards = [];
+  if (live.length > 0) {
+    cards.push({
+      type: 'entities',
+      title: 'Powerwall Status',
+      show_header_toggle: false,
+      entities: live,
+    });
+  }
+  if (lifetime.length > 0) {
+    cards.push({
+      type: 'entities',
+      title: 'Lifetime Energy',
+      show_header_toggle: false,
+      entities: lifetime,
+    });
+  }
+  return { type: 'vertical-stack', cards };
 }
 
 function _optimizerStatus(e, showForceChargeWindows = false) {
@@ -1282,7 +1544,7 @@ function _optimizerStatus(e, showForceChargeWindows = false) {
   };
 }
 
-function _teslaStyleFlow(e, hass) {
+function _teslaStyleFlow(e, hass, findSensor) {
   // Auto-detect weather entity — try common patterns
   let weatherEntity = null;
   for (const candidate of [
@@ -1404,16 +1666,26 @@ function _teslaStyleFlow(e, hass) {
     }
   }
 
-  // Add PV array detail if available (FoxESS, GoodWe)
-  const pv1 = e('pv1_power');
-  const pv2 = e('pv2_power');
+  // Add PV array detail if available (FoxESS, GoodWe, or upstream inverter integrations).
+  const resolveSensor = (names, fallback) =>
+    (typeof findSensor === 'function' ? findSensor(names) : null) || e(fallback);
+  const pv1 = resolveSensor(['pv1_power', 'pv_1_power', 'ppv1'], 'pv1_power');
+  const pv2 = resolveSensor(['pv2_power', 'pv_2_power', 'ppv2'], 'pv2_power');
   if (hass.states[pv1]) {
     config.entities.roof_a_power = pv1;
     config.roof_a_label = 'PV1';
+    const pv1Voltage = resolveSensor(['pv1_voltage', 'pv_1_voltage', 'vpv1'], 'pv1_voltage');
+    const pv1Current = resolveSensor(['pv1_current', 'pv_1_current', 'ipv1'], 'pv1_current');
+    if (hass.states[pv1Voltage]) config.entities.roof_a_voltage = pv1Voltage;
+    if (hass.states[pv1Current]) config.entities.roof_a_current = pv1Current;
   }
   if (hass.states[pv2]) {
     config.entities.roof_b_power = pv2;
     config.roof_b_label = 'PV2';
+    const pv2Voltage = resolveSensor(['pv2_voltage', 'pv_2_voltage', 'vpv2'], 'pv2_voltage');
+    const pv2Current = resolveSensor(['pv2_current', 'pv_2_current', 'ipv2'], 'pv2_current');
+    if (hass.states[pv2Voltage]) config.entities.roof_b_voltage = pv2Voltage;
+    if (hass.states[pv2Current]) config.entities.roof_b_current = pv2Current;
   }
 
   // Sigenergy DC/AC PV split
@@ -1470,7 +1742,11 @@ function _powerFlow(e) {
   };
 }
 
-function _priceChart(e) {
+function _priceChart(e, hass) {
+  const importMeta = _priceMeta(hass, e('current_import_price'));
+  const exportMeta = _priceMeta(hass, e('current_export_price'));
+  const importUnit = importMeta.minorPriceUnit;
+  const exportUnit = exportMeta.minorPriceUnit;
   return {
     type: 'custom:apexcharts-card',
     header: { show: true, title: 'Electricity Prices - 24 Hours', show_states: false },
@@ -1484,7 +1760,7 @@ function _priceChart(e) {
     series: [
       {
         entity: e('current_import_price'),
-        name: 'Import',
+        name: 'Import Price',
         type: 'line',
         color: '#FF9800',
         yaxis_id: 'price',
@@ -1494,7 +1770,7 @@ function _priceChart(e) {
       },
       {
         entity: e('current_export_price'),
-        name: 'Export Earnings',
+        name: 'Export Price',
         type: 'line',
         color: '#4CAF50',
         yaxis_id: 'price',
@@ -1510,21 +1786,24 @@ function _priceChart(e) {
       tooltip: {
         x: { format: 'HH:mm' },
         y: {
-          formatter: "EVAL:function(value) { if (value === null || value === undefined) return ''; const cents = value * 100; if (Math.abs(cents) >= 1000) { return '$' + value.toFixed(2); } return cents.toFixed(0) + '¢'; }",
+          formatter: `EVAL:function(value, opts) { const units = ${JSON.stringify([importUnit, exportUnit])}; return (${_formatMajorPriceAsMinor.toString()})(value, units[opts.seriesIndex] || ${JSON.stringify(importUnit)}); }`,
         },
       },
     },
   };
 }
 
-function _touSchedule(e) {
+function _touSchedule(e, hass) {
+  const meta = _priceMeta(hass, e('tariff_schedule'));
   return {
     type: 'custom:power-sync-chart',
     title: 'TOU Schedule',
     entity: e('tariff_schedule'),
     mode: 'tou',
     stepLine: true,
-    yUnit: '¢',
+    yUnit: meta.minorPriceUnit,
+    yUnitCompact: true,
+    yMultiplier: 100,
     series: [
       { key: 'buy', name: 'Buy Price', color: '#FF9800' },
       { key: 'sell', name: 'Sell Price', color: '#4CAF50' },
@@ -1561,14 +1840,16 @@ function _lpSolarLoadChart(e) {
   };
 }
 
-function _lpPriceChart(e) {
+function _lpPriceChart(e, hass) {
+  const meta = _priceMeta(hass, e('lp_import_price_forecast'));
   return {
     type: 'custom:power-sync-chart',
     title: 'LP Forecast - Import & Export Prices (48h)',
     mode: 'forecast',
     intervalMinutes: 5,
     stepLine: true,
-    yUnit: '¢',
+    yUnit: meta.minorPriceUnit,
+    yUnitCompact: true,
     yMultiplier: 100,
     series: [
       { entity: e('lp_import_price_forecast'), attribute: 'price_values', name: 'Import', color: '#FF9800' },
@@ -1825,21 +2106,35 @@ function _acInverterControls(e) {
   };
 }
 
-function _foxessSensors(e) {
-  const entities = [
-    { entity: e('pv1_power'), name: 'PV1 Power' },
-    { entity: e('pv2_power'), name: 'PV2 Power' },
-  ];
-  // Only add CT2 if it exists (not all FoxESS models have it)
-  entities.push({ entity: e('ct2_power'), name: 'CT2 Power' });
-  entities.push({ entity: e('work_mode'), name: 'Work Mode' });
-  entities.push({ entity: e('min_soc'), name: 'Min SOC' });
-  entities.push({ entity: e('daily_battery_charge_foxess'), name: 'Daily Charge' });
-  entities.push({ entity: e('daily_battery_discharge_foxess'), name: 'Daily Discharge' });
+function _pvStringSensors(e, hass, findSensor) {
+  const entities = [];
+  const resolveSensor = (names, fallback) =>
+    (typeof findSensor === 'function' ? findSensor(names) : null) || e(fallback);
+  const add = (entity, name, icon) => {
+    if (!entity || !hass?.states?.[entity]) return;
+    const row = { entity, name };
+    if (icon) row.icon = icon;
+    entities.push(row);
+  };
+
+  add(resolveSensor(['pv1_power', 'pv_1_power', 'ppv1'], 'pv1_power'), 'PV1 Power', 'mdi:solar-panel');
+  add(resolveSensor(['pv1_voltage', 'pv_1_voltage', 'vpv1'], 'pv1_voltage'), 'PV1 Voltage', 'mdi:sine-wave');
+  add(resolveSensor(['pv1_current', 'pv_1_current', 'ipv1'], 'pv1_current'), 'PV1 Current', 'mdi:current-dc');
+  add(resolveSensor(['pv2_power', 'pv_2_power', 'ppv2'], 'pv2_power'), 'PV2 Power', 'mdi:solar-panel');
+  add(resolveSensor(['pv2_voltage', 'pv_2_voltage', 'vpv2'], 'pv2_voltage'), 'PV2 Voltage', 'mdi:sine-wave');
+  add(resolveSensor(['pv2_current', 'pv_2_current', 'ipv2'], 'pv2_current'), 'PV2 Current', 'mdi:current-dc');
+
+  add(e('ct2_power'), 'CT2 Power', 'mdi:current-ac');
+  add(e('work_mode'), 'Work Mode', 'mdi:cog');
+  add(e('min_soc'), 'Min SOC', 'mdi:battery-low');
+  add(e('daily_battery_charge_foxess'), 'Daily Charge', 'mdi:battery-charging');
+  add(e('daily_battery_discharge_foxess'), 'Daily Discharge', 'mdi:battery-arrow-down');
+
+  if (entities.length === 0) return null;
 
   return {
     type: 'entities',
-    title: 'FoxESS Inverter',
+    title: 'PV String Details',
     show_header_toggle: false,
     entities,
   };
@@ -1896,12 +2191,14 @@ function _batteryHealth(e, hass) {
     },
   });
 
-  // Build individual battery gauge cards. Followers get a distinct label so it's
-  // clear their capacity is inferred from the aggregate rather than directly measured.
+  // Build individual battery gauge cards. Each slot is labelled by its role:
+  // followers get capacity inferred from the aggregate, expansions hang off a
+  // leader, and the leader is the gateway-attached primary unit.
   const individualGauges = [];
   for (let n = 1; n <= numSlots; n++) {
     const attrPath = `states['${healthEntity}']?.attributes?.battery_${n}_health_percent`;
     const followerPath = `states['${healthEntity}']?.attributes?.battery_${n}_is_follower`;
+    const expansionPath = `states['${healthEntity}']?.attributes?.battery_${n}_is_expansion`;
     individualGauges.push({
       type: 'custom:button-card',
       entity: healthEntity,
@@ -1910,7 +2207,10 @@ function _batteryHealth(e, hass) {
       show_state: true,
       name: `[[[
         const isFollower = ${followerPath};
-        return isFollower ? 'Follower ${n}' : 'Battery ${n}';
+        const isExpansion = ${expansionPath};
+        if (isFollower) return 'Follower ${n}';
+        if (isExpansion) return 'Expansion ${n}';
+        return 'Leader ${n}';
       ]]]`,
       state_display: `[[[
         const v = ${attrPath};
@@ -1989,8 +2289,9 @@ function _batteryHealth(e, hass) {
 {% set scan = state_attr('${healthEntity}', 'last_scan') %}
 {% set soh = state_attr('${healthEntity}', 'state_of_health_percent') %}
 {% set has_follower = state_attr('${healthEntity}', 'battery_1_is_follower') or state_attr('${healthEntity}', 'battery_2_is_follower') or state_attr('${healthEntity}', 'battery_3_is_follower') or state_attr('${healthEntity}', 'battery_4_is_follower') %}
-{%- if source in ('mobile_app_tedapi', 'mobile_app', 'fleet_api') %}
-**Capacity:** {{ current }} / {{ original }} kWh | **Last scan:** {{ scan[:10] if scan else 'N/A' }}
+{% set source_label = 'local gateway' if source == 'ha_local_tedapi' else 'Fleet API relay' if source == 'ha_fleet_api_relay' else 'mobile local scan' if source == 'mobile_app_tedapi' else 'mobile cloud RSA' if source == 'mobile_app_cloud_rsa' else source %}
+{%- if source in ('mobile_app_tedapi', 'mobile_app', 'fleet_api', 'ha_local_tedapi', 'ha_fleet_api_relay', 'mobile_app_cloud_rsa') %}
+**Capacity:** {{ current }} / {{ original }} kWh | **Last scan:** {{ scan[:10] if scan else 'N/A' }} | **Source:** {{ source_label }}
 {%- if has_follower %} *(follower capacity inferred from aggregate)*{%- endif %}
 {%- elif source == 'inverter_modbus' %}
 **State of Health:** {{ soh }}% (from inverter)
@@ -2041,7 +2342,47 @@ function _demandCharge(e) {
   };
 }
 
-function _powerwallLocalControl(e) {
+function _powerwallLocalControl(e, hasE) {
+  const statusEntities = [
+    {
+      entity: e('powerwall_local_paired'),
+      name: 'Paired',
+      icon: 'mdi:key-variant',
+    },
+    {
+      entity: e('powerwall_local_islanded'),
+      name: 'Off-Grid',
+      icon: 'mdi:transmission-tower-off',
+    },
+  ];
+  if (hasE && hasE('pw_system_island_state')) {
+    statusEntities.push({
+      entity: e('pw_system_island_state'),
+      name: 'Island State',
+      icon: 'mdi:transmission-tower',
+    });
+  }
+  if (hasE && hasE('pw_count')) {
+    statusEntities.push({
+      entity: e('pw_count'),
+      name: 'Powerwalls',
+      icon: 'mdi:battery-multiple',
+    });
+  }
+  if (hasE && hasE('pw_active_alerts')) {
+    statusEntities.push({
+      entity: e('pw_active_alerts'),
+      name: 'Active Alerts',
+      icon: 'mdi:alert-circle',
+    });
+  }
+  if (hasE && hasE('pw_critical_alert')) {
+    statusEntities.push({
+      entity: e('pw_critical_alert'),
+      name: 'Alert Active',
+      icon: 'mdi:alert-octagon',
+    });
+  }
   return {
     type: 'vertical-stack',
     cards: [
@@ -2050,18 +2391,7 @@ function _powerwallLocalControl(e) {
         title: 'Powerwall Local Control',
         show_header_toggle: false,
         state_color: true,
-        entities: [
-          {
-            entity: e('powerwall_local_paired'),
-            name: 'Paired',
-            icon: 'mdi:key-variant',
-          },
-          {
-            entity: e('powerwall_local_islanded'),
-            name: 'Off-Grid',
-            icon: 'mdi:transmission-tower-off',
-          },
-        ],
+        entities: statusEntities,
       },
       {
         type: 'conditional',
@@ -2081,6 +2411,48 @@ function _powerwallLocalControl(e) {
       },
     ],
   };
+}
+
+function _powerwallHealth(hass) {
+  // Scan hass.states for per-PW sensors created by the lazy-add task.
+  // The deferred-add pattern means these only exist on PW2 / supported sites,
+  // so we render the section only when at least one block is discovered.
+  const states = hass && hass.states ? hass.states : {};
+  const blockIndices = new Set();
+  const blockRe = /^sensor\.power_sync_pw(\d+)_(soc|soh|capacity|voltage|temperature)$/;
+  for (const key of Object.keys(states)) {
+    const m = blockRe.exec(key);
+    if (m) blockIndices.add(parseInt(m[1], 10));
+  }
+  if (blockIndices.size === 0) return null;
+
+  const cards = [];
+  const sortedIndices = Array.from(blockIndices).sort((a, b) => a - b);
+  for (const i of sortedIndices) {
+    const entities = [];
+    for (const [suffix, label, icon] of [
+      ['soc', 'SOC', 'mdi:battery'],
+      ['soh', 'State of Health', 'mdi:battery-heart'],
+      ['capacity', 'Capacity', 'mdi:battery-high'],
+      ['voltage', 'Voltage', 'mdi:flash'],
+      ['temperature', 'Temperature', 'mdi:thermometer'],
+    ]) {
+      const id = `sensor.power_sync_pw${i}_${suffix}`;
+      if (states[id] && states[id].state !== 'unavailable') {
+        entities.push({ entity: id, name: label, icon });
+      }
+    }
+    if (entities.length > 0) {
+      cards.push({
+        type: 'entities',
+        title: `Powerwall ${i}`,
+        show_header_toggle: false,
+        entities,
+      });
+    }
+  }
+  if (cards.length === 0) return null;
+  return { type: 'vertical-stack', cards };
 }
 
 function _aemoSpike(e) {

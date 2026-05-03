@@ -30,6 +30,7 @@ fails.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import struct
 import time
@@ -243,6 +244,7 @@ class TeslaSignalingClient:
         self._hermes_jwt_is_fallback = False  # True when using raw token, not a real JWT
         self._working_jwt_url: str | None = None
         self._auth_denied = False
+        self._fallback_rejection_count = 0  # Stop retrying after repeated exchange+fallback failures
 
         # Metrics
         self._connected_since: float | None = None
@@ -373,12 +375,31 @@ class TeslaSignalingClient:
                             continue
                         if resp.status != 200:
                             body = await resp.text()
+                            # The PowerSync.cc proxy returns structured JSON with
+                            # `error`, `detail`, and `token_scopes` from the
+                            # upstream Tesla response. Log those explicitly so
+                            # we don't lose `token_scopes` to the 200-char clip.
+                            err_code = ""
+                            detail = ""
+                            scopes: list = []
+                            try:
+                                parsed = json.loads(body)
+                                if isinstance(parsed, dict):
+                                    err_code = str(parsed.get("error", ""))
+                                    detail = str(parsed.get("detail", ""))
+                                    raw_scopes = parsed.get("token_scopes")
+                                    if isinstance(raw_scopes, list):
+                                        scopes = raw_scopes
+                            except (ValueError, TypeError):
+                                pass
                             _LOGGER.warning(
                                 "signaling: hermes JWT exchange at %s "
-                                "failed (%d): %s",
+                                "failed (%d) error=%s scopes=%s detail=%s",
                                 url,
                                 resp.status,
-                                body[:200],
+                                err_code or "?",
+                                scopes if scopes else "?",
+                                (detail or body)[:400],
                             )
                             continue
 
@@ -397,6 +418,7 @@ class TeslaSignalingClient:
                         self._hermes_jwt_obtained_at = time.monotonic()
                         self._hermes_jwt_is_fallback = False
                         self._working_jwt_url = url
+                        self._fallback_rejection_count = 0
                         _LOGGER.info(
                             "signaling: hermes JWT obtained from %s", url
                         )
@@ -596,6 +618,18 @@ class TeslaSignalingClient:
         # exchange again. Only treat as permanent when a real JWT was rejected.
         if "authorization denied" in payload_text.lower():
             if self._hermes_jwt_is_fallback:
+                self._fallback_rejection_count += 1
+                if self._fallback_rejection_count >= 3:
+                    _LOGGER.error(
+                        "signaling: hermes JWT exchange repeatedly failed and raw "
+                        "token fallback also rejected — a real Tesla JWT with hermes "
+                        "scope is required (psync_ proxy tokens are not accepted). "
+                        "Signaling will stop retrying. Install the tesla_fleet HA "
+                        "integration alongside PowerSync to enable signaling."
+                    )
+                    self._auth_denied = True
+                    self._stop_event.set()
+                    return
                 _LOGGER.warning(
                     "signaling: HermesServer rejected raw token fallback — "
                     "the JWT exchange endpoints were unavailable. "

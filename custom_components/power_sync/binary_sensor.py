@@ -19,6 +19,7 @@ from .const import (
     CONF_TESLA_ENERGY_SITE_ID,
     CONF_POWERWALL_LOCAL_PAIRED,
     family_device_info,
+    powerwall_device_info,
     SENSOR_FAMILY_BATTERY,
     SENSOR_FAMILY_CONTROLS,
     SENSOR_FAMILY_GRID_HOME,
@@ -47,6 +48,23 @@ async def async_setup_entry(
     # Local Control section on it, and the mobile app can subscribe.
     async_add_entities([PowerwallLocalPairedBinarySensor(hass, entry)])
     async_add_entities([PowerwallLocalIslandedBinarySensor(hass, entry)])
+    # Surface "paired but no LAN IP" as a diagnostic — mobile app uses this
+    # to show a banner directing the user to set the gateway IP, since
+    # without it the local-only features (snapshot, curtailment, fast writes)
+    # silently won't work even though pairing succeeded.
+    async_add_entities([PowerwallLocalIPMissingBinarySensor(hass, entry)])
+
+    # Critical Alert sensor only makes sense once the gateway is paired
+    # (its data source is the local TEDAPI snapshot).
+    if entry.data.get(CONF_POWERWALL_LOCAL_PAIRED):
+        async_add_entities([PowerwallCriticalAlertBinarySensor(hass, entry)])
+
+    # Universally-available Tesla site sensors (no capability probe needed).
+    async_add_entities([
+        GridServicesActiveBinarySensor(hass, entry),
+        CalibrationActiveBinarySensor(hass, entry),
+        PermissionToOperateBinarySensor(hass, entry),
+    ])
 
     async def _add_capability_gated_binary_sensors() -> None:
         entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
@@ -153,6 +171,56 @@ class ManualExportOverrideBinarySensor(_TeslaBinarySensorBase):
         }
 
 
+class PowerwallCriticalAlertBinarySensor(_TeslaBinarySensorBase):
+    """True when at least one Powerwall alert is active.
+
+    Reads the local TEDAPI snapshot's ``alerts`` list. Severity strings vary
+    by firmware (``warning`` / ``critical`` / ``error``); we treat any active
+    entry as a problem rather than guessing the severity taxonomy.
+    """
+
+    _attr_device_class = BinarySensorDeviceClass.PROBLEM
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+        super().__init__(
+            hass, entry,
+            key="pw_critical_alert",
+            name="Powerwall Alert Active",
+            icon="mdi:alert-octagon",
+        )
+
+    @property
+    def device_info(self):
+        return powerwall_device_info(self._entry.entry_id)
+
+    @property
+    def is_on(self) -> bool | None:
+        entry_data = self.hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {})
+        runtime = entry_data.get("powerwall_local") or {}
+        coord = runtime.get("coordinator")
+        if coord is None:
+            return None
+        snap = coord.data
+        if snap is None or snap.alerts is None:
+            return None
+        return len(snap.alerts) > 0
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        entry_data = self.hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {})
+        runtime = entry_data.get("powerwall_local") or {}
+        coord = runtime.get("coordinator")
+        snap = getattr(coord, "data", None)
+        if snap is None or not snap.alerts:
+            return {}
+        return {
+            "alerts": [
+                a.get("name") or a.get("alert_name") or "Unknown" for a in snap.alerts
+            ],
+        }
+
+
 class PowerwallLocalPairedBinarySensor(_TeslaBinarySensorBase):
     """True when the Powerwall gateway has a verified local-control key.
 
@@ -178,6 +246,137 @@ class PowerwallLocalPairedBinarySensor(_TeslaBinarySensorBase):
     @property
     def is_on(self) -> bool | None:
         return bool(self._entry.data.get(CONF_POWERWALL_LOCAL_PAIRED, False))
+
+
+class GridServicesActiveBinarySensor(_TeslaBinarySensorBase):
+    """True while Tesla is dispatching the Powerwall for VPP / grid services."""
+
+    _attr_device_class = BinarySensorDeviceClass.RUNNING
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+        super().__init__(
+            hass, entry,
+            key="tesla_grid_services_active",
+            name="Grid Services Active",
+            icon="mdi:transmission-tower-export",
+        )
+
+    @property
+    def device_info(self):
+        return powerwall_device_info(self._entry.entry_id)
+
+    @property
+    def is_on(self) -> bool | None:
+        coord = self._tesla_coord()
+        if coord is None or coord.data is None:
+            return None
+        return bool(coord.data.get("grid_services_active", False))
+
+
+class CalibrationActiveBinarySensor(_TeslaBinarySensorBase):
+    """True when PowerSync has detected a Powerwall calibration cycle.
+
+    The optimiser flips ``calibration_suspected`` after repeated mode-toggle
+    failures (Powerwall ignoring commands while it self-calibrates). Surfacing
+    this lets the dashboard show why automatic control is paused.
+    """
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_device_class = BinarySensorDeviceClass.PROBLEM
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+        super().__init__(
+            hass, entry,
+            key="tesla_calibration_active",
+            name="Calibration Active",
+            icon="mdi:battery-sync",
+        )
+
+    @property
+    def device_info(self):
+        return powerwall_device_info(self._entry.entry_id)
+
+    @property
+    def is_on(self) -> bool | None:
+        entry_data = self.hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {})
+        return bool(entry_data.get("calibration_suspected", False))
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        entry_data = self.hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {})
+        detected_at = entry_data.get("calibration_detected_at")
+        return {
+            "detected_at": detected_at,
+        }
+
+
+class PermissionToOperateBinarySensor(_TeslaBinarySensorBase):
+    """True when the Powerwall is commissioned for grid export by the utility."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+        super().__init__(
+            hass, entry,
+            key="tesla_permission_to_operate",
+            name="Permission to Operate",
+            icon="mdi:check-decagram",
+        )
+
+    @property
+    def device_info(self):
+        return powerwall_device_info(self._entry.entry_id)
+
+    @property
+    def is_on(self) -> bool | None:
+        coord = self._tesla_coord()
+        if coord is None:
+            return None
+        site_info = getattr(coord, "_site_info_cache", None) or {}
+        # Tesla exposes the commissioning state under several keys depending
+        # on region / firmware. Check the common ones; default to None so the
+        # entity reads "unknown" rather than misleadingly "not commissioned".
+        for key in ("permission_to_export", "permission_to_operate", "pto"):
+            if key in site_info:
+                return bool(site_info[key])
+            components = site_info.get("components") or {}
+            if key in components:
+                return bool(components[key])
+        return None
+
+
+class PowerwallLocalIPMissingBinarySensor(_TeslaBinarySensorBase):
+    """True when the entry is paired but no local gateway IP is configured.
+
+    This signals "you finished cloud-side pairing but local-only features
+    (per-PW snapshot, automated curtailment, fast operation-mode toggles)
+    won't work until you set ``CONF_POWERWALL_LOCAL_IP``". Off-grid still
+    works in this state because it goes through the cloud signed
+    ``device_command`` path.
+    """
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_device_class = BinarySensorDeviceClass.PROBLEM
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+        super().__init__(
+            hass, entry,
+            key="powerwall_local_ip_missing",
+            name="Powerwall Gateway IP Missing",
+            icon="mdi:lan-disconnect",
+        )
+
+    @property
+    def is_on(self) -> bool | None:
+        from .const import CONF_POWERWALL_LOCAL_IP
+        paired = bool(self._entry.data.get(CONF_POWERWALL_LOCAL_PAIRED, False))
+        if not paired:
+            # Not paired at all — this banner doesn't apply. Returning False
+            # (not None) so it shows as "OK" rather than "unknown" in the
+            # device's diagnostic panel.
+            return False
+        ip = self._entry.data.get(CONF_POWERWALL_LOCAL_IP)
+        return not ip
 
 
 class PowerwallLocalIslandedBinarySensor(_TeslaBinarySensorBase):

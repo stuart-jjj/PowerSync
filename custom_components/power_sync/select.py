@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from homeassistant.components.select import SelectEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -16,7 +18,10 @@ from .const import (
     family_device_info,
     SENSOR_FAMILY_BATTERY,
     SENSOR_FAMILY_GRID_HOME,
+    TESLA_SITE_INFO_CONTROL_MAX_AGE_SECONDS,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_entry(
@@ -98,7 +103,7 @@ async def async_setup_entry(
 class PowerSyncDurationSelect(SelectEntity):
     """Select entity for choosing a duration in minutes."""
 
-    _attr_entity_category = EntityCategory.CONFIG
+    # User-facing duration picker for force charge/discharge — Controls, not Configuration.
     _attr_icon = "mdi:clock-outline"
     _attr_has_entity_name = True
 
@@ -139,6 +144,13 @@ class PowerSyncDurationSelect(SelectEntity):
         if entry is None:
             return
 
+        if entry.options.get(self._key, str(DEFAULT_DISCHARGE_DURATION)) == option:
+            self.async_write_ha_state()
+            return
+
+        entry_data = self.hass.data.setdefault(DOMAIN, {}).setdefault(self._entry_id, {})
+        entry_data["_skip_reload"] = True
+
         new_options = dict(entry.options)
         new_options[self._key] = option
         self.hass.config_entries.async_update_entry(entry, options=new_options)
@@ -146,10 +158,11 @@ class PowerSyncDurationSelect(SelectEntity):
 
 
 class _TeslaSiteSelectBase(SelectEntity):
-    """Base for Tesla Energy Site select entities."""
+    """Base for Tesla Energy Site select entities (Operation Mode, Grid Export)."""
 
     _attr_has_entity_name = True
-    _attr_entity_category = EntityCategory.CONFIG
+    _attr_should_poll = True
+    # User-facing — these are primary controls, belong in Controls section.
 
     def __init__(
         self,
@@ -179,11 +192,26 @@ class _TeslaSiteSelectBase(SelectEntity):
             .get("tesla_coordinator")
         )
 
+    async def async_update(self) -> None:
+        """Refresh Tesla site_info often enough for controls changed elsewhere."""
+        coord = self._tesla_coord()
+        if coord is None:
+            return
+        try:
+            await coord.async_get_site_info(
+                max_age=TESLA_SITE_INFO_CONTROL_MAX_AGE_SECONDS,
+            )
+        except Exception:
+            _LOGGER.debug(
+                "Could not refresh Tesla site_info for select entity",
+                exc_info=True,
+            )
+
 
 class TeslaOperationModeSelect(_TeslaSiteSelectBase):
-    """Powerwall operation mode: Time-of-Use (autonomous) or Self-Consumption."""
+    """Powerwall operation mode: Time-of-Use, Self-Consumption, or Backup-Only."""
 
-    _OPTIONS = ["autonomous", "self_consumption"]
+    _OPTIONS = ["autonomous", "self_consumption", "backup"]
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         super().__init__(
