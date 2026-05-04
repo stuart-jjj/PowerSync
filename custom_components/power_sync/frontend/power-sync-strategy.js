@@ -368,6 +368,7 @@ class PowerSyncLayout extends HTMLElement {
     this.attachShadow({ mode: 'open' });
     this._cards = [];
     this._built = false;
+    this._building = false;
   }
 
   setConfig(config) {
@@ -375,13 +376,36 @@ class PowerSyncLayout extends HTMLElement {
   }
 
   set hass(hass) {
+    const prev = this._hass;
     this._hass = hass;
-    if (!this._built) this._buildLayout();
-    for (const c of this._cards) c.hass = hass;
+
+    // Rebuild the layout when either hide-toggle switch changes state so the
+    // conditional cards inside columns re-evaluate with the current hass.
+    const TOGGLES = [
+      'switch.power_sync_hide_pv_sensors',
+      'switch.power_sync_hide_battery_health',
+    ];
+    const toggleChanged = !this._building && prev != null && TOGGLES.some(
+      id => (prev.states[id]?.state) !== (hass.states[id]?.state)
+    );
+
+    if (toggleChanged) {
+      this._built = false;
+      this._cards = [];
+      const root = this.shadowRoot;
+      while (root.lastChild) root.removeChild(root.lastChild);
+    }
+
+    if (!this._built && !this._building) {
+      this._buildLayout();
+    } else {
+      for (const c of this._cards) c.hass = hass;
+    }
   }
 
   async _buildLayout() {
-    if (this._built) return;
+    if (this._building || this._built) return;
+    this._building = true;
     this._built = true;
 
     const root = this.shadowRoot;
@@ -442,6 +466,7 @@ class PowerSyncLayout extends HTMLElement {
     }
 
     root.appendChild(grid);
+    this._building = false;
   }
 
   getCardSize() { return 12; }
