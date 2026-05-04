@@ -13530,10 +13530,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     else:
         expected_title = "PowerSync Amber"
 
-    # Update title if it doesn't match (migration for old entries)
-    if entry.title != expected_title:
-        _LOGGER.info(f"Updating entry title from '{entry.title}' to '{expected_title}'")
-        hass.config_entries.async_update_entry(entry, title=expected_title)
+    # Title migration is deferred to after hass.data is initialised so the
+    # _skip_reload flag can suppress the spurious reload that async_update_entry
+    # would otherwise trigger via _async_options_update_listener.
 
     # Check pricing source configuration
     aemo_spike_enabled = entry.options.get(
@@ -14762,6 +14761,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "_mode_stick_failures": [],  # list of timestamps for calibration detection
         "_calibration_check_unsub": None,
     }
+
+    # Title migration — runs here so _skip_reload is already in entry_data when
+    # async_update_entry fires _async_options_update_listener, preventing a reload.
+    if entry.title != expected_title:
+        _LOGGER.info("Updating entry title from '%s' to '%s'", entry.title, expected_title)
+        hass.data[DOMAIN][entry.entry_id]["_skip_reload"] = True
+        hass.config_entries.async_update_entry(entry, title=expected_title)
 
     from .auto_update import async_setup_auto_update
     hass.data[DOMAIN][entry.entry_id]["auto_update_cancel"] = await async_setup_auto_update(
@@ -16163,7 +16169,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
         use_aemo_sensor = (
             aemo_sensor_coordinator is not None and
-            flow_power_price_source in ("aemo_sensor", "aemo")
+            (
+                flow_power_price_source in ("aemo_sensor", "aemo")
+                or electricity_provider_check == "aemo"
+            )
         )
 
         # Check for Localvolts pricing source

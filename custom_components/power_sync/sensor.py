@@ -1223,6 +1223,17 @@ async def async_setup_entry(
                     entry=entry,
                 )
             )
+    elif domain_data.get("aemo_sensor_coordinator"):
+        aemo_sensor_coordinator = domain_data["aemo_sensor_coordinator"]
+        _LOGGER.info("Adding AEMO Direct price sensors (import and export)")
+        for description in PRICE_SENSORS:
+            entities.append(
+                AmberPriceSensor(
+                    coordinator=aemo_sensor_coordinator,
+                    description=description,
+                    entry=entry,
+                )
+            )
     else:
         # For non-Amber providers (Globird, Flow Power, etc.), always create TariffPriceSensor.
         # The sensor handles missing tariff_schedule gracefully (returns None until
