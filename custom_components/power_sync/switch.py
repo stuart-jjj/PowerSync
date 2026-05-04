@@ -23,6 +23,8 @@ from .const import (
     CONF_ELECTRICITY_PROVIDER,
     CONF_MONITORING_MODE,
     CONF_POWERWALL_LOCAL_PAIRED,
+    CONF_HIDE_PV_SENSORS,
+    CONF_HIDE_BATTERY_HEALTH,
     SWITCH_TYPE_AUTO_SYNC,
     SWITCH_TYPE_AUTO_UPDATE,
     SWITCH_TYPE_FORCE_DISCHARGE,
@@ -30,6 +32,8 @@ from .const import (
     SWITCH_TYPE_MONITORING_MODE,
     SWITCH_TYPE_AWAY_MODE,
     SWITCH_TYPE_PROFIT_MAX_MODE,
+    SWITCH_TYPE_HIDE_PV_SENSORS,
+    SWITCH_TYPE_HIDE_BATTERY_HEALTH,
     DEFAULT_DISCHARGE_DURATION,
     ATTR_LAST_SYNC,
     ATTR_SYNC_STATUS,
@@ -93,6 +97,30 @@ async def async_setup_entry(
                 key=SWITCH_TYPE_MONITORING_MODE,
                 name="Monitoring Mode",
                 icon="mdi:eye-outline",
+            ),
+        ),
+    )
+
+    # Dashboard display preference switches
+    entities.append(
+        HidePVSensorsSwitch(
+            hass=hass,
+            entry=entry,
+            description=SwitchEntityDescription(
+                key=SWITCH_TYPE_HIDE_PV_SENSORS,
+                name="Hide PV String Sensors",
+                icon="mdi:solar-panel-large",
+            ),
+        ),
+    )
+    entities.append(
+        HideBatteryHealthSwitch(
+            hass=hass,
+            entry=entry,
+            description=SwitchEntityDescription(
+                key=SWITCH_TYPE_HIDE_BATTERY_HEALTH,
+                name="Hide Battery Health",
+                icon="mdi:battery-heart-outline",
             ),
         ),
     )
@@ -1054,4 +1082,94 @@ class OffGridSwitch(SwitchEntity):
             {},
             blocking=True,
         )
+        self.async_write_ha_state()
+
+
+class HidePVSensorsSwitch(SwitchEntity):
+    """Switch to hide inverter PV string sensors (voltage/current/power) from the dashboard."""
+
+    _attr_has_entity_name = True
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry: ConfigEntry,
+        description: SwitchEntityDescription,
+    ) -> None:
+        self.hass = hass
+        self.entity_description = description
+        self._entry = entry
+        self._attr_unique_id = f"{entry.entry_id}_{description.key}"
+        self._attr_suggested_object_id = f"power_sync_{description.key}"
+        self._attr_is_on = entry.options.get(
+            CONF_HIDE_PV_SENSORS,
+            entry.data.get(CONF_HIDE_PV_SENSORS, False),
+        )
+
+    @property
+    def device_info(self):
+        return family_device_info(self._entry.entry_id, SENSOR_FAMILY_CONTROLS)
+
+    @property
+    def is_on(self) -> bool:
+        return self._attr_is_on
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        self._attr_is_on = True
+        new_options = {**self._entry.options}
+        new_options[CONF_HIDE_PV_SENSORS] = True
+        self.hass.config_entries.async_update_entry(self._entry, options=new_options)
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        self._attr_is_on = False
+        new_options = {**self._entry.options}
+        new_options[CONF_HIDE_PV_SENSORS] = False
+        self.hass.config_entries.async_update_entry(self._entry, options=new_options)
+        self.async_write_ha_state()
+
+
+class HideBatteryHealthSwitch(SwitchEntity):
+    """Switch to hide the battery health section from the dashboard."""
+
+    _attr_has_entity_name = True
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry: ConfigEntry,
+        description: SwitchEntityDescription,
+    ) -> None:
+        self.hass = hass
+        self.entity_description = description
+        self._entry = entry
+        self._attr_unique_id = f"{entry.entry_id}_{description.key}"
+        self._attr_suggested_object_id = f"power_sync_{description.key}"
+        self._attr_is_on = entry.options.get(
+            CONF_HIDE_BATTERY_HEALTH,
+            entry.data.get(CONF_HIDE_BATTERY_HEALTH, False),
+        )
+
+    @property
+    def device_info(self):
+        return family_device_info(self._entry.entry_id, SENSOR_FAMILY_CONTROLS)
+
+    @property
+    def is_on(self) -> bool:
+        return self._attr_is_on
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        self._attr_is_on = True
+        new_options = {**self._entry.options}
+        new_options[CONF_HIDE_BATTERY_HEALTH] = True
+        self.hass.config_entries.async_update_entry(self._entry, options=new_options)
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        self._attr_is_on = False
+        new_options = {**self._entry.options}
+        new_options[CONF_HIDE_BATTERY_HEALTH] = False
+        self.hass.config_entries.async_update_entry(self._entry, options=new_options)
         self.async_write_ha_state()

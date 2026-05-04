@@ -1053,6 +1053,12 @@ SWITCH_TYPE_MONITORING_MODE = "monitoring_mode"
 SWITCH_TYPE_AWAY_MODE = "away_mode"
 SWITCH_TYPE_PROFIT_MAX_MODE = "profit_max_mode"
 SWITCH_TYPE_AUTO_UPDATE = "auto_update"
+SWITCH_TYPE_HIDE_PV_SENSORS = "hide_pv_sensors"
+SWITCH_TYPE_HIDE_BATTERY_HEALTH = "hide_battery_health"
+
+# Config keys for dashboard display preferences
+CONF_HIDE_PV_SENSORS = "hide_pv_sensors"
+CONF_HIDE_BATTERY_HEALTH = "hide_battery_health"
 
 # Monitoring mode — blocks all battery/inverter control commands
 CONF_MONITORING_MODE = "monitoring_mode"
@@ -1589,6 +1595,8 @@ SENSOR_TYPE_LP_IMPORT_PRICE_FORECAST = "lp_import_price_forecast"
 SENSOR_TYPE_LP_EXPORT_PRICE_FORECAST = "lp_export_price_forecast"
 SENSOR_TYPE_LOAD_FORECAST_TODAY_REMAINING = "load_forecast_today_remaining"
 SENSOR_TYPE_LOAD_FORECAST_TOMORROW = "load_forecast_tomorrow"
+SENSOR_TYPE_SOLAR_FORECAST_TODAY_REMAINING = "solar_forecast_today_remaining"
+SENSOR_TYPE_SOLAR_FORECAST_TOMORROW = "solar_forecast_tomorrow"
 
 # ============================================================
 # EV Smart Charging Configuration
@@ -1692,6 +1700,8 @@ SENSOR_KEY_TO_FAMILY: dict[str, str] = {
     "lp_export_price_forecast": SENSOR_FAMILY_LP_OPTIMIZER,
     "load_forecast_today_remaining": SENSOR_FAMILY_LP_OPTIMIZER,
     "load_forecast_tomorrow": SENSOR_FAMILY_LP_OPTIMIZER,
+    "solar_forecast_today_remaining": SENSOR_FAMILY_LP_OPTIMIZER,
+    "solar_forecast_tomorrow": SENSOR_FAMILY_LP_OPTIMIZER,
     "tariff_schedule": SENSOR_FAMILY_LP_OPTIMIZER,
     # Battery
     "battery_power": SENSOR_FAMILY_BATTERY,
