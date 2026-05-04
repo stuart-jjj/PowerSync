@@ -13589,9 +13589,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # These don't need a real-time pricing API — they use a TOU schedule from config
     # (synced to Tesla if Tesla, or used directly for Sungrow/FoxESS/etc.)
     has_custom_tariff_provider = electricity_provider in ("globird", "aemo_vpp", "tou_only", "other", "nz")
-    has_aemo_direct = electricity_provider == "aemo" and bool(
-        entry.options.get(CONF_AEMO_REGION, entry.data.get(CONF_AEMO_REGION))
-    )
+    has_aemo_direct = electricity_provider == "aemo"
     has_tesla_site = bool(entry.data.get(CONF_TESLA_ENERGY_SITE_ID))
 
     def _is_monitoring_mode() -> bool:

@@ -3255,31 +3255,28 @@ class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Handle AEMO spike detection configuration."""
         errors: dict[str, str] = {}
 
+        is_aemo_direct = getattr(self, "_selected_electricity_provider", None) == "aemo"
+
         if user_input is not None:
-            # Validate AEMO region is selected if enabled
             aemo_enabled = user_input.get(CONF_AEMO_SPIKE_ENABLED, False)
+            region = user_input.get(CONF_AEMO_REGION)
 
-            if aemo_enabled:
-                region = user_input.get(CONF_AEMO_REGION)
-                if not region:
-                    errors["base"] = "aemo_region_required"
-                else:
-                    # Store AEMO config
-                    self._aemo_data = {
-                        CONF_AEMO_SPIKE_ENABLED: True,
-                        CONF_AEMO_REGION: region,
-                        CONF_AEMO_SPIKE_THRESHOLD: user_input.get(
-                            CONF_AEMO_SPIKE_THRESHOLD, 3000.0
-                        ),
-                    }
+            # Region is always required for AEMO Direct (price coordinator needs it)
+            if is_aemo_direct and not region:
+                errors[CONF_AEMO_REGION] = "aemo_region_required"
+            elif aemo_enabled and not region:
+                errors["base"] = "aemo_region_required"
 
-                    # Route to battery system selection
-                    return await self.async_step_battery_system()
-            else:
-                # AEMO disabled
-                self._aemo_data = {CONF_AEMO_SPIKE_ENABLED: False}
-
-                # Route to battery system selection
+            if not errors:
+                self._aemo_data = {
+                    CONF_AEMO_SPIKE_ENABLED: aemo_enabled,
+                }
+                if region:
+                    self._aemo_data[CONF_AEMO_REGION] = region
+                if aemo_enabled:
+                    self._aemo_data[CONF_AEMO_SPIKE_THRESHOLD] = user_input.get(
+                        CONF_AEMO_SPIKE_THRESHOLD, 3000.0
+                    )
                 return await self.async_step_battery_system()
 
         # Build region choices
@@ -3291,10 +3288,12 @@ class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         # Default to enabled if in AEMO-only mode
         default_enabled = self._aemo_only_mode
 
+        region_field = vol.Required(CONF_AEMO_REGION) if is_aemo_direct else vol.Optional(CONF_AEMO_REGION)
+
         data_schema = vol.Schema(
             {
                 vol.Optional(CONF_AEMO_SPIKE_ENABLED, default=default_enabled): BooleanSelector(),
-                vol.Optional(CONF_AEMO_REGION): SelectSelector(
+                region_field: SelectSelector(
                     SelectSelectorConfig(
                         options=region_options,
                         mode=SelectSelectorMode.DROPDOWN,
