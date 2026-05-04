@@ -756,20 +756,24 @@ class PowerSyncStrategy {
 
     // --- Left Column: PV String Sensors ---
     {
-      const hidePvSwitch = hass.states['switch.power_sync_hide_pv_sensors'];
-      const hidePvSensors = hidePvSwitch && hidePvSwitch.state === 'on';
-      if (!hidePvSensors) {
-        const pvStringCard = _pvStringSensors(e, hass, findSensor);
-        if (pvStringCard) left.push(pvStringCard);
+      const pvStringCard = _pvStringSensors(e, hass, findSensor);
+      if (pvStringCard) {
+        left.push({
+          type: 'conditional',
+          conditions: [{ entity: 'switch.power_sync_hide_pv_sensors', state_not: 'on' }],
+          card: pvStringCard,
+        });
       }
     }
 
     // --- Left Column: Battery Health (requires button-card) ---
     {
-      const hideBatteryHealthSwitch = hass.states['switch.power_sync_hide_battery_health'];
-      const hideBatteryHealth = hideBatteryHealthSwitch && hideBatteryHealthSwitch.state === 'on';
-      if (hasButton && hasE('battery_health') && !hideBatteryHealth) {
-        left.push(_batteryHealth(e, hass));
+      if (hasButton && hasE('battery_health')) {
+        left.push({
+          type: 'conditional',
+          conditions: [{ entity: 'switch.power_sync_hide_battery_health', state_not: 'on' }],
+          card: _batteryHealth(e, hass),
+        });
       }
     }
 
