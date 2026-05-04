@@ -1026,6 +1026,11 @@ class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 # Flow Power: Configure region and price source first
                 self._aemo_only_mode = False
                 return await self.async_step_flow_power_setup()
+            elif provider == "aemo":
+                # AEMO Direct: live 5-minute NEM wholesale pricing, no subscription needed
+                self._aemo_only_mode = False
+                self._amber_data = {}
+                return await self.async_step_aemo_config()
             elif provider in ("globird", "aemo_vpp"):
                 # Globird/AEMO VPP: AEMO spike only mode (static tariff)
                 self._aemo_only_mode = True

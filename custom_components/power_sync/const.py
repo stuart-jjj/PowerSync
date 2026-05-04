@@ -489,6 +489,7 @@ AEMO_SENSOR_30MIN_PATTERN = "sensor.aemo_nem_{region}_current_30min_forecast"
 # Electricity provider options
 ELECTRICITY_PROVIDERS = {
     "amber": "Amber Electric — real-time wholesale pricing (AU)",
+    "aemo": "AEMO Direct — 5-minute NEM wholesale pricing, no subscription (AU)",
     "localvolts": "Localvolts — 5-minute NEM wholesale pricing (AU)",
     "flow_power": "Flow Power — wholesale with Happy Hour exports (AU)",
     "globird": "Globird — static tariff with AEMO spike export (AU)",

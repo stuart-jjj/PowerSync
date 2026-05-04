@@ -14366,37 +14366,41 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         entry.data.get(CONF_FLOW_POWER_STATE, "NSW1")
     )
 
-    # Check for "aemo_sensor" (legacy) or "aemo" (new) price source.
-    # Both now use the direct AEMO API, but only Flow Power uses AEMO as an
-    # optimizer price feed. Other providers can retain stale Flow Power
-    # options after a provider switch and must not inherit AEMO prices.
-    use_aemo_pricing = (
+    # Determine whether to start the AEMO direct-API price coordinator.
+    # Triggers for:
+    #   - "aemo" standalone provider (uses CONF_AEMO_REGION)
+    #   - Flow Power with AEMO price source (uses CONF_FLOW_POWER_STATE)
+    aemo_region_for_pricing = None
+    if electricity_provider == "aemo":
+        aemo_region_for_pricing = entry.options.get(
+            CONF_AEMO_REGION, entry.data.get(CONF_AEMO_REGION)
+        )
+    elif (
         electricity_provider == "flow_power"
         and flow_power_price_source in ("aemo_sensor", "aemo")
-    )
+    ):
+        aemo_region_for_pricing = flow_power_state
 
-    if use_aemo_pricing and flow_power_state:
+    if aemo_region_for_pricing:
         from .coordinator import AEMOPriceCoordinator
 
-        # Get aiohttp session from Home Assistant
         session = async_get_clientsession(hass)
-
         aemo_sensor_coordinator = AEMOPriceCoordinator(
             hass,
-            flow_power_state,  # Region code (NSW1, QLD1, VIC1, SA1, TAS1)
+            aemo_region_for_pricing,
             session,
         )
         try:
             await aemo_sensor_coordinator.async_config_entry_first_refresh()
             _LOGGER.info(
                 "AEMO Price Coordinator initialized for region %s (direct API)",
-                flow_power_state,
+                aemo_region_for_pricing,
             )
         except Exception as e:
             _LOGGER.error("Failed to initialize AEMO price coordinator: %s", e)
             aemo_sensor_coordinator = None
-    elif use_aemo_pricing and not flow_power_state:
-        _LOGGER.warning("AEMO price source selected but no region configured")
+    elif electricity_provider == "aemo":
+        _LOGGER.warning("AEMO Direct provider selected but no region configured")
 
     # Initialize Flow Power TWAP tracker for dynamic PEA pricing
     flow_power_twap_tracker = None
@@ -23682,7 +23686,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # cadence (30 min, not on NEM) and gets its own :00/:30 cron.
     from .coordinator import SIGNAL_AEMO_NEW_DISPATCH, AEMOPriceCoordinator
 
-    NEM_PROVIDERS = ("amber", "flow_power", "localvolts", "aemo_sensor")
+    NEM_PROVIDERS = ("amber", "flow_power", "localvolts", "aemo_sensor", "aemo")
     is_nem_provider = electricity_provider in NEM_PROVIDERS
 
     async def _handle_aemo_dispatch_event(_signal_data) -> None:
