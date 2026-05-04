@@ -707,6 +707,31 @@ class PowerSyncStrategy {
       });
     }
 
+    // --- Center Column: Solar Forecast Today/Tomorrow ---
+    if (hasE('solar_forecast_today_remaining') || hasE('solar_forecast_tomorrow')) {
+      const solarForecastEntities = [];
+      if (hasE('solar_forecast_today_remaining')) {
+        solarForecastEntities.push({
+          entity: e('solar_forecast_today_remaining'),
+          name: 'Solar Today (Remaining)',
+          icon: 'mdi:solar-power-variant',
+        });
+      }
+      if (hasE('solar_forecast_tomorrow')) {
+        solarForecastEntities.push({
+          entity: e('solar_forecast_tomorrow'),
+          name: 'Solar Tomorrow',
+          icon: 'mdi:solar-power-variant-outline',
+        });
+      }
+      center.push({
+        type: 'entities',
+        title: 'Solar Forecast',
+        show_header_toggle: false,
+        entities: solarForecastEntities,
+      });
+    }
+
     // --- Center Column: LP Price Chart (48h) ---
     if (hasE('lp_import_price_forecast')) {
       center.push(_lpPriceChart(e, hass));
@@ -731,13 +756,21 @@ class PowerSyncStrategy {
 
     // --- Left Column: PV String Sensors ---
     {
-      const pvStringCard = _pvStringSensors(e, hass, findSensor);
-      if (pvStringCard) left.push(pvStringCard);
+      const hidePvSwitch = hass.states['switch.power_sync_hide_pv_sensors'];
+      const hidePvSensors = hidePvSwitch && hidePvSwitch.state === 'on';
+      if (!hidePvSensors) {
+        const pvStringCard = _pvStringSensors(e, hass, findSensor);
+        if (pvStringCard) left.push(pvStringCard);
+      }
     }
 
     // --- Left Column: Battery Health (requires button-card) ---
-    if (hasButton && hasE('battery_health')) {
-      left.push(_batteryHealth(e, hass));
+    {
+      const hideBatteryHealthSwitch = hass.states['switch.power_sync_hide_battery_health'];
+      const hideBatteryHealth = hideBatteryHealthSwitch && hideBatteryHealthSwitch.state === 'on';
+      if (hasButton && hasE('battery_health') && !hideBatteryHealth) {
+        left.push(_batteryHealth(e, hass));
+      }
     }
 
     // --- Center Column: Combined Energy Chart ---
@@ -1812,8 +1845,11 @@ function _touSchedule(e, hass) {
 }
 
 function _lpForecastSummary(e, has) {
+  const solarEntity = has(e('solar_forecast_today_remaining'))
+    ? { type: 'entity', entity: e('solar_forecast_today_remaining'), name: 'Solar Forecast', icon: 'mdi:solar-power-variant' }
+    : { type: 'entity', entity: e('lp_solar_forecast'), name: 'Solar Forecast', icon: 'mdi:solar-power-variant' };
   const cards = [
-    { type: 'entity', entity: e('lp_solar_forecast'), name: 'Solar Forecast', icon: 'mdi:solar-power-variant' },
+    solarEntity,
     { type: 'entity', entity: e('lp_load_forecast'), name: 'Load Forecast', icon: 'mdi:home-lightning-bolt' },
   ];
   if (has(e('lp_import_price_forecast'))) {

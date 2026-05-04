@@ -439,6 +439,44 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "profit_max_mode": self.profit_max_mode,
         }
 
+    def _summarise_solar_forecast(self) -> dict | None:
+        """Slice the cached solar forecast into today-remaining and tomorrow kWh totals."""
+        if not self._last_solar_forecast:
+            return None
+
+        now = dt_util.now()
+        dt_h = self._config.interval_minutes / 60
+        interval_minutes = self._config.interval_minutes
+
+        forecast_start = self._last_update_time or now
+        elapsed_intervals = int(
+            (now - forecast_start).total_seconds() / 60 / interval_minutes
+        )
+
+        today_remaining_kw: list[float] = []
+        tomorrow_kw: list[float] = []
+        slot_time = forecast_start + elapsed_intervals * timedelta(minutes=interval_minutes)
+        local_midnight_today = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        local_midnight_tomorrow = local_midnight_today + timedelta(days=1)
+
+        for i in range(elapsed_intervals, len(self._last_solar_forecast)):
+            solar_kw = self._last_solar_forecast[i]
+            if slot_time <= local_midnight_today:
+                today_remaining_kw.append(solar_kw)
+            elif slot_time <= local_midnight_tomorrow:
+                tomorrow_kw.append(solar_kw)
+            else:
+                break
+            slot_time += timedelta(minutes=interval_minutes)
+
+        today_remaining_kwh = sum(today_remaining_kw) * dt_h if today_remaining_kw else 0
+        tomorrow_kwh = sum(tomorrow_kw) * dt_h if tomorrow_kw else 0
+
+        return {
+            "today_remaining_kwh": round(today_remaining_kwh, 2),
+            "tomorrow_kwh": round(tomorrow_kwh, 2),
+        }
+
     async def async_setup(self) -> bool:
         """Set up the optimization coordinator with built-in LP optimizer."""
         _LOGGER.info("Setting up optimization coordinator (built-in LP)")
@@ -1435,7 +1473,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             if force_type == "charge":
                                 await battery.force_charge(
                                     duration_minutes=extend_mins,
-                                    power_w=action.power_w,
+                                    power_w=min(action.power_w, self._config.max_charge_w),
                                     _extend_hardware=True,
                                 )
                             else:
@@ -1719,6 +1757,8 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             if effective_action == "charge":
                 if hasattr(battery, "force_charge"):
+                    # Clamp to user-configured max in case LP solution drifts above it
+                    capped_charge_w = min(action.power_w, self._config.max_charge_w)
                     charge_duration = self._config.interval_minutes + 5
                     # Near the demand window, shorten charge duration so the
                     # auto-restore fires 1 minute before demand starts.  The
@@ -1746,19 +1786,19 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         )
                         await battery.force_charge(
                             duration_minutes=charge_duration,
-                            power_w=action.power_w,
+                            power_w=capped_charge_w,
                         )
                         _LOGGER.info(
                             "Optimizer: Charging at %.0fW for %dmin "
                             "(auto-restore before demand)",
-                            action.power_w, charge_duration,
+                            capped_charge_w, charge_duration,
                         )
                     else:
                         await battery.force_charge(
                             duration_minutes=charge_duration,
-                            power_w=action.power_w,
+                            power_w=capped_charge_w,
                         )
-                        _LOGGER.info("Optimizer: Charging at %.0fW", action.power_w)
+                        _LOGGER.info("Optimizer: Charging at %.0fW", capped_charge_w)
             elif effective_action in ("discharge", "export"):
                 # Safety guard: do NOT force-discharge if SOC is at or below
                 # the configured backup reserve.  force_discharge sets Tesla
@@ -3656,7 +3696,8 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         User overrides saved in config entry take priority over auto-detection.
         """
-        # Check for user overrides in config entry first
+        # Check for user overrides in config entry first (options take priority over data,
+        # but both are checked so initial-setup values saved only to data are respected too).
         if self._entry:
             from ..const import (
                 CONF_OPTIMIZATION_BATTERY_CAPACITY_WH,
@@ -3664,9 +3705,10 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 CONF_OPTIMIZATION_MAX_DISCHARGE_W,
             )
             opts = self._entry.options
-            saved_capacity = opts.get(CONF_OPTIMIZATION_BATTERY_CAPACITY_WH)
-            saved_charge = opts.get(CONF_OPTIMIZATION_MAX_CHARGE_W)
-            saved_discharge = opts.get(CONF_OPTIMIZATION_MAX_DISCHARGE_W)
+            data = self._entry.data
+            saved_capacity = opts.get(CONF_OPTIMIZATION_BATTERY_CAPACITY_WH) or data.get(CONF_OPTIMIZATION_BATTERY_CAPACITY_WH)
+            saved_charge = opts.get(CONF_OPTIMIZATION_MAX_CHARGE_W) or data.get(CONF_OPTIMIZATION_MAX_CHARGE_W)
+            saved_discharge = opts.get(CONF_OPTIMIZATION_MAX_DISCHARGE_W) or data.get(CONF_OPTIMIZATION_MAX_DISCHARGE_W)
 
             if saved_capacity or saved_charge or saved_discharge:
                 if saved_capacity:
@@ -4292,6 +4334,10 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             data["solar_forecast_kwh"] = sum(self._last_solar_forecast) * dt_h
             data["solar_peak_kw"] = max(self._last_solar_forecast)
             data["solar_forecast"] = self._last_solar_forecast
+            solar_summary = self._summarise_solar_forecast()
+            if solar_summary:
+                data["solar_today_remaining_kwh"] = solar_summary["today_remaining_kwh"]
+                data["solar_tomorrow_kwh"] = solar_summary["tomorrow_kwh"]
 
         if self._last_load_forecast:
             data["load_forecast_kwh"] = sum(self._last_load_forecast) * dt_h
