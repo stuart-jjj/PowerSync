@@ -12354,6 +12354,24 @@ class PriceRecommendationView(HomeAssistantView):
                 except Exception as e:
                     _LOGGER.debug(f"Could not read coordinator prices: {e}")
 
+            elif electricity_provider == "aemo":
+                # AEMO Direct: Read from AEMO price coordinator (5-min dispatch prices)
+                try:
+                    aemo_coordinator = entry_data.get("aemo_sensor_coordinator")
+                    if aemo_coordinator and aemo_coordinator.data:
+                        current_prices = aemo_coordinator.data.get("current", [])
+                        for price in current_prices:
+                            channel = price.get("channelType", "")
+                            if channel == "general":
+                                import_price_cents = price.get("perKwh", 30.0)
+                                price_source = "aemo"
+                            elif channel == "feedIn":
+                                export_price_cents = price.get("perKwh", -8.0)
+                                price_source = "aemo"
+                        _LOGGER.debug(f"Using AEMO Direct coordinator prices: import={import_price_cents}c, export={export_price_cents}c")
+                except Exception as e:
+                    _LOGGER.debug(f"Could not read AEMO coordinator prices: {e}")
+
             elif electricity_provider in ("globird", "aemo_vpp", "nz"):
                 # Globird/AEMO VPP/NZ: Read from Tesla/custom tariff with real-time TOU
                 try:
@@ -13495,7 +13513,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     has_amber = bool(entry.data.get(CONF_AMBER_API_TOKEN))
 
     # Determine correct title based on provider
-    if electricity_provider == "aemo_vpp":
+    if electricity_provider in ("aemo_vpp", "aemo"):
         expected_title = "PowerSync AEMO"
     elif electricity_provider == "globird" or (not has_amber and entry.data.get(CONF_AEMO_SPIKE_ENABLED)):
         expected_title = "PowerSync Globird"
@@ -13571,6 +13589,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # These don't need a real-time pricing API — they use a TOU schedule from config
     # (synced to Tesla if Tesla, or used directly for Sungrow/FoxESS/etc.)
     has_custom_tariff_provider = electricity_provider in ("globird", "aemo_vpp", "tou_only", "other", "nz")
+    has_aemo_direct = electricity_provider == "aemo" and bool(
+        entry.options.get(CONF_AEMO_REGION, entry.data.get(CONF_AEMO_REGION))
+    )
     has_tesla_site = bool(entry.data.get(CONF_TESLA_ENERGY_SITE_ID))
 
     def _is_monitoring_mode() -> bool:
@@ -13588,6 +13609,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     elif has_epex:
         _LOGGER.info("Running in EPEX Day-Ahead mode with EU dynamic pricing (region: %s)",
                      entry.data.get(CONF_EPEX_REGION))
+    elif has_aemo_direct:
+        _LOGGER.info("Running in AEMO Direct mode (region: %s)",
+                     entry.options.get(CONF_AEMO_REGION, entry.data.get(CONF_AEMO_REGION)))
     elif aemo_spike_enabled:
         _LOGGER.info("Running in AEMO Spike Detection only mode (%s)", electricity_provider)
     elif has_custom_tariff_provider:
@@ -21148,7 +21172,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             saved_tariff = force_discharge_state.get("saved_tariff") or force_charge_state.get("saved_tariff")
 
             # Dynamic pricing providers should sync fresh prices, not restore stale saved tariff
-            dynamic_providers = ("amber", "flow_power", "aemo_vpp")
+            dynamic_providers = ("amber", "flow_power", "aemo_vpp", "aemo")
             if electricity_provider in dynamic_providers:
                 # Dynamic pricing users - trigger a fresh sync to get current prices
                 # (sync handler already loops over all site_ids)
