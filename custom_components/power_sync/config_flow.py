@@ -3956,6 +3956,8 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                 return await self.async_step_epex_options()
             if provider == "nz":
                 return await self.async_step_nz_options()
+            if provider == "aemo":
+                return await self.async_step_aemo_options()
             return await self.async_step_amber_options()
 
         current_provider = self._get_option(CONF_ELECTRICITY_PROVIDER, "amber")
@@ -5188,6 +5190,8 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                     return await self.async_step_epex_options()
                 elif self._provider == "nz":
                     return await self.async_step_nz_options()
+                elif self._provider == "aemo":
+                    return await self.async_step_aemo_options()
 
         current_provider = self._get_option(CONF_ELECTRICITY_PROVIDER, "amber")
         current_tesla_provider = self.config_entry.data.get(
@@ -5414,6 +5418,8 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                     return await self.async_step_epex_options()
                 elif self._provider == "nz":
                     return await self.async_step_nz_options()
+                elif self._provider == "aemo":
+                    return await self.async_step_aemo_options()
 
         current_provider = self._get_option(CONF_ELECTRICITY_PROVIDER, "amber")
         current_modbus_host = self._get_option(CONF_SIGENERGY_MODBUS_HOST, "")
@@ -5628,6 +5634,8 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                     return await self.async_step_epex_options()
                 elif self._provider == "nz":
                     return await self.async_step_nz_options()
+                elif self._provider == "aemo":
+                    return await self.async_step_aemo_options()
 
         current_provider = self._get_option(CONF_ELECTRICITY_PROVIDER, "amber")
         current_host = self._get_option(CONF_SUNGROW_HOST, "")
@@ -5823,6 +5831,8 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                     return await self.async_step_epex_options()
                 elif self._provider == "nz":
                     return await self.async_step_nz_options()
+                elif self._provider == "aemo":
+                    return await self.async_step_aemo_options()
 
         current_provider = self._get_option(CONF_ELECTRICITY_PROVIDER, "amber")
         current_conn_type = self._get_option(
@@ -5989,6 +5999,8 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                     return await self.async_step_epex_options()
                 elif self._provider == "nz":
                     return await self.async_step_nz_options()
+                elif self._provider == "aemo":
+                    return await self.async_step_aemo_options()
 
         current_provider = self._get_option(CONF_ELECTRICITY_PROVIDER, "amber")
         current_host = self._get_option(CONF_GOODWE_HOST, "")
@@ -6104,6 +6116,8 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
             return await self.async_step_epex_options()
         if provider == "nz":
             return await self.async_step_nz_options()
+        if provider == "aemo":
+            return await self.async_step_aemo_options()
         return await self.async_step_amber_options()
 
     async def async_step_powersync_token(
@@ -8153,6 +8167,68 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
             step_id="octopus_saving_sessions_options",
             data_schema=data_schema,
             errors=errors,
+        )
+
+    async def async_step_aemo_options(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Options flow step for AEMO Direct (NEM real-time pricing)."""
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            region = user_input.get(CONF_AEMO_REGION)
+            if not region:
+                errors[CONF_AEMO_REGION] = "aemo_region_required"
+
+            if not errors:
+                aemo_enabled = user_input.get(CONF_AEMO_SPIKE_ENABLED, False)
+                options: dict[str, Any] = {
+                    CONF_ELECTRICITY_PROVIDER: "aemo",
+                    CONF_AEMO_REGION: region,
+                    CONF_AEMO_SPIKE_ENABLED: aemo_enabled,
+                }
+                if aemo_enabled:
+                    options[CONF_AEMO_SPIKE_THRESHOLD] = user_input.get(
+                        CONF_AEMO_SPIKE_THRESHOLD, 3000.0
+                    )
+                self._amber_options = options
+                return await self.async_step_demand_charge_options()
+
+        current_region = self._get_option(CONF_AEMO_REGION, "")
+        current_spike_enabled = self._get_option(CONF_AEMO_SPIKE_ENABLED, False)
+        current_spike_threshold = self._get_option(CONF_AEMO_SPIKE_THRESHOLD, 3000.0)
+
+        region_options = [
+            SelectOptionDict(value=k, label=v)
+            for k, v in AEMO_REGIONS.items()
+        ]
+
+        schema: dict[Any, Any] = {
+            vol.Required(CONF_AEMO_REGION, default=current_region): SelectSelector(
+                SelectSelectorConfig(
+                    options=region_options,
+                    mode=SelectSelectorMode.DROPDOWN,
+                )
+            ),
+            vol.Optional(CONF_AEMO_SPIKE_ENABLED, default=current_spike_enabled): BooleanSelector(),
+            vol.Optional(CONF_AEMO_SPIKE_THRESHOLD, default=current_spike_threshold): NumberSelector(
+                NumberSelectorConfig(
+                    min=0,
+                    max=20000,
+                    step=100,
+                    unit_of_measurement=self._selector_unit("market_rate"),
+                    mode=NumberSelectorMode.BOX,
+                )
+            ),
+        }
+
+        return self.async_show_form(
+            step_id="aemo_options",
+            data_schema=vol.Schema(schema),
+            errors=errors,
+            description_placeholders={
+                "threshold_hint": "Default: $3,000/MWh. Adjust only if your plan specifies a different spike threshold.",
+            },
         )
 
     async def async_step_nz_options(

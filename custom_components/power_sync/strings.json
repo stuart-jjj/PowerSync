@@ -1346,6 +1346,19 @@
         },
         "submit": "Save"
       },
+      "aemo_options": {
+        "title": "AEMO Direct pricing settings",
+        "description": "Update your AEMO NEM region and optional spike detection settings. Changes apply after the next sync cycle.",
+        "data": {
+          "aemo_region": "NEM region",
+          "aemo_spike_enabled": "Enable spike detection",
+          "aemo_spike_threshold": "Spike threshold ($/MWh)"
+        },
+        "data_description": {
+          "aemo_spike_threshold": "{threshold_hint}"
+        },
+        "submit": "Save"
+      },
       "epex_options": {
         "title": "EPEX day-ahead settings",
         "description": "Update your EPEX pricing settings. Changes apply after the next sync cycle.",
