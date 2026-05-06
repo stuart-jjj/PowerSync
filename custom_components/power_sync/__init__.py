@@ -18681,6 +18681,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         force_discharge_state["source"] = source
         force_discharge_state["duration"] = duration
 
+        # Resolve power_w: fall back to configured max_discharge_w when caller did not supply one
+        _fd_entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+        _raw_power_w = call.data.get("power_w", 0)
+        if _raw_power_w == 0:
+            _opt_coord = _fd_entry_data.get("optimization_coordinator")
+            if _opt_coord:
+                _raw_power_w = _opt_coord._config.max_discharge_w
+        _resolved_discharge_power_w = _raw_power_w
+
         # Check if this is a Sigenergy system
         is_sigenergy = bool(entry.data.get(CONF_SIGENERGY_STATION_ID))
         if is_sigenergy:
@@ -18713,7 +18722,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 )
 
                 # Enable Remote EMS + set discharge mode + set rate
-                power_w = call.data.get("power_w", 0)
+                power_w = _resolved_discharge_power_w
                 power_kw = power_w / 1000 if power_w > 0 else 10.0
                 result = await controller.force_discharge(power_kw=power_kw)
                 await controller.disconnect()
@@ -18770,7 +18779,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     _LOGGER.error("Force discharge: FoxESS coordinator not available")
                     return
 
-                power_w = call.data.get("power_w", 0)
+                power_w = _resolved_discharge_power_w
                 discharge_result = await foxess_coord.force_discharge(duration, power_w=power_w)
 
                 if discharge_result:
@@ -18824,7 +18833,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     _LOGGER.error("Force discharge: GoodWe coordinator not available")
                     return
 
-                power_w = call.data.get("power_w", 0)
+                power_w = _resolved_discharge_power_w
                 discharge_result = await goodwe_coord.force_discharge(duration, power_w=power_w)
 
                 if discharge_result:
@@ -18877,7 +18886,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     _LOGGER.error("Force discharge: AlphaESS coordinator not available")
                     return
 
-                power_w = call.data.get("power_w", 0)
+                power_w = _resolved_discharge_power_w
                 discharge_result = await alphaess_coord.force_discharge(duration, power_w=power_w)
 
                 if discharge_result:
@@ -18929,7 +18938,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     _LOGGER.error("Force discharge: Voltx coordinator not available")
                     return
 
-                power_w = call.data.get("power_w", 0)
+                power_w = _resolved_discharge_power_w
                 discharge_result = await voltx_coord.force_discharge(duration, power_w=power_w)
 
                 if discharge_result:
@@ -18983,7 +18992,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     _LOGGER.error("Force discharge: ESY Sunhome coordinator not available")
                     return
 
-                power_w = call.data.get("power_w", 0)
+                power_w = _resolved_discharge_power_w
                 discharge_result = await esy_coord.force_discharge(duration, power_w=power_w)
 
                 if discharge_result:
@@ -19040,7 +19049,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     _LOGGER.error("Force discharge: Solax coordinator not available")
                     return
 
-                power_w = call.data.get("power_w", 0)
+                power_w = _resolved_discharge_power_w
                 discharge_result = await solax_coord.force_discharge(duration, power_w=power_w)
 
                 if discharge_result:
@@ -19090,7 +19099,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     _LOGGER.error("Force discharge: SAJ H2 coordinator not available")
                     return
 
-                power_w = call.data.get("power_w", 0)
+                power_w = _resolved_discharge_power_w
                 discharge_result = await saj_coord.force_discharge(duration, power_w=power_w)
 
                 if discharge_result:
@@ -19141,7 +19150,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     _LOGGER.error("Force discharge: Sungrow coordinator not available")
                     return
 
-                power_w = call.data.get("power_w", 0)
+                power_w = _resolved_discharge_power_w
                 discharge_result = await sungrow_coord.force_discharge(duration, power_w=power_w)
 
                 if discharge_result:
@@ -19671,6 +19680,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         # Block force charge during demand peak periods (grid charging must stay off)
         entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+        # Resolve power_w: fall back to configured max_charge_w when caller did not supply one
+        _raw_power_w = call.data.get("power_w", 0)
+        if _raw_power_w == 0:
+            _opt_coord = entry_data.get("optimization_coordinator")
+            if _opt_coord:
+                _raw_power_w = _opt_coord._config.max_charge_w
+        _resolved_charge_power_w = _raw_power_w
         dc_coordinator = entry_data.get("demand_charge_coordinator")
         if dc_coordinator and dc_coordinator.enabled and not entry_data.get("demand_allow_grid_charging", False):
             current_time = dt_util.now()
@@ -19769,7 +19785,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     force_discharge_state["expires_at"] = None
 
                 # Enable Remote EMS + set charge mode + set rate
-                power_w = call.data.get("power_w", 0)
+                power_w = _resolved_charge_power_w
                 power_kw = power_w / 1000 if power_w > 0 else 10.0
                 result = await controller.force_charge(power_kw=power_kw)
                 await controller.disconnect()
@@ -19835,7 +19851,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     force_discharge_state["active"] = False
                     force_discharge_state["expires_at"] = None
 
-                power_w = call.data.get("power_w", 0)
+                power_w = _resolved_charge_power_w
                 charge_result = await foxess_coord.force_charge(duration, power_w=power_w)
 
                 if charge_result:
@@ -19898,7 +19914,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     force_discharge_state["active"] = False
                     force_discharge_state["expires_at"] = None
 
-                power_w = call.data.get("power_w", 0)
+                power_w = _resolved_charge_power_w
                 charge_result = await goodwe_coord.force_charge(duration, power_w=power_w)
 
                 if charge_result:
@@ -19951,7 +19967,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     _LOGGER.error("Force charge: AlphaESS coordinator not available")
                     return
 
-                power_w = call.data.get("power_w", 0)
+                power_w = _resolved_charge_power_w
                 charge_result = await alphaess_coord.force_charge(duration, power_w=power_w)
 
                 if charge_result:
@@ -20011,7 +20027,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     force_discharge_state["active"] = False
                     force_discharge_state["expires_at"] = None
 
-                power_w = call.data.get("power_w", 0)
+                power_w = _resolved_charge_power_w
                 charge_result = await voltx_coord.force_charge(duration, power_w=power_w)
 
                 if charge_result:
@@ -20073,7 +20089,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     force_discharge_state["active"] = False
                     force_discharge_state["expires_at"] = None
 
-                power_w = call.data.get("power_w", 0)
+                power_w = _resolved_charge_power_w
                 charge_result = await esy_coord.force_charge(duration, power_w=power_w)
 
                 if charge_result:
@@ -20138,7 +20154,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     force_discharge_state["active"] = False
                     force_discharge_state["expires_at"] = None
 
-                power_w = call.data.get("power_w", 0)
+                power_w = _resolved_charge_power_w
                 charge_result = await solax_coord.force_charge(duration, power_w=power_w)
 
                 if charge_result:
@@ -20196,7 +20212,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     force_discharge_state["active"] = False
                     force_discharge_state["expires_at"] = None
 
-                power_w = call.data.get("power_w", 0)
+                power_w = _resolved_charge_power_w
                 charge_result = await saj_coord.force_charge(duration, power_w=power_w)
 
                 if charge_result:
@@ -20256,7 +20272,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     force_discharge_state["active"] = False
                     force_discharge_state["expires_at"] = None
 
-                power_w = call.data.get("power_w", 0)
+                power_w = _resolved_charge_power_w
                 charge_result = await sungrow_coord.force_charge(duration, power_w=power_w)
 
                 if charge_result:
