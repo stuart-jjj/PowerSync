@@ -33,7 +33,7 @@ from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
-GITHUB_REPO = "bolagnaise/PowerSync"
+GITHUB_REPO = "stuart-jjj/PowerSync"
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 SCAN_INTERVAL = timedelta(hours=1)
 
@@ -152,22 +152,6 @@ class PowerSyncUpdateEntity(CoordinatorEntity, UpdateEntity):
             except ValueError:
                 return
         self._notified_version = latest
-        release_url = self.coordinator.data.get("release_url", "")
-        notes_line = f"\n\n[View release notes]({release_url})" if release_url else ""
-        self.hass.async_create_task(
-            self.hass.services.async_call(
-                "persistent_notification",
-                "create",
-                {
-                    "title": "PowerSync Update Available",
-                    "message": (
-                        f"PowerSync **v{latest}** is available "
-                        f"(installed: v{self._installed}).{notes_line}"
-                    ),
-                    "notification_id": f"power_sync_update_{latest}",
-                },
-            )
-        )
         _LOGGER.info("PowerSync update available: v%s → v%s", self._installed, latest)
 
     @property
